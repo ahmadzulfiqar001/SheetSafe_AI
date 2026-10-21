@@ -40,6 +40,10 @@ def ready(request: Request, response: Response) -> ReadyResponse:
         raise NotReadyError()
     try:
         database.check_ready()
+        storage = getattr(request.app.state, "storage", None)
+        if storage is None:
+            raise NotReadyError()
+        storage.check_ready()
         lifecycle = getattr(request.app.state, "lifecycle", None)
         task = getattr(request.app.state, "cleanup_task", None)
         if lifecycle is None or task is None or task.done():

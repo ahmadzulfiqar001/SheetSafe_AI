@@ -15,9 +15,9 @@ gain access to cleanup controls or receipt inspection.
 2. Claim with a random lease token for 30 seconds. Only the current token may
    purge metadata or certify completion. Expired leases recover after restart.
 3. Inspect only that session's metadata. Verify runtime teardown first, then
-   storage removal through reviewed adapters. No adapter exists in the shipped
-   application yet. Registered dataset/code references therefore block without
-   a storage adapter; execution evidence blocks without a runner adapter.
+   storage removal through reviewed adapters. Step 6 wires the private storage
+   adapter; registered dataset/code references must resolve in its registry.
+   Execution evidence still blocks without a runner adapter.
 4. Purge session metadata and cascading datasets/profiles/runs/attempts in one
    transaction. Mark the durable phase `CHECKPOINT` before committing.
 5. Verify SQLite `wal_checkpoint(TRUNCATE)` before certifying `COMPLETE`. A pinned
@@ -31,7 +31,8 @@ Adapters receive opaque server session/request IDs, not client-supplied paths.
 They must validate their own server-controlled namespace, reject traversal and
 links, bound/cancel I/O, and be idempotent across retries and expired leases. Future
 artifact/storage/runner schemas must extend inventory verification before release.
-No arbitrary filesystem deletion or container command is implemented here.
+The storage adapter performs only scoped, verified nonrecursive removal; no
+container command is implemented. See [secure storage](secure-storage.md).
 
 ## Scheduling, retries and failure
 

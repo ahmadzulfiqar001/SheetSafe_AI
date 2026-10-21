@@ -46,6 +46,7 @@ _EVENT_TYPES = frozenset({
     "DELETION_REQUESTED", "DELETION_COMPLETED",
     "SESSION_EXPIRED", "CLEANUP_STARTED", "CLEANUP_RETRY", "CLEANUP_BLOCKED",
     "CLEANUP_DEADLINE_MISSED", "CLEANUP_COMPLETED",
+    "STORAGE_STAGED", "STORAGE_SEALED",
 })
 
 
@@ -147,6 +148,8 @@ class Database:
                 ("attempts", "attempt_id"), ("audit_events", "sequence"),
                 ("session_creation_limits", "scope, key_hash"),
                 ("cleanup_requests", "request_id, state"), ("cleanup_daily_metrics", "day_start"),
+                ("storage_identity", "root_id"), ("storage_namespaces", "session_id"),
+                ("storage_objects", "object_id, state"),
             ):
                 connection.execute(f"SELECT {columns} FROM {table} LIMIT 0")
 

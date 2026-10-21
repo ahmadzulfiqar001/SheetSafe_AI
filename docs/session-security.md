@@ -69,4 +69,6 @@ reviewed proxy configuration are still needed before public deployment.
 Schema migration 2 adds durable admission counters; migration 3 adds lifecycle
 coordination without rewriting previous migrations. SQLite is not encrypted by this module. Private mode,
 operator upload access control, encrypted storage, provider privacy verification,
-production storage adapters and running-worker coordination remain later release gates.
+deployed storage permissions/encryption verification and running-worker coordination
+remain later release gates. Step 6 adds the synthetic-only storage adapter; see
+[secure storage](secure-storage.md).

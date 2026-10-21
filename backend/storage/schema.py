@@ -4,7 +4,7 @@ Published migrations are immutable; future changes add a new numbered entry.
 Only metadata/references belong here, never raw uploads or inference credentials.
 """
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 APPLICATION_ID = 0x53534149  # SSAI, identifies this application's SQLite files.
 
 RUN_STATES = (
@@ -298,5 +298,67 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
                 BEGIN SELECT RAISE(ABORT, 'session is inactive'); END"""
             for operation in ("INSERT", "UPDATE")
         ),
+    ),
+    4: (
+        """CREATE TABLE storage_identity (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+            root_id TEXT NOT NULL UNIQUE CHECK(length(root_id)=32)
+        ) STRICT""",
+        """CREATE TABLE storage_namespaces (
+            session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
+            namespace_id TEXT NOT NULL UNIQUE CHECK(length(namespace_id)=32 AND namespace_id NOT GLOB '*[^0-9a-f]*'),
+            cleaned_at INTEGER
+        ) STRICT""",
+        """CREATE TABLE storage_objects (
+            object_id TEXT PRIMARY KEY CHECK(length(object_id)=32 AND object_id NOT GLOB '*[^0-9a-f]*'),
+            session_id TEXT NOT NULL REFERENCES storage_namespaces(session_id) ON DELETE CASCADE,
+            category TEXT NOT NULL CHECK(category IN ('original','version','candidate','temporary','quarantine','validated')),
+            file_type TEXT NOT NULL CHECK(file_type IN ('csv','xlsx','py','png','json','txt')),
+            run_id TEXT REFERENCES runs(run_id) ON DELETE RESTRICT,
+            candidate_version INTEGER NOT NULL DEFAULT 0 CHECK(candidate_version BETWEEN 0 AND 3),
+            state TEXT NOT NULL DEFAULT 'STAGING' CHECK(state IN ('STAGING','SEALED')),
+            byte_count INTEGER NOT NULL CHECK(byte_count>0),
+            sha256 TEXT CHECK(length(sha256)=64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+            created_at INTEGER NOT NULL CHECK(created_at>0),
+            CHECK(state!='SEALED' OR sha256 IS NOT NULL),
+            CHECK((category IN ('original','version') AND run_id IS NULL AND candidate_version=0)
+                OR (category NOT IN ('original','version') AND run_id IS NOT NULL AND candidate_version BETWEEN 1 AND 3))
+        ) STRICT""",
+        "CREATE INDEX storage_objects_owner ON storage_objects(session_id)",
+        "CREATE UNIQUE INDEX storage_single_original ON storage_objects(session_id) WHERE category='original'",
+        "CREATE UNIQUE INDEX storage_single_candidate ON storage_objects(run_id,candidate_version) WHERE category='candidate'",
+        """CREATE TRIGGER storage_identity_immutable BEFORE UPDATE ON storage_identity
+            BEGIN SELECT RAISE(ABORT, 'storage root identity is immutable'); END""",
+        """CREATE TRIGGER storage_identity_no_delete BEFORE DELETE ON storage_identity
+            BEGIN SELECT RAISE(ABORT, 'storage root identity is required'); END""",
+        """CREATE TRIGGER storage_namespace_immutable BEFORE UPDATE ON storage_namespaces
+            WHEN NEW.session_id IS NOT OLD.session_id OR NEW.namespace_id IS NOT OLD.namespace_id
+            BEGIN SELECT RAISE(ABORT, 'storage ownership is immutable'); END""",
+        """CREATE TRIGGER storage_object_immutable BEFORE UPDATE ON storage_objects
+            WHEN NEW.object_id IS NOT OLD.object_id OR NEW.session_id IS NOT OLD.session_id
+                OR NEW.category IS NOT OLD.category OR NEW.file_type IS NOT OLD.file_type
+                OR NEW.run_id IS NOT OLD.run_id OR NEW.candidate_version IS NOT OLD.candidate_version
+                OR NEW.byte_count IS NOT OLD.byte_count OR NEW.created_at IS NOT OLD.created_at
+                OR (OLD.state='SEALED')
+            BEGIN SELECT RAISE(ABORT, 'storage metadata is immutable'); END""",
+        *tuple(
+            f"""CREATE TRIGGER {table}_active_insert BEFORE INSERT ON {table}
+                WHEN NOT EXISTS(SELECT 1 FROM sessions WHERE session_id=NEW.session_id
+                    AND revoked_at IS NULL AND deletion_requested_at IS NULL AND expires_at>retention_now())
+                BEGIN SELECT RAISE(ABORT, 'session is inactive'); END"""
+            for table in ('storage_namespaces', 'storage_objects')
+        ),
+        """CREATE TRIGGER storage_active_seal BEFORE UPDATE ON storage_objects
+            WHEN NOT EXISTS(SELECT 1 FROM sessions WHERE session_id=NEW.session_id
+                AND revoked_at IS NULL AND deletion_requested_at IS NULL AND expires_at>retention_now())
+            BEGIN SELECT RAISE(ABORT, 'session is inactive'); END""",
+        """CREATE TRIGGER storage_run_owner BEFORE INSERT ON storage_objects
+            WHEN NEW.run_id IS NOT NULL AND NOT EXISTS(
+                SELECT 1 FROM runs WHERE run_id=NEW.run_id AND session_id=NEW.session_id)
+            BEGIN SELECT RAISE(ABORT, 'storage run owner mismatch'); END""",
+        """CREATE TRIGGER storage_no_unverified_session_delete BEFORE DELETE ON sessions
+            WHEN EXISTS(SELECT 1 FROM storage_namespaces WHERE session_id=OLD.session_id AND cleaned_at IS NULL)
+                OR EXISTS(SELECT 1 FROM storage_objects WHERE session_id=OLD.session_id)
+            BEGIN SELECT RAISE(ABORT, 'storage cleanup is not verified'); END""",
     ),
 }

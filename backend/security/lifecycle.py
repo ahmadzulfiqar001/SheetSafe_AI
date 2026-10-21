@@ -231,8 +231,9 @@ class LifecycleCoordinator:
                 raise _CleanupFailure("UNVERIFIED")
             storage = connection.execute(
                 """SELECT 1 FROM datasets WHERE session_id=? UNION ALL
-                    SELECT 1 FROM attempts a JOIN runs r USING(run_id) WHERE r.session_id=? LIMIT 1""",
-                (job["session_id"], job["session_id"]),
+                    SELECT 1 FROM attempts a JOIN runs r USING(run_id) WHERE r.session_id=? UNION ALL
+                    SELECT 1 FROM storage_namespaces WHERE session_id=? LIMIT 1""",
+                (job["session_id"],) * 3,
             ).fetchone() is not None
             runtime = connection.execute(
                 """SELECT 1 FROM runs WHERE session_id=? AND
@@ -268,6 +269,7 @@ class LifecycleCoordinator:
             session = connection.execute("SELECT * FROM sessions WHERE session_id=?", (job["session_id"],)).fetchone()
             if session is None or session["revoked_at"] is None or session["deletion_requested_at"] is None:
                 raise _CleanupFailure("UNVERIFIED")
+            connection.execute("DELETE FROM storage_objects WHERE session_id=?", (job["session_id"],))
             connection.execute("DELETE FROM sessions WHERE session_id=?", (job["session_id"],))
             connection.execute(
                 """UPDATE cleanup_requests SET phase='CHECKPOINT', storage_status=?, runtime_status=?

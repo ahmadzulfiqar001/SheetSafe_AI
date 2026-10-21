@@ -15,6 +15,7 @@ from backend.config import Settings
 from backend.security.lifecycle import LifecycleCoordinator
 from backend.security.sessions import SessionService
 from backend.storage.database import Database
+from backend.storage.files import PrivateStorage
 
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         application.state.sessions = None
         application.state.lifecycle = None
         application.state.cleanup_task = None
+        application.state.storage = None
         stop = asyncio.Event()
         cleanup_task = None
         try:
@@ -41,12 +43,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 # not block the event loop during startup.
                 await run_in_threadpool(database.initialize)
                 await run_in_threadpool(database.check_ready, full_integrity=True)
-                lifecycle = LifecycleCoordinator(database, settings)
+                storage = PrivateStorage(database, settings)
+                await run_in_threadpool(storage.initialize)
+                lifecycle = LifecycleCoordinator(database, settings, storage=storage)
                 await lifecycle.run_once()  # Recover expired/abandoned work before readiness.
             except Exception as error:
                 logger.error("Database startup failed; exception_type=%s", type(error).__name__)
                 raise RuntimeError("Database startup checks failed") from None
             application.state.database = database
+            application.state.storage = storage
             lifecycle.worker_required = lifecycle.running = True
             cleanup_task = asyncio.create_task(lifecycle.serve(stop), name="session-retention")
             application.state.lifecycle = lifecycle
@@ -67,6 +72,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 application.state.sessions = None
                 application.state.lifecycle = None
                 application.state.cleanup_task = None
+                application.state.storage = None
 
     application = FastAPI(
         title="SheetSafe AI API",
@@ -80,6 +86,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.state.sessions = None
     application.state.lifecycle = None
     application.state.cleanup_task = None
+    application.state.storage = None
     application.state.settings = settings
     application.add_middleware(
         SafeCORSMiddleware, allow_origins=list(settings.allowed_origins), allow_credentials=True,

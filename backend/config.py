@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     docs_enabled: bool = False
     database_path: Path = PROJECT_ROOT / "var" / "sheetsafe.sqlite3"
     database_busy_timeout_ms: int = Field(default=5000, ge=1, le=60000)
+    private_storage_path: Path | None = None
     allowed_origins: tuple[str, ...] = ()
     allow_insecure_local_cookies: bool = False
     session_lifetime_seconds: int = Field(default=3600, ge=60, le=3600)
@@ -78,6 +79,12 @@ class Settings(BaseSettings):
         ):
             raise ValueError("Insecure cookies require explicit loopback-only development settings")
         return self
+
+    @property
+    def storage_path(self) -> Path:
+        """Dedicated local namespace; preserve links for the storage safety checks."""
+        path = self.private_storage_path or self.database_path.parent / "storage"
+        return Path.absolute(path if path.is_absolute() else PROJECT_ROOT / path)
 
     @property
     def session_cookie_name(self) -> str:
