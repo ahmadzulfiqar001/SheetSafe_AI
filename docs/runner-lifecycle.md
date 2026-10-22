@@ -3,7 +3,11 @@
 Historical Step 7C evidence. Step 7D now adds read-only preflight and a strict
 native metadata mapper; actual observations and remaining schema/transport gates
 are documented in [runner-preflight.md](runner-preflight.md). Lifecycle behavior,
-image definition and policy restrictions remain unchanged.
+image definition and policy restrictions remained unchanged in Step 7D.
+Step 7G now pins Step 7F's hardened image for static selection only; the old
+identity below is historical and is rejected by current code. See the
+[current admission record](runner-preflight.md#step-7g-local-static-image-admission).
+No real lifecycle transport, container creation or execution is enabled.
 
 Implemented and tested on 2026-10-22 using Python 3.12.13 and existing uv.
 All transport calls in this increment were in-memory fakes. No Docker CLI,

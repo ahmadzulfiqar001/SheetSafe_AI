@@ -1,4 +1,171 @@
-# Step 7D: read-only Engine preflight and metadata verification
+# Read-only Engine preflight and metadata verification
+
+Step 7H adds a separate [read-only host assessment](runner-host-readiness.md).
+It reuses this preflight unchanged, distinguishes advertised LSM support from
+host enforcement evidence and leaves all execution/runtime gates intact.
+Current Windows/Desktop native Linux acceptance remains PENDING.
+
+## Step 7G: local static image admission
+
+Observed on 2026-10-22 at HEAD `169effb`, with uncommitted Step 7E/F changes
+preserved. Read-only real Engine inspection and fake negative/lifecycle tests
+only. No image was built/pulled/retagged/pushed, and no container was created,
+started or executed. No commit, deployment or cloud expenditure occurred.
+
+### Reviewed identity and verification design
+
+| Identity | Exact value / status |
+| --- | --- |
+| Approved local manifest/image ID for static selection | `sha256:551ae45bad03b4a1856ae503c62c01a8078394a19d3c318b53fc9f2e98f66bc9` |
+| Bound local configuration blob digest | `sha256:59f66d35ff913f60851bde600c75680bc0054c04f32ba72ec42ca2ae2ec6d546` |
+| Source/base registry index digest, separately recorded in Dockerfile | `sha256:6a0e06f5ba0b373d051aabd3fffb9b873f27f9a2a3a14bcbe37dee6f0e3bbc70` |
+| Fixed diagnostic tag | `sheetsafe-runner:environment-review` |
+| Remotely verified final runner registry digest | None |
+| Final identity approved for execution | None |
+
+`LOCAL_IMAGE_ID` in docker_backend.py and `LOCAL_CONFIG_DIGEST` in
+engine_metadata.py are updated explicitly from Step 7F's reviewed archive/build
+evidence, never from whichever image a tag currently selects. The source/base
+digest remains a separate build input. Docker locally reports a RepoDigest
+matching this local manifest ID; no registry lookup or push verifies publication.
+
+The read-only client first inspects the exact immutable ID. It requires the
+manifest descriptor and configuration annotation to match the reviewed pair,
+Linux/amd64, UID/GID 10001, exact startup/working directory/stop signal, labels,
+ArgsEscaped and the approved environment. All required image Config fields must
+exist; unknown configuration keys are rejected. Only absent/null/empty
+Volumes/ExposedPorts/OnBuild encodings are allowed. Validly parsed environment
+drift remains an explicit `IMAGE_ENVIRONMENT_MISMATCH` blocking issue.
+
+The client then independently inspects the fixed diagnostic tag, checks its ID
+against the approved immutable ID and validates its metadata too. Reassignment
+reports `IMAGE_TAG_MISMATCH`. Missing/malformed metadata, unavailable images,
+timeouts and inspection errors fail closed with `IMAGE_METADATA_UNAVAILABLE`;
+no raw error, private value, pull or old-image fallback is used. Failure of
+immutable-ID inspection prevents any tag-based fallback lookup.
+
+The command allowlist adds only that exact tag inspection. There are now five
+read-only query shapes (context/version/info/image-ID/image-tag), with the same
+local-channel checks, bounded time/output, API pin and minimal environment.
+No caller image argument, environment setting or policy override is accepted.
+
+A tag check is a point-in-time consistency observation, not a lock on Docker's
+tag map. Even if it changes immediately afterwards, the frozen job specification
+contains only the reviewed immutable ID, never that tag. A future real driver
+must repeat image/preflight verification before creating anything, use the exact
+ID without pulls or fallbacks, and satisfy the separately approved runtime gates.
+There is still no concrete lifecycle transport or approved creation path. The
+existing injectable lifecycle contract is exercised with fakes only.
+
+The old `4f6d2d...` manifest and `0d78a20...` configuration identities are no
+longer accepted. A build, download or retag cannot change these source-controlled
+pins automatically. Frozen Python values guard routine mutation; they do not
+defend against a compromised operator process, local daemon or image store.
+Image-store/context ownership and host service permissions remain deployment
+trust prerequisites. This local containerd OCI descriptor schema is deliberately
+specific; different Engine identity representations require another review.
+
+Official read-only inspection and tag semantics:
+[Docker image inspect](https://docs.docker.com/reference/cli/docker/image/inspect/),
+[Docker image tag](https://docs.docker.com/reference/cli/docker/image/tag/).
+
+### Real inspection and current preflight outcome
+
+```powershell
+docker --context desktop-linux image inspect sha256:551ae45bad03b4a1856ae503c62c01a8078394a19d3c318b53fc9f2e98f66bc9 --format '{{json .}}'
+uv run --frozen --no-sync python -m var.step7g-inspection.verify_selection
+```
+
+Both exited 0. The one-off local host audit uses the production read-only client,
+verifies both resolutions and compares the selected pair to Step 7F's saved
+summary. Raw metadata/summary and helper remain under ignored
+`var/step7g-inspection`; they are audit artifacts, not production modules.
+
+Observed: Linux/amd64; user `10001:10001`; workdir `/work`; stop signal SIGTERM;
+entrypoint `["/usr/local/bin/python", "-I", "-S", "-B", "-u", "/opt/sheetsafe/bootstrap.py"]`;
+command `["smoke-v1"]`; exactly this environment:
+
+```text
+PATH=/usr/local/bin:/usr/bin:/bin
+LANG=C.UTF-8
+HOME=/nonexistent
+```
+
+Image issues: empty. Tag consistency: verified at inspection time. Current
+preflight issues: **`LSM_NOT_ADVERTISED` only**. Engine 29.9.1/API 1.56 reports
+Linux x86_64, cgroup v2/cgroupfs, resource support and builtin seccomp. It still
+does not advertise AppArmor or SELinux; compiled runc support is not enforcement.
+`metadata_prerequisites_met=False`, `execution_enabled=False`, and SEC01-SEC10
+remain UNVERIFIED. The always-failing execution gate was explicitly checked.
+`SandboxPolicy.final_image_digest`, `ImageFacts.final_approved_identity` and
+`verified_registry_digest` remain None. They are not static-selection permits.
+
+Static image approval removes the image-selection blocker, not the host/runtime
+release gates. Seccomp, non-root execution/capabilities, network denial,
+read-only root/tmpfs, CPU/memory/PID limits, watchdog, cancellation, fresh state,
+scoped cleanup and durable orphan recovery still need effective acceptance tests.
+Actual process ENV (including daemon-added HOSTNAME) remains unmeasured.
+Stopped-container archive extraction conflicts with read-only root; tmpfs hides
+pre-start files and disappears on stop. Secure input preparation and pre-stop
+artifact collection remain unresolved; no bind-mount or post-start-upload
+workaround was added. Private uploads stay disabled.
+
+### Changes, negative tests and next review
+
+Step 7G modifies runner/docker_backend.py, runner/engine_metadata.py,
+runner/preflight.py and the explanatory docstring in runner/policy.py; tests are
+in tests/test_runner_preflight.py and tests/test_runner_lifecycle.py. Documentation
+updates are README.md, runner-foundation-plan.md, runner-preflight.md,
+runner-image-rebuild.md and runner-lifecycle.md. No dependencies, migrations,
+backend/authentication files, Dockerfile instructions or bootstrap changed here.
+Earlier uncommitted image-definition/test/environment-document changes remain.
+
+New fake cases cover the exact pin pair, old/crossed/wrong IDs, tag reassignment,
+missing/malformed metadata, inspection errors, wrong OS/architecture/user/startup,
+unexpected environment/configuration, caller image overrides and execution staying
+disabled. A passing-image preflight still reports missing LSM; native mapping
+still rejects that host. Existing seccomp/resource/filesystem/cleanup rejection
+tests remain in the suite. No real Docker tag was reassigned to test rejection.
+
+Actual uv/Python 3.12 verification:
+
+```powershell
+uv run --frozen --no-sync python -m pytest tests/test_runner_image.py tests/test_runner_policy.py -q -p no:cacheprovider
+# 100 passed in 0.31s
+uv run --frozen --no-sync python -m pytest tests/test_runner_preflight.py tests/test_runner_lifecycle.py -q -p no:cacheprovider
+# 356 passed in 1.32s
+uv run --frozen --no-sync python -m pytest -q -rs -p no:cacheprovider --basetemp var/step7g-tests-20261022
+# 682 passed, 1 skipped, 1 warning in 35.79s
+uv run --frozen --no-sync python -m compileall -q backend runner tests
+# exit 0
+git diff --check
+# exit 0
+```
+
+All tests passed. The existing Windows symlink-creation privilege skip at
+`tests/test_storage.py:176` and Starlette TestClient/httpx deprecation warning
+remain visible. Git LF/CRLF advisories are separate. HEAD stays `169effb`;
+all Step 7E-G changes remain unstaged. Image archives/raw metadata, SQLite,
+virtual environments and secret environment files stay ignored; `.env.example`
+is tracked. No source-controlled secret or runtime file was added. Pattern scans
+are heuristic, not a credential-absence certification.
+
+Next smallest proposed milestone: read-only preflight of a supported operator-owned
+Linux verification host, explicitly measuring LSM/profile prerequisites and
+service/context permissions. Do not provision a VM or spend credits implicitly.
+Desktop results cannot certify the Vultr kernel, LSM, cgroups, swap/storage or
+runtime behavior. Repeat the mandatory native-Linux storage symlink test without
+skipping, then obtain separate approval for any fixed-code runtime experiment.
+Resolve stopped-input/archive and collector design gates before spreadsheet
+parsing. Do not bypass missing LSM or enable execution in the meantime.
+
+## Historical Step 7D evidence
+
+Historical Step 7D evidence. Step 7E's definition/static tests are recorded in
+[runner-image-environment.md](runner-image-environment.md). Step 7F's separate
+review build is recorded in [runner-image-rebuild.md](runner-image-rebuild.md).
+Step 7G updates static identity pins as documented above; the historical hashes
+and next-step proposals below describe Step 7D only. Runtime gates remain intact.
 
 Implemented on 2026-10-22 in the existing Python 3.12.13/uv environment. No new
 dependencies. Work began from clean commit `4a13b0f`; the attachment's `407ad08`
@@ -76,6 +243,12 @@ compiled AppArmor/SELinux support, but it does not prove the daemon enabled an L
 or that a profile is enforced. No settings were weakened to obtain a green result.
 
 ## Image identity and hardening review
+
+Historical Step 7D observations below apply to the unchanged pinned old image.
+Step 7F has since built and statically inspected a separate environment-corrected
+review image; see [runner-image-rebuild.md](runner-image-rebuild.md). The preflight
+still uses its original identity pins and remains blocked. Neither review admits
+the new image for execution or bypasses `LSM_NOT_ADVERTISED`.
 
 The inspected image is still the Step 7B image:
 

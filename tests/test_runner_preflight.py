@@ -8,7 +8,7 @@ import subprocess
 
 import pytest
 
-from runner.docker_backend import ContainerJobSpec, LOCAL_IMAGE_ID, verify_configuration
+from runner.docker_backend import ContainerJobSpec, LOCAL_IMAGE_ID, LOCAL_REVIEW_TAG, verify_configuration
 from runner.engine_metadata import (
     LOCAL_CONFIG_DIGEST, MetadataError, map_container, parse_engine, parse_image,
 )
@@ -33,13 +33,15 @@ def info_response():
 
 
 def image_response():
-    # Synthetic target metadata, NOT the actual Step 7B environment (tested below).
+    # Synthetic Step 7F/G contract; live evidence is recorded separately.
     policy = SandboxPolicy()
     return {"Id": LOCAL_IMAGE_ID, "Os": "linux", "Architecture": "amd64", "RepoDigests": [],
         "Descriptor": {"digest": LOCAL_IMAGE_ID, "mediaType": "application/vnd.oci.image.manifest.v1+json",
                        "annotations": {"config.digest": LOCAL_CONFIG_DIGEST}},
         "Config": {"User": "10001:10001", "Entrypoint": list(policy.entrypoint), "Cmd": ["smoke-v1"],
-            "WorkingDir": "/work", "StopSignal": "SIGTERM", "Env": [f"{k}={v}" for k, v in policy.environment]}}
+            "WorkingDir": "/work", "StopSignal": "SIGTERM", "Env": [f"{k}={v}" for k, v in policy.environment],
+            "ArgsEscaped": True, "Labels": {"org.opencontainers.image.title": "SheetSafe fixed smoke fixture",
+                "org.opencontainers.image.version": "smoke-v1", "io.sheetsafe.policy": policy.version}}}
 
 
 def native_response(spec):
@@ -221,6 +223,40 @@ def test_actual_inherited_environment_is_blocked_and_repo_digest_is_not_promoted
         parse_image(image)
 
 
+@pytest.mark.parametrize("name", [
+    "GPG_KEY", "PYTHON_VERSION", "PYTHON_SHA256", "HOSTNAME", "TERM",
+    "VULTR_API_KEY", "AWS_SECRET_ACCESS_KEY", "DOCKER_HOST",
+])
+@pytest.mark.parametrize("value", ["", PRIVATE])
+def test_any_extra_image_environment_key_is_rejected_even_when_empty(name, value):
+    image = image_response()
+    image["Config"]["Env"].append(f"{name}={value}")
+    result = parse_image(image)
+    assert result.issues == ("IMAGE_ENVIRONMENT_MISMATCH",)
+    assert name in result.environment_names
+    assert PRIVATE not in repr(result)
+    assert result.final_approved_identity is result.verified_registry_digest is None
+
+
+@pytest.mark.parametrize("name,value", [
+    ("LANG", ""), ("LANG", "en_US.UTF-8"), ("HOME", ""), ("HOME", "/root"),
+    ("PATH", ""), ("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+    ("PATH", ".:/usr/local/bin:/usr/bin:/bin"),
+])
+def test_approved_image_environment_values_cannot_drift(name, value):
+    image = image_response()
+    image["Config"]["Env"] = [f"{name}={value}" if entry.startswith(name + "=") else entry
+                               for entry in image["Config"]["Env"]]
+    assert parse_image(image).issues == ("IMAGE_ENVIRONMENT_MISMATCH",)
+
+
+@pytest.mark.parametrize("name", ["LANG", "HOME", "PATH"])
+def test_missing_approved_image_environment_value_is_rejected(name):
+    image = image_response()
+    image["Config"]["Env"] = [entry for entry in image["Config"]["Env"] if not entry.startswith(name + "=")]
+    assert parse_image(image).issues == ("IMAGE_ENVIRONMENT_MISMATCH",)
+
+
 @pytest.fixture
 def mapping_case():
     spec = ContainerJobSpec.for_fixture(FixtureRequest("smoke-v1"))
@@ -315,10 +351,11 @@ def test_client_has_only_fixed_read_commands_and_no_mutations(monkeypatch):
     monkeypatch.setattr(preflight, "_capture", capture)
     client = preflight.DockerReadOnlyClient(preflight.LocalContext.DESKTOP_LINUX)
     assert preflight.run_preflight(client).metadata_prerequisites_met
-    assert len(commands) == 7
+    assert len(commands) == 9
     for command in commands:
         assert not set(command) & {"create", "start", "stop", "rm", "run", "exec", "build", "pull", "push", "update"}
-    assert commands[-1] == ["--context", "desktop-linux", "image", "inspect", LOCAL_IMAGE_ID]
+    assert commands[-3] == ["--context", "desktop-linux", "image", "inspect", LOCAL_IMAGE_ID]
+    assert commands[-1] == ["--context", "desktop-linux", "image", "inspect", LOCAL_REVIEW_TAG]
     for name in ("create", "start", "stop", "remove", "exec"):
         assert not hasattr(client, name)
     with pytest.raises(preflight.QueryError):
@@ -385,3 +422,135 @@ def test_cli_failure_output_limits_and_timeout_are_sanitized(monkeypatch, mode):
 def test_even_internal_capture_rejects_commands_and_overrides(arguments):
     with pytest.raises(preflight.QueryError):
         preflight._capture(arguments)
+
+
+OLD_IMAGE_ID = "sha256:4f6d2d12fcecf7c70e7923186c698785cfdf0b370a89c5cee186896207f01756"
+OLD_CONFIG_DIGEST = "sha256:0d78a20a59527cde284674316413b4d1bd5ba66ac95a7639be6b4823fdba1965"
+
+
+@pytest.fixture
+def image_client(monkeypatch):
+    """Read-only fake CLI responses; no tag or container is changed on Docker."""
+    calls = []
+    responses = {LOCAL_IMAGE_ID: [image_response()], LOCAL_REVIEW_TAG: [image_response()]}
+    def capture(arguments):
+        calls.append(arguments)
+        if arguments[0] == "context":
+            return {"Host": "npipe:////./pipe/dockerDesktopLinuxEngine", "SkipTLSVerify": False}
+        if arguments[2:4] == ["image", "inspect"]:
+            value = responses[arguments[-1]]
+            if isinstance(value, Exception):
+                raise value
+            return deepcopy(value)
+        if arguments[2] == "version":
+            return version_response()
+        assert arguments[2] == "info"
+        return info_response()
+    monkeypatch.setattr(preflight, "_capture", capture)
+    return preflight.DockerReadOnlyClient(preflight.LocalContext.DESKTOP_LINUX), calls, responses
+
+
+def test_reviewed_local_pin_pair_is_exact_and_never_execution_permission(image_client):
+    client, calls, _ = image_client
+    assert LOCAL_IMAGE_ID == "sha256:551ae45bad03b4a1856ae503c62c01a8078394a19d3c318b53fc9f2e98f66bc9"
+    assert LOCAL_CONFIG_DIGEST == "sha256:59f66d35ff913f60851bde600c75680bc0054c04f32ba72ec42ca2ae2ec6d546"
+    report = preflight.run_preflight(client)
+    assert report.metadata_prerequisites_met and not report.execution_enabled
+    assert report.image.verified_registry_digest is report.image.final_approved_identity is None
+    assert SandboxPolicy().final_image_digest is None and not SandboxPolicy().execution_enabled
+    assert len(report.unverified_controls) == 10
+    assert [args[-1] for args in calls if "image" in args] == [LOCAL_IMAGE_ID, LOCAL_REVIEW_TAG]
+    assert ContainerJobSpec().create_body()["Image"] == LOCAL_IMAGE_ID
+
+
+@pytest.mark.parametrize("replacement", [OLD_IMAGE_ID, "sha256:" + "f" * 64, LOCAL_REVIEW_TAG])
+def test_reassigned_review_tag_is_rejected_without_fallback(image_client, replacement):
+    client, calls, responses = image_client
+    responses[LOCAL_REVIEW_TAG][0]["Id"] = replacement
+    report = preflight.run_preflight(client)
+    assert report.issues == ("IMAGE_TAG_MISMATCH",) and report.image is None
+    assert not report.metadata_prerequisites_met and not report.execution_enabled
+    assert len([args for args in calls if "image" in args]) == 2
+    assert ContainerJobSpec().image_id == LOCAL_IMAGE_ID  # Never follows the tag.
+
+
+@pytest.mark.parametrize("reference", [LOCAL_IMAGE_ID, LOCAL_REVIEW_TAG])
+@pytest.mark.parametrize("response", [[], [{}], [None], {}, None, [image_response(), image_response()],
+    preflight.QueryError(), RuntimeError(PRIVATE)])
+def test_missing_or_failed_image_inspection_is_closed_and_sanitized(image_client, reference, response, caplog):
+    client, calls, responses = image_client
+    responses[reference] = response
+    report = preflight.run_preflight(client)
+    assert report.issues == ("IMAGE_METADATA_UNAVAILABLE",)
+    assert report.image is None and not report.execution_enabled and not report.metadata_prerequisites_met
+    assert PRIVATE not in repr(report) + caplog.text
+    if reference == LOCAL_IMAGE_ID:
+        assert not any(args[-1] == LOCAL_REVIEW_TAG for args in calls)  # No tag fallback.
+
+
+@pytest.mark.parametrize("reference", [LOCAL_IMAGE_ID, LOCAL_REVIEW_TAG])
+@pytest.mark.parametrize("section,key,value", [
+    (None, "Architecture", "arm64"), (None, "Os", "windows"),
+    ("Descriptor", "digest", OLD_IMAGE_ID),
+    ("Config", "User", "root"), ("Config", "Entrypoint", ["/bin/sh"]),
+    ("Config", "Cmd", ["arbitrary"]), ("Config", "Env", ["PRIVATE=" + PRIVATE]),
+    ("Config", "ArgsEscaped", False), ("Config", "Labels", {}),
+    ("Config", "Healthcheck", {"Test": ["CMD", "sh"]}),
+])
+def test_both_image_resolutions_reject_unreviewed_metadata(image_client, reference, section, key, value):
+    client, _, responses = image_client
+    raw = responses[reference][0]
+    (raw if section is None else raw[section])[key] = value
+    report = preflight.run_preflight(client)
+    assert report.issues and not report.metadata_prerequisites_met and not report.execution_enabled
+    assert PRIVATE not in repr(report)
+
+
+@pytest.mark.parametrize("field", list(image_response()["Config"]))
+def test_each_reviewed_image_configuration_field_is_required(field):
+    raw = image_response()
+    del raw["Config"][field]
+    with pytest.raises(MetadataError):
+        parse_image(raw)
+
+
+@pytest.mark.parametrize("id_value,config_value", [
+    (OLD_IMAGE_ID, OLD_CONFIG_DIGEST), (OLD_IMAGE_ID, LOCAL_CONFIG_DIGEST),
+    (LOCAL_IMAGE_ID, OLD_CONFIG_DIGEST), (LOCAL_CONFIG_DIGEST, LOCAL_CONFIG_DIGEST),
+])
+def test_old_or_crossed_identity_pairs_cannot_be_admitted(id_value, config_value):
+    raw = image_response()
+    raw["Id"] = raw["Descriptor"]["digest"] = id_value
+    raw["Descriptor"]["annotations"]["config.digest"] = config_value
+    with pytest.raises(MetadataError):
+        parse_image(raw)
+
+
+def test_local_static_image_approval_does_not_clear_lsm_or_execution_gate(image_client, monkeypatch):
+    from runner.policy import RunnerNotReady, require_execution_ready
+
+    client, _, _ = image_client
+    info = info_response()
+    info["SecurityOptions"].remove("name=apparmor")
+    monkeypatch.setattr(client, "info", lambda: info)
+    report = preflight.run_preflight(client)
+    assert report.issues == ("LSM_NOT_ADVERTISED",)
+    assert report.image.local_image_id == LOCAL_IMAGE_ID and not report.image.issues
+    assert not report.metadata_prerequisites_met and not report.execution_enabled
+    with pytest.raises(RunnerNotReady):
+        require_execution_ready()
+    raw = native_response(ContainerJobSpec())
+    with pytest.raises(MetadataError):
+        map_container(raw, ContainerJobSpec(), report.engine, report.image)
+
+
+@pytest.mark.parametrize("reference", [OLD_IMAGE_ID, "caller:latest", LOCAL_REVIEW_TAG])
+def test_caller_image_selection_overrides_are_not_supported(image_client, reference):
+    client, calls, _ = image_client
+    with pytest.raises(TypeError):
+        preflight.DockerReadOnlyClient(preflight.LocalContext.DESKTOP_LINUX, image=reference)
+    with pytest.raises(TypeError):
+        client.image(reference)
+    with pytest.raises(TypeError):
+        ContainerJobSpec(image_id=reference)
+    assert calls == []

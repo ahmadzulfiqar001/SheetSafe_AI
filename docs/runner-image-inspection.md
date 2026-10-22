@@ -2,7 +2,11 @@
 
 This is the historical Step 7B record. The subsequent fake-only lifecycle adapter
 and additional archive/environment admission blockers are documented in
-[runner-lifecycle.md](runner-lifecycle.md); the image itself is unchanged.
+[runner-lifecycle.md](runner-lifecycle.md). The old image is preserved unchanged.
+Step 7E changed the Dockerfile; Step 7F built and inspected that definition under
+a separate review tag. The hashes/layers below describe only the historical
+Step 7B build. See the [environment hardening review](runner-image-environment.md)
+and [Step 7F rebuild evidence](runner-image-rebuild.md) for the new image.
 
 Observed on 2026-10-22. Build and static inspection passed. No container was
 created, started or executed for this increment. The smoke fixture did not run.

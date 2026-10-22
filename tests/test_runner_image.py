@@ -4,7 +4,6 @@ import ast
 import fnmatch
 import json
 from pathlib import Path
-import re
 import shlex
 
 import pytest
@@ -21,16 +20,20 @@ def instructions():
     return [line.strip().split(None, 1) for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
 
 
-def test_image_has_one_digest_pinned_official_base_and_no_override_arguments():
+def test_image_has_exact_pinned_source_and_independent_final_stage():
     rows = instructions()
-    assert rows[0][0] == "FROM"
-    assert re.fullmatch(r"docker\.io/library/python:3\.12-slim-bookworm@sha256:[0-9a-f]{64}", rows[0][1])
-    # No network installer, build-argument image substitution, arbitrary build
-    # scripts, ports, volume declarations or additional stages may slip in.
-    assert [command for command, _ in rows].count("FROM") == 1
-    assert {command for command, _ in rows} <= {
-        "FROM", "LABEL", "ENV", "COPY", "USER", "WORKDIR", "STOPSIGNAL", "ENTRYPOINT", "CMD",
-    }
+    assert rows[:3] == [
+        ["FROM", "docker.io/library/python:3.12-slim-bookworm@sha256:6a0e06f5ba0b373d051aabd3fffb9b873f27f9a2a3a14bcbe37dee6f0e3bbc70 AS python_source"],
+        ["FROM", "scratch"],
+        ["COPY", "--from=python_source / /"],
+    ]
+    # This exact graph replaces the old single-stage contract. An independent
+    # final stage copies files, not inherited image configuration. No third
+    # stage, installer, ARG substitution, extra ENV or startup override is allowed.
+    assert [command for command, _ in rows] == [
+        "FROM", "FROM", "COPY", "LABEL", "ENV", "COPY", "USER", "WORKDIR",
+        "STOPSIGNAL", "ENTRYPOINT", "CMD",
+    ]
 
 
 def test_image_non_root_fixed_exec_entrypoint_and_read_only_fixture_definition():
@@ -43,6 +46,21 @@ def test_image_non_root_fixed_exec_entrypoint_and_read_only_fixture_definition()
     assert rows["COPY"] == "--chown=0:0 --chmod=0444 bootstrap.py /opt/sheetsafe/bootstrap.py"
     assert dict(item.split("=", 1) for item in shlex.split(rows["ENV"])) == dict(policy.environment)
     assert rows["STOPSIGNAL"] == "SIGTERM"
+
+
+def test_final_definition_has_only_the_approved_environment_and_reviewed_copies():
+    rows = instructions()
+    declared = [arguments for command, arguments in rows if command == "ENV"]
+    assert len(declared) == 1
+    entries = shlex.split(declared[0])
+    assert len(entries) == 3  # Duplicate declarations cannot hide behind dict().
+    assert dict(item.split("=", 1) for item in entries) == {
+        "LANG": "C.UTF-8", "HOME": "/nonexistent", "PATH": "/usr/local/bin:/usr/bin:/bin",
+    }
+    assert [arguments for command, arguments in rows if command == "COPY"] == [
+        "--from=python_source / /",
+        "--chown=0:0 --chmod=0444 bootstrap.py /opt/sheetsafe/bootstrap.py",
+    ]
 
 
 def test_build_context_whitelist_excludes_credentials_code_and_runtime_content():

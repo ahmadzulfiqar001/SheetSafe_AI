@@ -19,8 +19,10 @@ from uuid import uuid4
 from runner.policy import FixtureRequest, SandboxPolicy, policy_for
 
 
-# Reviewed Step 7B LOCAL identity, not a registry-published RepoDigest.
-LOCAL_IMAGE_ID = "sha256:4f6d2d12fcecf7c70e7923186c698785cfdf0b370a89c5cee186896207f01756"
+# Step 7G static selection approval of Step 7F's LOCAL manifest identity.
+# Not a registry-published RepoDigest or permission to create/execute containers.
+LOCAL_IMAGE_ID = "sha256:551ae45bad03b4a1856ae503c62c01a8078394a19d3c318b53fc9f2e98f66bc9"
+LOCAL_REVIEW_TAG = "sheetsafe-runner:environment-review"  # Consistency check only.
 API_TIMEOUT_SECONDS = 1.0
 _ID = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -126,9 +128,12 @@ class ContainerJobSpec:
 class DockerTransport(Protocol):
     """No start/exec/build/pull/archive/general-command methods are permitted.
 
-    A real implementation must honor the supplied timeout, use the fixed local
-    Linux/amd64 image without pulling, and map daemon metadata conservatively.
-    No implementation that contacts Docker is supplied by this milestone.
+    A future real implementation must verify the reviewed local manifest/config
+    pair, critical image metadata and fixed-tag consistency before create; use
+    only the exact ID in the spec, without pulling or tag/old-image fallback.
+    Static selection never clears execution/runtime gates. It must also honor
+    the supplied timeout and map daemon metadata conservatively. No production
+    lifecycle transport that contacts Docker is supplied by this milestone.
     """
 
     def create(self, spec: ContainerJobSpec, *, timeout: float) -> str: ...

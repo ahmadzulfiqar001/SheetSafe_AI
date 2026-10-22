@@ -9,7 +9,8 @@ from runner.policy import SandboxPolicy
 
 
 INSPECTION_API = "1.56"  # Reviewed initial schema, not a claim of all-version support.
-LOCAL_CONFIG_DIGEST = "sha256:0d78a20a59527cde284674316413b4d1bd5ba66ac95a7639be6b4823fdba1965"
+# Bound to the reviewed local manifest; distinct from its ID or a registry digest.
+LOCAL_CONFIG_DIGEST = "sha256:59f66d35ff913f60851bde600c75680bc0054c04f32ba72ec42ca2ae2ec6d546"
 
 
 class MetadataError(ValueError):
@@ -156,8 +157,13 @@ def parse_image(raw: object) -> ImageFacts:
     config = object_value(raw.get("Config"))
     policy = SandboxPolicy()
     require(raw.get("Os") == "linux" and raw.get("Architecture") == "amd64")
+    required_config = {"User", "Entrypoint", "Cmd", "WorkingDir", "StopSignal", "Env", "Labels", "ArgsEscaped"}
+    require(required_config <= config.keys()
+        and not config.keys() - required_config - {"Volumes", "ExposedPorts", "OnBuild"})
     for name, expected in {"User": "10001:10001", "Entrypoint": list(policy.entrypoint),
-            "Cmd": ["smoke-v1"], "WorkingDir": "/work", "StopSignal": "SIGTERM"}.items():
+            "Cmd": ["smoke-v1"], "WorkingDir": "/work", "StopSignal": "SIGTERM", "ArgsEscaped": True,
+            "Labels": {"org.opencontainers.image.title": "SheetSafe fixed smoke fixture",
+                "org.opencontainers.image.version": "smoke-v1", "io.sheetsafe.policy": policy.version}}.items():
         require(exact(config.get(name), expected))
     for name in ("Volumes", "ExposedPorts", "OnBuild"):
         require(name not in config or config[name] is None or exact(config[name], {} if name != "OnBuild" else []))

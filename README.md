@@ -27,11 +27,26 @@ the pinned image on Docker Desktop's Linux backend without starting a container.
 Step 7C adds a stopped-container lifecycle adapter tested only with an in-memory
 fake transport: fixed specifications, ownership checks and verified removal.
 Step 7D adds a read-only Engine preflight client and typed, fake-tested native
-metadata mapping. Local preflight reports missing advertised LSM support and
-an image environment mismatch; these blockers have not been bypassed.
+metadata mapping. Its original image environment mismatch prompted the following
+hardening; the missing advertised LSM support remains blocking.
+Step 7E prepares an independent final-stage image definition with only the
+approved environment. Step 7F built it under a separate local review tag and
+verified its actual environment and saved layers without starting a container.
+Step 7G pins the reviewed local manifest/config identity pair and verifies both
+immutable ID and fixed-tag consistency using read-only inspection. The old image,
+tag reassignment and unexpected configuration are rejected without fallback.
+Current real preflight has no image issues and remains blocked by
+`LSM_NOT_ADVERTISED`. Static selection approval does not permit execution.
+Bootstrap and runtime execution policy are unchanged.
+Step 7H adds a portable read-only Linux host evidence probe with synthetic tests.
+Current Windows/Desktop results leave native Linux acceptance PENDING and the
+LSM blocker intact; host observations never authorize container execution.
 Execution stays disabled: no Docker lifecycle transport, runner command or final
 policy image digest is configured, and no smoke payload has been executed.
 Runtime controls remain unverified. See the
+[Linux host readiness and checkpoint review](docs/runner-host-readiness.md),
+[image environment hardening review](docs/runner-image-environment.md),
+[hardened rebuild and static evidence](docs/runner-image-rebuild.md),
 [preflight observations and review proposals](docs/runner-preflight.md),
 [lifecycle contract and transport blockers](docs/runner-lifecycle.md) and
 [image inspection record](docs/runner-image-inspection.md)
@@ -108,7 +123,7 @@ to run them. If a different Windows identity cannot access existing pytest temp
 or cache directories, use a fresh, dedicated `--basetemp var/<unique-test-name>`
 and `-p no:cacheprovider`. Never point pytest's base temp at existing user data.
 
-The Step 7D Windows verification reported 599 passed, 1 skipped and 1
+The Step 7H Windows verification reported 746 passed, 1 skipped and 1
 Starlette/httpx deprecation warning. The skipped file-symlink fixture lacked OS
 creation privilege; real Windows junction and hardlink rejection were tested.
 Linux storage and deployed sandbox acceptance are still required. The follow-up

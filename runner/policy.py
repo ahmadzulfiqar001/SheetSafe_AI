@@ -57,9 +57,10 @@ class TmpfsTarget:
 class SandboxPolicy:
     """No caller-settable constructor fields; all SEC controls remain unverified.
 
-    No final image digest is configured until an image is built, inspected and
-    reviewed. The base image is separately pinned in the Dockerfile. No caller
-    flag, tag, environment variable or readiness boolean can enable execution.
+    Local static image selection is pinned separately from execution permission.
+    No execution-approved final image digest is configured. The source image is
+    separately pinned in the Dockerfile. No caller flag, tag, environment variable
+    or readiness boolean can enable execution.
     """
 
     version: str = field(default="sheetsafe-smoke-policy-v1", init=False)

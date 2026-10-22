@@ -10,7 +10,7 @@ import subprocess
 from threading import Event, Thread
 from typing import Protocol
 
-from runner.docker_backend import LOCAL_IMAGE_ID
+from runner.docker_backend import LOCAL_IMAGE_ID, LOCAL_REVIEW_TAG
 from runner.engine_metadata import INSPECTION_API, EngineFacts, ImageFacts, MetadataError, parse_engine, parse_image, require
 from runner.policy import SandboxPolicy
 
@@ -22,6 +22,10 @@ MAX_OUTPUT_BYTES = 1024 * 1024
 class QueryError(RuntimeError):
     def __init__(self) -> None:
         super().__init__("Docker read-only query failed.")
+
+
+class ImageTagMismatch(QueryError):
+    """A diagnostic tag resolved to another image; never select that replacement."""
 
 
 class LocalContext(StrEnum):
@@ -61,6 +65,7 @@ def _capture(arguments: list[str]) -> object:
             ["--context", context.value, "version", "--format", "{{json .}}"],
             ["--context", context.value, "info", "--format", "{{json .}}"],
             ["--context", context.value, "image", "inspect", LOCAL_IMAGE_ID],
+            ["--context", context.value, "image", "inspect", LOCAL_REVIEW_TAG],
         ])
     if type(arguments) is not list or arguments not in allowed_commands:
         raise QueryError()
@@ -119,7 +124,7 @@ def _capture(arguments: list[str]) -> object:
 
 
 class DockerReadOnlyClient:
-    """Fixed local context and four queries only; no arbitrary command arguments."""
+    """Fixed local context and five queries only; no arbitrary command arguments."""
 
     def __init__(self, context: LocalContext) -> None:
         if type(context) is not LocalContext:
@@ -138,10 +143,21 @@ class DockerReadOnlyClient:
         return _capture(["--context", self._context.value, "info", "--format", "{{json .}}"])
 
     def image(self) -> object:
+        # Select by immutable ID, never a tag or caller input. The separately
+        # queried fixed tag detects reassignment; it is not a fallback selector.
         validate_channel(self.channel())
         result = _capture(["--context", self._context.value, "image", "inspect", LOCAL_IMAGE_ID])
         if type(result) is not list or len(result) != 1:
             raise QueryError()
+        selected = parse_image(result[0])
+        validate_channel(self.channel())
+        tagged = _capture(["--context", self._context.value, "image", "inspect", LOCAL_REVIEW_TAG])
+        if type(tagged) is not list or len(tagged) != 1 or type(tagged[0]) is not dict or "Id" not in tagged[0]:
+            raise QueryError()
+        if tagged[0]["Id"] != LOCAL_IMAGE_ID:
+            raise ImageTagMismatch()
+        # Both responses must satisfy the same critical configuration contract.
+        require(parse_image(tagged[0]).issues == selected.issues)
         return result[0]
 
 
@@ -187,6 +203,8 @@ def run_preflight(reader: EngineReader) -> PreflightReport:
     try:
         image = parse_image(reader.image())
         issues.extend(image.issues)
+    except ImageTagMismatch:
+        issues.append("IMAGE_TAG_MISMATCH")
     except Exception:
         issues.append("IMAGE_METADATA_UNAVAILABLE")
     return PreflightReport(channel, engine, image, tuple(issues))

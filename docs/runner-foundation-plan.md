@@ -12,6 +12,30 @@ Step 7C states, tests and input-transport blockers are recorded in
 [runner-lifecycle.md](runner-lifecycle.md).
 Step 7D's actual blocked preflight, metadata rules, image-hardening proposal and
 input-transport conflict are recorded in [runner-preflight.md](runner-preflight.md).
+Step 7E prepares a two-stage environment-isolating Dockerfile and static tests.
+Step 7F built the separate review image and verified its exact image environment,
+saved-layer hashes, bootstrap and static runtime dependency files. Neither build
+executes the fixture. Step 7G approves that local identity pair for static
+selection only, checks the fixed tag for reassignment and rejects old/substituted
+images. Current read-only preflight reports only `LSM_NOT_ADVERTISED`; the image
+environment matches policy. See [runner-image-environment.md](runner-image-environment.md)
+for definition tradeoffs and [runner-image-rebuild.md](runner-image-rebuild.md)
+for actual Step 7F evidence, identities, tests and remaining runtime gates.
+
+The [Step 7G record](runner-preflight.md#step-7g-local-static-image-admission)
+contains exact identity pins, observations and rejection tests. No locally
+reported RepoDigest is promoted to a verified registry digest. Next smallest
+proposed increment is a read-only supported Linux-host prerequisite review,
+especially effective LSM/profile availability, with execution still disabled.
+Input transport and runtime acceptance remain separate blocking work.
+
+Step 7H implements that read-only host assessment with fixed bounded Linux
+interfaces and separate AppArmor/SELinux enforcement evidence. Synthetic host
+tests pass; real Windows/Desktop preflight still reports `LSM_NOT_ADVERTISED`
+and native Linux acceptance is PENDING. No Linux deployment or runtime has been
+verified. See [host readiness, Linux commands and checkpoint proposal](runner-host-readiness.md).
+The next review is the stopped-input/collector architecture decision and future
+native-host evidence, with no automatic VM provisioning or container execution.
 
 Verification on 2026-10-22: the unchanged checkpoint baseline passed 225 tests
 (one Windows symlink skip and one existing deprecation warning). The new focused
@@ -141,7 +165,7 @@ startup recovery and a later independent supervisor are separate requirements.
 | `runner/engine_metadata.py` | Implemented: typed Engine/image facts and strict native inspection mapping; fake-tested, not runtime enforcement |
 | `runner/preflight.py` | Implemented: fixed read-only local metadata queries; cannot create or execute containers |
 | `runner/__main__.py` | Pending: operator-only fixed-fixture command |
-| `runner/image/Dockerfile` | Locally built and statically inspected in Step 7B; execution/release review pending |
+| `runner/image/Dockerfile` | Step 7F built and statically inspected the pinned source/scratch definition; Step 7G pins its local identity for static selection only |
 | `runner/image/.dockerignore` | Implemented: build context whitelist |
 | `runner/image/bootstrap.py` | Implemented: fixed harmless payload; runtime supervision pending |
 | `tests/test_runner_policy.py` | Implemented: overrides, immutability, import safety, fail-closed state |
@@ -177,10 +201,25 @@ warning in 23.80 seconds. Read-only local preflight completed with explicit
 `LSM_NOT_ADVERTISED` and `IMAGE_ENVIRONMENT_MISMATCH` blockers. API 1.56, Linux/amd64,
 cgroup v2 and builtin seccomp are advertised; no effective protection is certified.
 
-Next smallest slice, after review: implement only the approved image-environment
-hardening definition/static tests, with no automatic build, image substitution or
-execution. Select an LSM-capable Linux verification host separately. A real
-lifecycle transport still needs durable ownership/reconciliation before use.
+Step 7E prepares that definition/static-test slice. The full suite passed 626
+tests, with the existing Windows symlink skip and Starlette/httpx warning, in
+35.13 seconds. Focused image/policy tests passed 100 cases; preflight/lifecycle
+tests passed 300 cases. The environment allowlist, old image identity pins,
+bootstrap and LSM prerequisites remain unchanged. Fresh read-only preflight still
+reported both blockers during Step 7E; no new image existed at that stage.
+
+Step 7F completed that separate review build and offline inspection, without
+container execution: 100 image/policy and 300 preflight/lifecycle tests passed;
+the complete suite reported 626 passed, 1 skipped, 1 warning in 24.18 seconds.
+Syntax and whitespace checks passed. New image metadata matches the environment
+policy; its filesystem/dependency evidence and identity pair are recorded in
+[runner-image-rebuild.md](runner-image-rebuild.md). Final read-only preflight
+still reported both blockers against the old pin at Step 7F. Step 7G now admits
+only the reviewed new local identity for static selection: the current preflight
+has no image issues, remains blocked by missing LSM and cannot enable execution.
+Select an LSM-capable Linux
+verification host separately. Docker-generated process environment, archive
+transport and durable lifecycle recovery remain separate gates.
 
 ## Mandatory profile: PRD SEC01-SEC10
 
