@@ -1,9 +1,102 @@
-# Step 7 proposal: restricted sandbox runner foundation
+# Step 7: restricted sandbox runner foundation
 
-Status: proposal for approval, not implemented. No Docker image, runner process,
-container execution, upload parsing or inference is added by this review.
+Status: policy, image definition, fixed fixture and unit tests implemented.
+Step 7B built and statically inspected the image on Docker Desktop's Linux
+backend without starting a container. Step 7C adds an injectable stopped-container
+lifecycle adapter tested only against a fake transport. No concrete Docker client,
+operator command, broker or container execution is implemented. Every SEC01-SEC10 runtime control
+remains UNVERIFIED. Actual build/inspection evidence and digest distinctions are
+recorded in [runner-image-inspection.md](runner-image-inspection.md).
+Step 7C states, tests and input-transport blockers are recorded in
+[runner-lifecycle.md](runner-lifecycle.md).
 
-## Smallest next implementation: Step 7A
+Verification on 2026-10-22: the unchanged checkpoint baseline passed 225 tests
+(one Windows symlink skip and one existing deprecation warning). The new focused
+runner tests passed 99 cases; Docker BuildKit check-only validation had no warnings.
+The initial combined suite reported 323 passed, one failed, one skipped and one
+warning. Work stopped for review before any further runner implementation.
+
+### Concurrency investigation and regression outcome (2026-10-22)
+
+The original isolated test passed 30 diagnostic runs; tracked connection opens
+and closes balanced, with no connections left open. Controlled real WAL reader
+contention reproduced the failure: the job remained in `CHECKPOINT`/`RETRY`, with
+the next attempt scheduled two controlled seconds later. The old test swept again
+without advancing its frozen clock and incorrectly demanded immediate completion.
+At the stored due time, one sweep completed with one completion event and an
+unchanged deadline. The historical failing run's exact lock holder was not
+recorded; this reproduction confirms the incorrect test timing assumption.
+
+Stress testing also exposed native SQLITE_BUSY (5) on the writer path: a waiting
+checkpointer can block metadata purge or even persistence of the retry record.
+The existing durable retry or 30-second fenced-lease recovery handles those cases.
+An initial test revision failed seven of 30 rounds because it assumed only the
+checkpoint phase could contend. The final regression observes/re-raises native
+errors and permits only the verified SQLITE_BUSY family in this scenario. It
+exercises both competing coordinators and a real pinned reader, rejects early
+reclaim/completion, advances only to stored retry/lease eligibility, then requires
+bounded recovery, final COMPLETE, exactly one completion event/metric, retired
+stale ownership and the unchanged five-minute deadline. No backend implementation,
+security restriction, busy timeout, attempt budget or deadline was changed.
+
+Final observed verification using uv and Python 3.12.13:
+
+- Repeated isolated regression: 30 fresh processes, two cases each; 60 passed,
+  zero failed rounds.
+- Related database/lifecycle/retention/storage suite: 122 passed, one skipped,
+  one existing warning.
+- Complete suite: 325 passed, one skipped, one existing warning in 23.58 seconds.
+- Existing runner policy/image suite: 99 passed. Syntax and diff checks passed.
+
+The remaining skip is the Windows file-symlink privilege limitation documented
+below; the warning is the existing Starlette/httpx deprecation. No Docker image
+was built or run during this investigation. Runtime SEC controls remain
+UNVERIFIED despite passing host-side unit tests.
+
+## First increment boundary and evidence
+
+`runner/policy.py` contains frozen, slot-based canonical policy and an exact
+fixture request parser. Requests accept only `{"fixture_id":"smoke-v1"}`; unknown
+keys, commands, image names, mounts, privilege changes, environment and runtime
+overrides are rejected with a sanitized error. Policy fields cannot be passed
+to its constructor or replaced through ordinary dataclass operations. The module
+does not load `.env`/host settings, import the backend or contact Docker.
+Python freezing prevents accidental mutation, not compromise of the trusted
+runner process. Operator authentication/OS separation requires the later broker.
+
+Execution is explicitly disabled. No final runner image digest is configured,
+and `require_execution_ready()` always raises until an adapter and effective
+runtime validation are implemented. There is no new FastAPI endpoint or Docker
+access in the web service. Existing backend/configuration/migrations are unchanged.
+
+The Dockerfile uses the official Python 3.12 slim-bookworm base pinned to index
+digest `sha256:6a0e06f5ba0b373d051aabd3fffb9b873f27f9a2a3a14bcbe37dee6f0e3bbc70`.
+Registry metadata was read on 2026-10-22 and identified Python 3.12.15. This is a
+base digest, not a built/approved SheetSafe image digest. No base-image layers or
+fixture runtime have been executed by these unit tests. The local project remains
+on its existing Python 3.12 environment.
+
+The image definition selects UID/GID 10001, an exec-form Python entrypoint with
+isolation/no-site/no-bytecode flags, and a root-owned 0444 fixture. Its tiny build
+context excludes everything except the Dockerfile, ignore file and bootstrap.
+There is no build argument, remote ADD, installer, RUN command, published port,
+volume or caller-selected entrypoint. Step 7B inventoried inherited packages and
+environment: shell, pip, Python headers and three public build metadata variables
+remain. Hardening, vulnerability review and alignment with the runtime environment
+allowlist are pending; the Debian slim base is not a certified final sandbox image.
+
+The fixed fixture has no code dispatch. It refuses unsupported arguments and
+checks Linux UID/GID, read-only root, no-new-privileges and effective capabilities
+before touching `/work`. It creates a new synthetic marker with no-follow,
+exclusive file access and probes only a fixed harmless protected-root filename.
+Its stdout explicitly marks runtime verification UNVERIFIED; the future broker
+must use external inspection/measurements and verified teardown, not stdout.
+Do not invoke this fixture directly on the host. Unit tests exercise dispatch
+validation, compile the fixture and inspect the image contract without executing
+the smoke payload. BuildKit `docker build --check --network=none runner/image`
+completed with no warnings; this check does not build the image or run the payload.
+
+## Approved overall Step 7A design (execution adapter still pending)
 
 Build an operator-only, standalone runner harness for one fixed, reviewed smoke
 fixture. Its input selects only an allowlisted fixture ID and opaque job ID; it
@@ -35,25 +128,47 @@ The smoke job's deadline is bounded even though the full durable worker/lease
 integration is deferred. A process crash cannot execute a `finally` block, so
 startup recovery and a later independent supervisor are separate requirements.
 
-## Proposed files (create incrementally after approval)
+## Files and remaining increments
 
 | File | Purpose |
 | --- | --- |
-| `runner/__init__.py` | Separate runner package |
-| `runner/policy.py` | Frozen security profile, fixture IDs and typed receipt |
-| `runner/docker_backend.py` | Create/inspect/start/watchdog/remove/reaper; no general command interface |
-| `runner/__main__.py` | Operator-only fixed-fixture command |
-| `runner/image/Dockerfile` | Minimal, reviewed Python image and non-root identity |
-| `runner/image/bootstrap.py` | Immutable fixed smoke fixture and supervision |
-| `tests/test_runner_policy.py` | Reject overrides and invalid targets; failure-path tests |
-| `tests/integration/test_runner_smoke.py` | Explicitly invoked real Docker smoke and verified teardown |
+| `runner/__init__.py` | Implemented: separate package, import has no execution side effects |
+| `runner/policy.py` | Implemented: frozen target profile and strict fixture IDs; runtime receipts pending |
+| `runner/docker_backend.py` | Implemented: fake-tested stopped create/inspect/remove contract; real transport/start/watchdog/reaper pending |
+| `runner/__main__.py` | Pending: operator-only fixed-fixture command |
+| `runner/image/Dockerfile` | Locally built and statically inspected in Step 7B; execution/release review pending |
+| `runner/image/.dockerignore` | Implemented: build context whitelist |
+| `runner/image/bootstrap.py` | Implemented: fixed harmless payload; runtime supervision pending |
+| `tests/test_runner_policy.py` | Implemented: overrides, immutability, import safety, fail-closed state |
+| `tests/test_runner_image.py` | Implemented: static image/context checks and payload dispatch checks |
+| `tests/test_runner_lifecycle.py` | Implemented: fake transport, specification, ownership, failure/cancellation and cleanup verification |
+| `tests/integration/test_runner_smoke.py` | Pending: real isolated execution and teardown |
 
-Update this plan/README with actual evidence after implementation. Backend API,
+Update this plan/README with further actual evidence after implementation. Backend API,
 session storage, database migrations and inference configuration need no changes
 for the first harness. Add a small image-context `.dockerignore` if required and
 build only from `runner/image/`, never the repository or user home directory.
 Do not create all files in one unverified change: policy tests first, then fixed
 image, then the container lifecycle adapter and its real smoke test.
+
+Step 7B complete-suite verification: 325 passed, one Windows symlink skip and
+one existing Starlette/httpx warning in 44.25 seconds. The focused policy/image
+suite passed 99 tests in 0.16 seconds. Syntax and diff checks passed. No runtime
+payload ran, no runner registry push occurred and policy remains fail-closed
+with `execution_enabled=False` and `final_image_digest=None`.
+
+Step 7C now implements that fake-transport slice. Observed verification:
+101 new lifecycle tests passed; all runner tests: 200 passed; complete suite:
+426 passed, one Windows symlink skip and one existing warning in 22.32 seconds.
+No real Docker operation ran. The strict inspection projection rejects unknown
+metadata and only verifies modeled configuration, not effective SEC enforcement.
+The Step 7B local image identity is fixed inside the job specification; it does
+not populate the policy's final registry digest or enable execution.
+
+Next smallest slice, after review: fixture-driven validation of real Engine
+metadata mapping and image-environment/LSM admission prerequisites, still without
+starting a container. A concrete transport also needs bounded I/O, immutable
+local image resolution and durable reconciliation before real lifecycle use.
 
 ## Mandatory profile: PRD SEC01-SEC10
 
@@ -91,8 +206,13 @@ and the lifecycle runner adapter. Only a verified, matching runtime receipt can
 unblock session cleanup. API access must use a local authenticated/OS-controlled
 channel and a distinct identity. Do not give FastAPI the Docker socket or group.
 
-Data transport and collector remain separate increments: selected bytes enter a
-stopped container through validated archive transport, never a host bind mount.
+Data transport and collector remain separate, blocked increments: selected bytes
+must enter a stopped runtime through validated archive transport, never a host
+bind mount. Copying into `/work` before startup cannot be assumed to survive its
+tmpfs mount. The reviewed Moby archive path also refuses extraction into read-only
+rootfs, so moving staging elsewhere is not sufficient by itself. The safe gated
+design and unresolved Docker capability are detailed in
+[runner-lifecycle.md](runner-lifecycle.md#stopped-container-input-transport-investigation).
 Validate members, reject links/devices/traversal, and install root-owned read-only
 inputs. Collect bounded allowlisted bytes while the runtime is alive, because
 tmpfs does not survive stop; stop candidate descendants before collecting.

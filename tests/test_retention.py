@@ -2,6 +2,7 @@
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 import sqlite3
 from threading import Event
@@ -332,21 +333,120 @@ def test_concurrent_delete_and_internal_requests_have_one_durable_receipt(enviro
     assert table_count(database, "audit_events") == 3
 
 
-def test_competing_coordinators_cannot_double_complete(environment) -> None:
-    _, settings, database, coordinator, service = environment
+@pytest.mark.parametrize("pin_reader", [False, True], ids=["competing-checkpoints", "pinned-reader"])
+def test_competing_coordinators_cannot_double_complete(
+    environment, pin_reader: bool, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock, settings, database, coordinator, service = environment
     issued = service.create("192.0.2.1")
     service.revoke(issued.credential, issued.principal.session_id)
+    deadline = job_row(database, issued.principal.session_id)["deadline_at"]
+    database_errors = []
+
+    # Observe and re-raise real errors. A retry must never conceal corruption,
+    # invalid SQL, I/O failures or other errors unrelated to this contention test.
+    def observe_scope(manager):
+        @contextmanager
+        def scope():
+            try:
+                with manager() as connection:
+                    yield connection
+            except sqlite3.Error as error:
+                database_errors.append(error)
+                raise
+        return scope
+
+    checkpoint = database.verify_checkpoint
+
+    def observe_checkpoint():
+        try:
+            checkpoint()
+        except sqlite3.Error as error:
+            database_errors.append(error)
+            raise
+
+    monkeypatch.setattr(database, "transaction", observe_scope(database.transaction))
+    monkeypatch.setattr(database, "connection", observe_scope(database.connection))
+    monkeypatch.setattr(database, "verify_checkpoint", observe_checkpoint)
 
     async def compete():
         return await asyncio.gather(coordinator.run_once(), LifecycleCoordinator(database, settings).run_once(),
                                     return_exceptions=True)
 
-    results = asyncio.run(compete())
+    with ExitStack() as resources:
+        if pin_reader:
+            # Real SQLite snapshot, not a mocked checkpoint error. Keep the old
+            # frames pinned until both coordinators have finished their sweeps.
+            reader = resources.enter_context(database.connection())
+            reader.execute("SELECT * FROM sessions").fetchall()
+        results = asyncio.run(compete())
     assert all(result is None or isinstance(result, (DatabaseReadinessError, sqlite3.OperationalError)) for result in results)
-    asyncio.run(coordinator.run_once())
-    assert job_row(database, issued.principal.session_id)["state"] == "COMPLETE"
+    assert all((error.sqlite_errorcode & 0xFF) == sqlite3.SQLITE_BUSY for error in database_errors)
+    pending = job_row(database, issued.principal.session_id)
+    assert pending["state"] in {"COMPLETE", "PENDING", "RETRY", "RUNNING"}
+    if pin_reader:
+        assert pending["state"] != "COMPLETE"
+        assert any(result is not None for result in results)
+    due_at = None
+    if pending["state"] == "RETRY":
+        if pending["last_error_code"] == "CHECKPOINT_BUSY":
+            assert pending["phase"] == "CHECKPOINT"
+        else:
+            assert pending["last_error_code"] == "DATABASE_FAILURE" and database_errors
+        assert pending["attempts"] == 1 and pending["completed_at"] is None
+        assert pending["lease_token"] is None and pending["lease_expires_at"] is None
+        due_at = pending["next_attempt_at"]
+        with database.connection() as connection:
+            assert coordinator.admissions_paused(connection)
+    elif pending["state"] == "RUNNING":
+        # A busy writer can also prevent persisting _fail(). That exception must
+        # remain visible; the existing fenced lease then governs crash recovery.
+        assert any(isinstance(result, sqlite3.OperationalError) for result in results)
+        assert database_errors and pending["attempts"] == 1
+        assert pending["lease_token"] is not None
+        due_at = pending["lease_expires_at"]
+    elif pending["state"] == "PENDING":
+        assert database_errors and pending["attempts"] == 0
+
+    if pending["state"] != "COMPLETE":
+        assert pending["completed_at"] is None
+        with database.connection() as connection:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM audit_events WHERE event_type='CLEANUP_COMPLETED'",
+            ).fetchone()[0] == 0
+        with pytest.raises(SessionError):
+            service.authenticate(issued.credential)
+
+    if due_at is not None:
+        assert clock[0] < due_at < deadline
+        # Clearing the lock waives neither durable backoff nor a live lease.
+        # An early sweep cannot reclaim the job or consume another attempt.
+        asyncio.run(coordinator.run_once())
+        assert job_row(database, issued.principal.session_id) == pending
+        clock[0] = due_at
+
+    # A fresh coordinator models restart recovery at the exact eligible time.
+    # One bounded sweep must complete after contention ends; no sleep/retry loop.
+    recovered = LifecycleCoordinator(database, settings)
+    asyncio.run(recovered.run_once())
+    complete = job_row(database, issued.principal.session_id)
+    assert complete["state"] == "COMPLETE" and complete["phase"] == "CHECKPOINT"
+    assert complete["deadline_at"] == deadline and complete["completed_at"] < deadline
+    assert complete["attempts"] <= 2
+    assert complete["lease_token"] is None and complete["lease_expires_at"] is None
+    if pending["state"] == "RUNNING":
+        with pytest.raises(_LeaseLost):
+            coordinator._complete(pending)  # The recovered lease retires its old owner.
+    with pytest.raises(SessionError):
+        service.authenticate(issued.credential)
+    asyncio.run(coordinator.run_once())  # Completion must remain idempotent.
     with database.connection() as connection:
         assert connection.execute("SELECT value FROM cleanup_daily_metrics WHERE metric='COMPLETED'").fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM audit_events WHERE event_type='CLEANUP_COMPLETED'",
+        ).fetchone()[0] == 1
+        assert not recovered.admissions_paused(connection)
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
 def test_deadline_miss_is_sticky_visible_and_counted_once(environment) -> None:

@@ -43,6 +43,26 @@ event loop; adapters have a two-second default timeout. Jobs and retention pruni
 have bounded batch sizes. Graceful shutdown signals the task and awaits its current
 cycle; process crashes leave durable leases rather than a false success.
 
+Leases serialize ownership of an individual cleanup job, not all database-wide
+checkpoints. Concurrent sweeps can contend on SQLite's exclusive checkpoint lock,
+or an active reader/writer can prevent WAL truncation. SQLite may return BUSY
+immediately for another checkpointer even when a busy timeout is configured.
+This is an eligible `CHECKPOINT_BUSY` failure: retain the `CHECKPOINT` phase,
+release the job lease and schedule the existing bounded backoff. Clearing the
+lock does not make an early sweep eligible or constitute a completion receipt.
+The worker must reach `next_attempt_at`, verify truncation and recheck its lease
+before recording exactly one completion. The original 300-second deadline never
+moves. See [SQLite checkpoint locking](https://www.sqlite.org/c3ref/wal_checkpoint_v2.html).
+
+A checkpointer waiting for readers can also hold SQLite's writer lock. A short
+purge transaction may therefore fail with native SQLITE_BUSY before reaching the
+checkpoint phase. If even persisting the failure cannot acquire that writer
+lock, the error propagates and the job retains its existing `RUNNING` lease.
+That is not completion: the same owner/session cannot regain access or publish.
+After the fixed 30-second lease expires, normal fenced recovery records the
+abandoned claim and uses the remaining attempt budget. Neither that recovery nor
+the next eligible retry extends the five-minute application-data deadline.
+
 Explicit transient adapter failures, timeouts, database errors and checkpoint
 contention retry with bounded backoff, at most five claims by default. Missing
 adapters, invalid verification and unknown adapter failures block for operator

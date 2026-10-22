@@ -18,10 +18,26 @@ This repository does not yet provide a working autonomous analysis application.
   SHA-256 verification, staging/atomic sealing, quarantine and verified scoped
   file cleanup. This is a byte store, not a spreadsheet safety validator.
 
+## Step 7 runner foundation
+
+The separate `runner/` package defines a frozen SEC01-SEC10 target policy, strict
+allowlisted `smoke-v1` requests, a digest-pinned Dockerfile and a fixed harmless
+fixture. Policy/image contract tests pass. Step 7B built and statically inspected
+the pinned image on Docker Desktop's Linux backend without starting a container.
+Step 7C adds a stopped-container lifecycle adapter tested only with an in-memory
+fake transport: fixed specifications, ownership checks and verified removal.
+Execution stays disabled: no concrete Docker transport, runner command or final
+policy image digest is configured, and no smoke payload has been executed.
+Runtime controls remain unverified. See the
+[lifecycle contract and transport blockers](docs/runner-lifecycle.md) and
+[image inspection record](docs/runner-image-inspection.md)
+for actual hashes, inherited base assets and limitations, and the
+[runner plan](docs/runner-foundation-plan.md) for pending work.
+
 ## Not implemented or enabled
 
-Private/customer uploads, upload/download APIs, spreadsheet parsing, sandbox
-runner, Vultr inference, agent planning, self-healing, independent numerical
+Private/customer uploads, upload/download APIs, spreadsheet parsing, real Docker
+execution transport, Vultr inference, agent planning, self-healing, independent numerical
 validation and Streamlit screens are not implemented. The `validated` storage
 category is reserved; result publication is blocked. Installed libraries do not
 mean their product features are operational.
@@ -78,7 +94,7 @@ Never place real keys, uploads or runtime receipts in the source tree.
 
 ```powershell
 uv run --frozen --no-sync python -m pytest -q -rs
-uv run --frozen --no-sync python -m compileall -q backend tests
+uv run --frozen --no-sync python -m compileall -q backend runner tests
 git diff --check
 ```
 
@@ -88,7 +104,7 @@ to run them. If a different Windows identity cannot access existing pytest temp
 or cache directories, use a fresh, dedicated `--basetemp var/<unique-test-name>`
 and `-p no:cacheprovider`. Never point pytest's base temp at existing user data.
 
-The latest Step 6 Windows verification reported 225 passed, 1 skipped and 1
+The Step 7C Windows verification reported 426 passed, 1 skipped and 1
 Starlette/httpx deprecation warning. The skipped file-symlink fixture lacked OS
 creation privilege; real Windows junction and hardlink rejection were tested.
 Linux storage and deployed sandbox acceptance are still required. The follow-up
@@ -103,4 +119,5 @@ and proposed next milestone are recorded in the runner plan below.
 
 The intended architecture keeps Streamlit, FastAPI, SQLite, Vultr Serverless
 Inference, a separately privileged restricted runner and an independent validator
-separate. Only the backend and storage foundations above exist today.
+separate. Backend/storage foundations, runner policy/image definitions and a
+fake-tested lifecycle contract exist; an executing analysis workflow is pending.
