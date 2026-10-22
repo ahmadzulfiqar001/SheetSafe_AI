@@ -3,12 +3,15 @@
 Status: policy, image definition, fixed fixture and unit tests implemented.
 Step 7B built and statically inspected the image on Docker Desktop's Linux
 backend without starting a container. Step 7C adds an injectable stopped-container
-lifecycle adapter tested only against a fake transport. No concrete Docker client,
-operator command, broker or container execution is implemented. Every SEC01-SEC10 runtime control
+lifecycle adapter tested only against a fake transport. Step 7D adds a read-only
+Docker metadata client and typed inspection mapping. No Docker lifecycle transport,
+operator execution command, broker or container execution is implemented. Every SEC01-SEC10 runtime control
 remains UNVERIFIED. Actual build/inspection evidence and digest distinctions are
 recorded in [runner-image-inspection.md](runner-image-inspection.md).
 Step 7C states, tests and input-transport blockers are recorded in
 [runner-lifecycle.md](runner-lifecycle.md).
+Step 7D's actual blocked preflight, metadata rules, image-hardening proposal and
+input-transport conflict are recorded in [runner-preflight.md](runner-preflight.md).
 
 Verification on 2026-10-22: the unchanged checkpoint baseline passed 225 tests
 (one Windows symlink skip and one existing deprecation warning). The new focused
@@ -135,6 +138,8 @@ startup recovery and a later independent supervisor are separate requirements.
 | `runner/__init__.py` | Implemented: separate package, import has no execution side effects |
 | `runner/policy.py` | Implemented: frozen target profile and strict fixture IDs; runtime receipts pending |
 | `runner/docker_backend.py` | Implemented: fake-tested stopped create/inspect/remove contract; real transport/start/watchdog/reaper pending |
+| `runner/engine_metadata.py` | Implemented: typed Engine/image facts and strict native inspection mapping; fake-tested, not runtime enforcement |
+| `runner/preflight.py` | Implemented: fixed read-only local metadata queries; cannot create or execute containers |
 | `runner/__main__.py` | Pending: operator-only fixed-fixture command |
 | `runner/image/Dockerfile` | Locally built and statically inspected in Step 7B; execution/release review pending |
 | `runner/image/.dockerignore` | Implemented: build context whitelist |
@@ -142,6 +147,7 @@ startup recovery and a later independent supervisor are separate requirements.
 | `tests/test_runner_policy.py` | Implemented: overrides, immutability, import safety, fail-closed state |
 | `tests/test_runner_image.py` | Implemented: static image/context checks and payload dispatch checks |
 | `tests/test_runner_lifecycle.py` | Implemented: fake transport, specification, ownership, failure/cancellation and cleanup verification |
+| `tests/test_runner_preflight.py` | Implemented: Engine/image prerequisites, native metadata and bounded read-only CLI tests |
 | `tests/integration/test_runner_smoke.py` | Pending: real isolated execution and teardown |
 
 Update this plan/README with further actual evidence after implementation. Backend API,
@@ -165,10 +171,16 @@ metadata and only verifies modeled configuration, not effective SEC enforcement.
 The Step 7B local image identity is fixed inside the job specification; it does
 not populate the policy's final registry digest or enable execution.
 
-Next smallest slice, after review: fixture-driven validation of real Engine
-metadata mapping and image-environment/LSM admission prerequisites, still without
-starting a container. A concrete transport also needs bounded I/O, immutable
-local image resolution and durable reconciliation before real lifecycle use.
+Step 7D completes that metadata slice: 173 new tests and 373 runner tests passed;
+the complete suite passed 599 tests with the existing one Windows skip and one
+warning in 23.80 seconds. Read-only local preflight completed with explicit
+`LSM_NOT_ADVERTISED` and `IMAGE_ENVIRONMENT_MISMATCH` blockers. API 1.56, Linux/amd64,
+cgroup v2 and builtin seccomp are advertised; no effective protection is certified.
+
+Next smallest slice, after review: implement only the approved image-environment
+hardening definition/static tests, with no automatic build, image substitution or
+execution. Select an LSM-capable Linux verification host separately. A real
+lifecycle transport still needs durable ownership/reconciliation before use.
 
 ## Mandatory profile: PRD SEC01-SEC10
 

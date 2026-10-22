@@ -26,9 +26,13 @@ fixture. Policy/image contract tests pass. Step 7B built and statically inspecte
 the pinned image on Docker Desktop's Linux backend without starting a container.
 Step 7C adds a stopped-container lifecycle adapter tested only with an in-memory
 fake transport: fixed specifications, ownership checks and verified removal.
-Execution stays disabled: no concrete Docker transport, runner command or final
+Step 7D adds a read-only Engine preflight client and typed, fake-tested native
+metadata mapping. Local preflight reports missing advertised LSM support and
+an image environment mismatch; these blockers have not been bypassed.
+Execution stays disabled: no Docker lifecycle transport, runner command or final
 policy image digest is configured, and no smoke payload has been executed.
 Runtime controls remain unverified. See the
+[preflight observations and review proposals](docs/runner-preflight.md),
 [lifecycle contract and transport blockers](docs/runner-lifecycle.md) and
 [image inspection record](docs/runner-image-inspection.md)
 for actual hashes, inherited base assets and limitations, and the
@@ -104,7 +108,7 @@ to run them. If a different Windows identity cannot access existing pytest temp
 or cache directories, use a fresh, dedicated `--basetemp var/<unique-test-name>`
 and `-p no:cacheprovider`. Never point pytest's base temp at existing user data.
 
-The Step 7C Windows verification reported 426 passed, 1 skipped and 1
+The Step 7D Windows verification reported 599 passed, 1 skipped and 1
 Starlette/httpx deprecation warning. The skipped file-symlink fixture lacked OS
 creation privilege; real Windows junction and hardlink rejection were tested.
 Linux storage and deployed sandbox acceptance are still required. The follow-up

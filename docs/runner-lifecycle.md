@@ -1,5 +1,10 @@
 # Step 7C: stopped-container lifecycle contract
 
+Historical Step 7C evidence. Step 7D now adds read-only preflight and a strict
+native metadata mapper; actual observations and remaining schema/transport gates
+are documented in [runner-preflight.md](runner-preflight.md). Lifecycle behavior,
+image definition and policy restrictions remain unchanged.
+
 Implemented and tested on 2026-10-22 using Python 3.12.13 and existing uv.
 All transport calls in this increment were in-memory fakes. No Docker CLI,
 daemon connection, container creation, payload execution or image modification
