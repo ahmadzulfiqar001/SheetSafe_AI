@@ -4,7 +4,7 @@ Published migrations are immutable; future changes add a new numbered entry.
 Only metadata/references belong here, never raw uploads or inference credentials.
 """
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 APPLICATION_ID = 0x53534149  # SSAI, identifies this application's SQLite files.
 
 RUN_STATES = (
@@ -360,5 +360,61 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
             WHEN EXISTS(SELECT 1 FROM storage_namespaces WHERE session_id=OLD.session_id AND cleaned_at IS NULL)
                 OR EXISTS(SELECT 1 FROM storage_objects WHERE session_id=OLD.session_id)
             BEGIN SELECT RAISE(ABORT, 'storage cleanup is not verified'); END""",
+    ),
+    5: (
+        # Synthetic preparation belongs to an existing run, not a second queue.
+        # No execution attempt or external-resource receipt is created here.
+        "ALTER TABLE runs ADD COLUMN runner_job_id TEXT CHECK(length(runner_job_id)=32 AND runner_job_id NOT GLOB '*[^0-9a-f]*')",
+        "ALTER TABLE runs ADD COLUMN prep_protocol_version INTEGER CHECK(prep_protocol_version=1)",
+        "ALTER TABLE runs ADD COLUMN prep_fixture_id TEXT CHECK(prep_fixture_id='smoke-v1')",
+        "ALTER TABLE runs ADD COLUMN prep_payload_length INTEGER CHECK(prep_payload_length BETWEEN 1 AND 262144)",
+        "ALTER TABLE runs ADD COLUMN prep_payload_sha256 TEXT CHECK(length(prep_payload_sha256)=64 AND prep_payload_sha256 NOT GLOB '*[^0-9a-f]*')",
+        "ALTER TABLE runs ADD COLUMN prep_state TEXT CHECK(prep_state IN ('CREATED','RECEIVING','INPUT_VERIFIED','READY_FOR_EXECUTION','FAILED','INTERRUPTED','TIMED_OUT','CANCELLED','BLOCKED_EXTERNAL'))",
+        "ALTER TABLE runs ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 0 CHECK(lease_epoch BETWEEN 0 AND 9223372036854775807)",
+        "ALTER TABLE runs ADD COLUMN prep_claim_started_at INTEGER CHECK(prep_claim_started_at>0)",
+        "ALTER TABLE runs ADD COLUMN prep_verified_epoch INTEGER CHECK(prep_verified_epoch>0)",
+        "ALTER TABLE runs ADD COLUMN prep_created_at INTEGER CHECK(prep_created_at>0)",
+        "ALTER TABLE runs ADD COLUMN prep_updated_at INTEGER CHECK(prep_updated_at>=prep_created_at)",
+        "CREATE UNIQUE INDEX runs_runner_job ON runs(runner_job_id) WHERE runner_job_id IS NOT NULL",
+        *tuple(
+            f"""CREATE TRIGGER runner_metadata_{operation.lower()} BEFORE {operation} ON runs
+                WHEN (NEW.runner_job_id IS NOT NULL AND (
+                    NEW.prep_protocol_version IS NULL OR NEW.prep_fixture_id IS NULL
+                    OR NEW.prep_payload_length IS NULL OR NEW.prep_payload_sha256 IS NULL
+                    OR NEW.prep_state IS NULL OR NEW.prep_created_at IS NULL OR NEW.prep_updated_at IS NULL))
+                    OR (NEW.runner_job_id IS NULL AND (NEW.prep_protocol_version IS NOT NULL
+                    OR NEW.prep_fixture_id IS NOT NULL OR NEW.prep_payload_length IS NOT NULL
+                    OR NEW.prep_payload_sha256 IS NOT NULL OR NEW.prep_state IS NOT NULL
+                    OR NEW.prep_created_at IS NOT NULL OR NEW.prep_updated_at IS NOT NULL))
+                    OR (NEW.prep_state='READY_FOR_EXECUTION'
+                        AND (NEW.prep_verified_epoch IS NULL OR NEW.prep_verified_epoch != NEW.lease_epoch))
+                BEGIN SELECT RAISE(ABORT, 'runner metadata is inconsistent'); END"""
+            for operation in ('INSERT', 'UPDATE')
+        ),
+        """CREATE TRIGGER runner_manifest_immutable BEFORE UPDATE ON runs
+            WHEN OLD.runner_job_id IS NOT NULL AND (
+                NEW.runner_job_id IS NOT OLD.runner_job_id
+                OR NEW.prep_protocol_version IS NOT OLD.prep_protocol_version
+                OR NEW.prep_fixture_id IS NOT OLD.prep_fixture_id
+                OR NEW.prep_payload_length IS NOT OLD.prep_payload_length
+                OR NEW.prep_payload_sha256 IS NOT OLD.prep_payload_sha256
+                OR NEW.prep_created_at IS NOT OLD.prep_created_at)
+            BEGIN SELECT RAISE(ABORT, 'runner manifest is immutable'); END""",
+        """CREATE TRIGGER runner_terminal_irreversible BEFORE UPDATE ON runs
+            WHEN (OLD.prep_state IN ('FAILED','INTERRUPTED','TIMED_OUT','CANCELLED','BLOCKED_EXTERNAL')
+                    AND NEW.prep_state IS NOT OLD.prep_state)
+                OR (OLD.prep_state='READY_FOR_EXECUTION'
+                    AND NEW.prep_state NOT IN ('READY_FOR_EXECUTION','CANCELLED'))
+                OR NEW.lease_epoch < OLD.lease_epoch
+                OR (OLD.runner_job_id IS NOT NULL AND OLD.admitted_at IS NOT NULL
+                    AND (NEW.admitted_at IS NOT OLD.admitted_at OR NEW.deadline_at IS NOT OLD.deadline_at))
+            BEGIN SELECT RAISE(ABORT, 'runner lifecycle is irreversible'); END""",
+        """CREATE TRIGGER runner_cancel_with_run AFTER UPDATE OF cancel_requested_at ON runs
+            WHEN NEW.runner_job_id IS NOT NULL AND NEW.cancel_requested_at IS NOT NULL
+                AND NEW.prep_state IN ('CREATED','RECEIVING','INPUT_VERIFIED','READY_FOR_EXECUTION')
+            BEGIN UPDATE runs SET prep_state='CANCELLED',
+                prep_updated_at=max(prep_updated_at, NEW.cancel_requested_at),
+                lease_owner=NULL, lease_expires_at=NULL, heartbeat_at=NULL,
+                prep_verified_epoch=NULL WHERE run_id=NEW.run_id; END""",
     ),
 }

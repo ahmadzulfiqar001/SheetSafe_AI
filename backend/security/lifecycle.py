@@ -237,7 +237,8 @@ class LifecycleCoordinator:
             ).fetchone() is not None
             runtime = connection.execute(
                 """SELECT 1 FROM runs WHERE session_id=? AND
-                    (lease_owner IS NOT NULL OR state IN ('EXECUTE', 'VALIDATE')) UNION ALL
+                    (lease_owner IS NOT NULL OR state IN ('EXECUTE', 'VALIDATE')
+                     OR prep_state='BLOCKED_EXTERNAL') UNION ALL
                     SELECT 1 FROM attempts a JOIN runs r USING(run_id) WHERE r.session_id=? AND
                     (execution_number IS NOT NULL OR runtime_receipt_json != '{}') LIMIT 1""",
                 (job["session_id"], job["session_id"]),

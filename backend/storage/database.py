@@ -47,6 +47,8 @@ _EVENT_TYPES = frozenset({
     "SESSION_EXPIRED", "CLEANUP_STARTED", "CLEANUP_RETRY", "CLEANUP_BLOCKED",
     "CLEANUP_DEADLINE_MISSED", "CLEANUP_COMPLETED",
     "STORAGE_STAGED", "STORAGE_SEALED",
+    "JOB_REGISTERED", "JOB_CLAIMED", "JOB_RENEWED", "JOB_RECOVERED",
+    "JOB_PREPARATION_CHANGED",
 })
 
 
@@ -146,6 +148,7 @@ class Database:
                 ("sessions", "session_id"), ("datasets", "dataset_id"),
                 ("dataset_versions", "dataset_id, version"), ("runs", "run_id"),
                 ("attempts", "attempt_id"), ("audit_events", "sequence"),
+                ("runs", "runner_job_id, prep_state, lease_epoch, prep_payload_sha256"),
                 ("session_creation_limits", "scope, key_hash"),
                 ("cleanup_requests", "request_id, state"), ("cleanup_daily_metrics", "day_start"),
                 ("storage_identity", "root_id"), ("storage_namespaces", "session_id"),

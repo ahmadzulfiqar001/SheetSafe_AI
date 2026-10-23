@@ -9,7 +9,7 @@ This repository does not yet provide a working autonomous analysis application.
 - FastAPI application factory, lifespan initialization, safe JSON errors, liveness
   and database/storage/retention readiness checks.
 - SQLite metadata, foreign keys, WAL, explicit transactions and ordered migrations
-  1 through 4. Published migrations are preserved.
+  1 through 5. Published migrations are preserved.
 - Opaque session credentials stored only as hashes, ownership checks, CSRF and
   exact-origin checks, secure cookies, expiry, revocation and bounded admission.
 - Durable session cleanup requests, retry/restart recovery, sanitized audit
@@ -41,9 +41,18 @@ Bootstrap and runtime execution policy are unchanged.
 Step 7H adds a portable read-only Linux host evidence probe with synthetic tests.
 Current Windows/Desktop results leave native Linux acceptance PENDING and the
 LSM blocker intact; host observations never authorize container execution.
+Step 7J adds transport-neutral synthetic manifest/framing validators and fake
+preparation tests. Logical readiness is not execution permission. Real transport,
+immutable inputs and collection remain unimplemented; PRD amendments are unapproved.
+Step 7K adds session-owned synthetic preparation on existing runs: atomic SQLite
+claims, durable fencing epochs, bounded renewal/recovery and cancellation. Fake
+transport stages commit before readiness; no execution attempts are fabricated.
 Execution stays disabled: no Docker lifecycle transport, runner command or final
 policy image digest is configured, and no smoke payload has been executed.
 Runtime controls remain unverified. See the
+[durable synthetic job boundary](docs/runner-durable-jobs.md),
+[synthetic transport validation subset](docs/runner-transport-validation.md),
+[input/output transport design proposal](docs/runner-secure-transport-design.md),
 [Linux host readiness and checkpoint review](docs/runner-host-readiness.md),
 [image environment hardening review](docs/runner-image-environment.md),
 [hardened rebuild and static evidence](docs/runner-image-rebuild.md),
@@ -123,7 +132,7 @@ to run them. If a different Windows identity cannot access existing pytest temp
 or cache directories, use a fresh, dedicated `--basetemp var/<unique-test-name>`
 and `-p no:cacheprovider`. Never point pytest's base temp at existing user data.
 
-The Step 7H Windows verification reported 746 passed, 1 skipped and 1
+The Step 7K Windows verification reported 996 passed, 1 skipped and 1
 Starlette/httpx deprecation warning. The skipped file-symlink fixture lacked OS
 creation privilege; real Windows junction and hardlink rejection were tested.
 Linux storage and deployed sandbox acceptance are still required. The follow-up

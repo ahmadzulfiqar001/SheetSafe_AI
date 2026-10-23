@@ -37,6 +37,12 @@ verified. See [host readiness, Linux commands and checkpoint proposal](runner-ho
 The next review is the stopped-input/collector architecture decision and future
 native-host evidence, with no automatic VM provisioning or container execution.
 
+Steps 7E-H were checkpointed and pushed as `38ec781`. Step 7I's
+[transport design comparison](runner-secure-transport-design.md) recommends bounded
+pre-candidate stdin input with a scoped host-side collector only conditionally:
+stopped-archive/root-owned-input and quiescence semantics need explicit PRD
+amendment approval first. No transport or runtime is implemented or enabled.
+
 Verification on 2026-10-22: the unchanged checkpoint baseline passed 225 tests
 (one Windows symlink skip and one existing deprecation warning). The new focused
 runner tests passed 99 cases; Docker BuildKit check-only validation had no warnings.
