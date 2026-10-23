@@ -49,6 +49,8 @@ _EVENT_TYPES = frozenset({
     "STORAGE_STAGED", "STORAGE_SEALED",
     "JOB_REGISTERED", "JOB_CLAIMED", "JOB_RENEWED", "JOB_RECOVERED",
     "JOB_PREPARATION_CHANGED",
+    "EXTERNAL_INTENT_RECORDED", "EXTERNAL_DISPATCH_UNCERTAIN", "EXTERNAL_RECONCILE_CLAIMED",
+    "EXTERNAL_INSPECTED", "EXTERNAL_CLEANUP_REQUIRED", "EXTERNAL_RECONCILE_FAILED",
 })
 
 
@@ -149,6 +151,7 @@ class Database:
                 ("dataset_versions", "dataset_id, version"), ("runs", "run_id"),
                 ("attempts", "attempt_id"), ("audit_events", "sequence"),
                 ("runs", "runner_job_id, prep_state, lease_epoch, prep_payload_sha256"),
+                ("external_intents", "operation_id, state, reconcile_epoch"),
                 ("session_creation_limits", "scope, key_hash"),
                 ("cleanup_requests", "request_id, state"), ("cleanup_daily_metrics", "day_start"),
                 ("storage_identity", "root_id"), ("storage_namespaces", "session_id"),

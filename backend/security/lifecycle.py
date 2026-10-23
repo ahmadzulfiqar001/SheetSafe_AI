@@ -238,10 +238,13 @@ class LifecycleCoordinator:
             runtime = connection.execute(
                 """SELECT 1 FROM runs WHERE session_id=? AND
                     (lease_owner IS NOT NULL OR state IN ('EXECUTE', 'VALIDATE')
-                     OR prep_state='BLOCKED_EXTERNAL') UNION ALL
+                     OR (prep_state='BLOCKED_EXTERNAL' AND NOT EXISTS(
+                         SELECT 1 FROM external_intents e WHERE e.run_id=runs.run_id))) UNION ALL
                     SELECT 1 FROM attempts a JOIN runs r USING(run_id) WHERE r.session_id=? AND
-                    (execution_number IS NOT NULL OR runtime_receipt_json != '{}') LIMIT 1""",
-                (job["session_id"], job["session_id"]),
+                    (execution_number IS NOT NULL OR runtime_receipt_json != '{}') UNION ALL
+                    SELECT 1 FROM external_intents WHERE session_id=?
+                        AND state NOT IN ('VERIFIED_ABSENT','VERIFIED_CLEANED') LIMIT 1""",
+                (job["session_id"],) * 3,
             ).fetchone() is not None
             return storage, runtime
 

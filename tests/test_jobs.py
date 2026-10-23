@@ -17,7 +17,7 @@ from backend.security.lifecycle import LifecycleCoordinator
 from backend.security.sessions import SessionError, SessionService
 from backend.storage.database import Database
 from backend.storage.jobs import JobCode, JobError, JobStore, SYNTHETIC_PAYLOAD
-from backend.storage.schema import MIGRATIONS
+from backend.storage.schema import MIGRATIONS, SCHEMA_VERSION
 from runner.durable_preparation import prepare_synthetic
 from runner.policy import SandboxPolicy
 from runner.transport_protocol import (
@@ -582,7 +582,7 @@ def test_populated_v4_migrates_without_reset_or_prior_migration_edits(tmp_path, 
     database.initialize()
     database.check_ready(full_integrity=True)
     with database.connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert connection.execute("SELECT session_id FROM sessions").fetchone()[0] == "old"
         assert connection.execute("SELECT event_id FROM audit_events").fetchone()[0] == "old"
         assert connection.execute("SELECT dataset_id FROM datasets").fetchone()[0] == "old"

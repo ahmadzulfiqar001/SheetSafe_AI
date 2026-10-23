@@ -162,6 +162,8 @@ class JobStore:
             now = self._now()
             row = self._find(connection, job_id)
             session_end = self._active(connection, row, now)
+            if connection.execute("SELECT 1 FROM external_intents WHERE job_id=?", (job_id,)).fetchone():
+                raise JobError(JobCode.BLOCKED)
             if row["prep_state"] not in _ACTIVE:
                 raise JobError(JobCode.STATE)
             if row["lease_owner"] is not None and row["lease_expires_at"] > now:
@@ -190,7 +192,8 @@ class JobStore:
             self._event(connection, current, "JOB_RECOVERED" if epoch > 1 else "JOB_CLAIMED", now)
             return JobLease(job_id, row["run_id"], row["session_id"], epoch, owner, expires)
 
-    def _leased(self, connection: sqlite3.Connection, lease: JobLease, now: int) -> sqlite3.Row:
+    def _leased(self, connection: sqlite3.Connection, lease: JobLease, now: int,
+            *, _permit_intent: bool = False) -> sqlite3.Row:
         if (type(lease) is not JobLease or type(lease.epoch) is not int
                 or not 1 <= lease.epoch <= MAX_CLAIMS or type(lease.owner) is not str
                 or re.fullmatch(r"[0-9a-f]{64}", lease.owner) is None
@@ -198,6 +201,9 @@ class JobStore:
             raise JobError(JobCode.STALE)
         row = self._find(connection, lease.job_id)
         self._active(connection, row, now)
+        if not _permit_intent and connection.execute(
+                "SELECT 1 FROM external_intents WHERE job_id=?", (lease.job_id,)).fetchone():
+            raise JobError(JobCode.BLOCKED)
         if row["prep_state"] not in _ACTIVE:
             raise JobError(JobCode.STATE)
         if (row["run_id"] != lease.run_id or row["session_id"] != lease.session_id

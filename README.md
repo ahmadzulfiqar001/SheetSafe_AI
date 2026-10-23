@@ -9,7 +9,7 @@ This repository does not yet provide a working autonomous analysis application.
 - FastAPI application factory, lifespan initialization, safe JSON errors, liveness
   and database/storage/retention readiness checks.
 - SQLite metadata, foreign keys, WAL, explicit transactions and ordered migrations
-  1 through 5. Published migrations are preserved.
+  1 through 6. Published migrations are preserved.
 - Opaque session credentials stored only as hashes, ownership checks, CSRF and
   exact-origin checks, secure cookies, expiry, revocation and bounded admission.
 - Durable session cleanup requests, retry/restart recovery, sanitized audit
@@ -47,9 +47,13 @@ immutable inputs and collection remain unimplemented; PRD amendments are unappro
 Step 7K adds session-owned synthetic preparation on existing runs: atomic SQLite
 claims, durable fencing epochs, bounded renewal/recovery and cancellation. Fake
 transport stages commit before readiness; no execution attempts are fabricated.
+Step 7L adds simulated external intents and bounded fenced reconciliation.
+Unknown create/remove outcomes remain unresolved until exact, quiesced fake
+inspection; these records never certify real Docker execution or cleanup.
 Execution stays disabled: no Docker lifecycle transport, runner command or final
 policy image digest is configured, and no smoke payload has been executed.
 Runtime controls remain unverified. See the
+[simulated external intent/recovery contract](docs/runner-external-intents.md),
 [durable synthetic job boundary](docs/runner-durable-jobs.md),
 [synthetic transport validation subset](docs/runner-transport-validation.md),
 [input/output transport design proposal](docs/runner-secure-transport-design.md),
@@ -132,7 +136,7 @@ to run them. If a different Windows identity cannot access existing pytest temp
 or cache directories, use a fresh, dedicated `--basetemp var/<unique-test-name>`
 and `-p no:cacheprovider`. Never point pytest's base temp at existing user data.
 
-The Step 7K Windows verification reported 996 passed, 1 skipped and 1
+The Step 7L Windows verification reported 1079 passed, 1 skipped and 1
 Starlette/httpx deprecation warning. The skipped file-symlink fixture lacked OS
 creation privilege; real Windows junction and hardlink rejection were tested.
 Linux storage and deployed sandbox acceptance are still required. The follow-up

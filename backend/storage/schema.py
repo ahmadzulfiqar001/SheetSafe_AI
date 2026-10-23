@@ -4,7 +4,7 @@ Published migrations are immutable; future changes add a new numbered entry.
 Only metadata/references belong here, never raw uploads or inference credentials.
 """
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 APPLICATION_ID = 0x53534149  # SSAI, identifies this application's SQLite files.
 
 RUN_STATES = (
@@ -416,5 +416,71 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
                 prep_updated_at=max(prep_updated_at, NEW.cancel_requested_at),
                 lease_owner=NULL, lease_expires_at=NULL, heartbeat_at=NULL,
                 prep_verified_epoch=NULL WHERE run_id=NEW.run_id; END""",
+    ),
+    6: (
+        # Multiple future operations need child identities, not a second job queue.
+        # This version admits only simulated fixed creation, never a Docker driver.
+        "CREATE UNIQUE INDEX runs_job_binding ON runs(runner_job_id,run_id,session_id)",
+        """CREATE TABLE external_intents (
+            operation_id TEXT PRIMARY KEY CHECK(length(operation_id)=32 AND operation_id NOT GLOB '*[^0-9a-f]*'),
+            job_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            operation_type TEXT NOT NULL CHECK(operation_type='SIMULATED_CREATE_SMOKE'),
+            mode TEXT NOT NULL CHECK(mode='SIMULATED'),
+            origin_epoch INTEGER NOT NULL CHECK(origin_epoch>0),
+            authorized_owner_hash TEXT NOT NULL CHECK(length(authorized_owner_hash)=64 AND authorized_owner_hash NOT GLOB '*[^0-9a-f]*'),
+            resource_id TEXT NOT NULL UNIQUE CHECK(length(resource_id)=32 AND resource_id NOT GLOB '*[^0-9a-f]*'),
+            resource_nonce TEXT NOT NULL CHECK(length(resource_nonce)=64 AND resource_nonce NOT GLOB '*[^0-9a-f]*'),
+            image_id TEXT NOT NULL CHECK(length(image_id)=71 AND substr(image_id,1,7)='sha256:'),
+            config_digest TEXT NOT NULL CHECK(length(config_digest)=71 AND substr(config_digest,1,7)='sha256:'),
+            state TEXT NOT NULL DEFAULT 'INTENT_RECORDED' CHECK(state IN (
+                'INTENT_RECORDED','DISPATCH_UNCERTAIN','RECONCILIATION_REQUIRED',
+                'VERIFIED_PRESENT','VERIFIED_ABSENT','CLEANUP_REQUIRED','VERIFIED_CLEANED','TERMINAL_FAILURE')),
+            created_at INTEGER NOT NULL CHECK(created_at>0),
+            updated_at INTEGER NOT NULL CHECK(updated_at>=created_at),
+            dispatched_at INTEGER CHECK(dispatched_at>=created_at),
+            cleanup_dispatched_at INTEGER CHECK(cleanup_dispatched_at>=dispatched_at),
+            inspected_at INTEGER CHECK(inspected_at>=created_at),
+            actions_quiesced INTEGER NOT NULL DEFAULT 0 CHECK(actions_quiesced IN (0,1)),
+            reconcile_epoch INTEGER NOT NULL DEFAULT 0 CHECK(reconcile_epoch BETWEEN 0 AND 3),
+            reconcile_owner TEXT,
+            reconcile_expires_at INTEGER,
+            inspection_pending INTEGER NOT NULL DEFAULT 0 CHECK(inspection_pending IN (0,1)),
+            last_error_code TEXT CHECK(last_error_code IN ('INSPECTION_FAILED','INSPECTION_TIMEOUT',
+                'IDENTITY_MISMATCH','CONTRADICTORY_EVIDENCE','QUIESCENCE_UNVERIFIED','RETRY_EXHAUSTED')),
+            UNIQUE(job_id,operation_type),
+            FOREIGN KEY(job_id,run_id,session_id)
+                REFERENCES runs(runner_job_id,run_id,session_id) ON DELETE CASCADE,
+            CHECK((reconcile_owner IS NULL AND reconcile_expires_at IS NULL AND inspection_pending=0)
+                OR (reconcile_owner IS NOT NULL AND length(reconcile_owner)=64 AND reconcile_expires_at>updated_at)),
+            CHECK(state!='INTENT_RECORDED' OR dispatched_at IS NULL),
+            CHECK(state NOT IN ('VERIFIED_ABSENT','VERIFIED_CLEANED') OR
+                (actions_quiesced=1 AND inspected_at IS NOT NULL AND reconcile_owner IS NULL)),
+            CHECK(state!='VERIFIED_CLEANED' OR cleanup_dispatched_at IS NOT NULL)
+        ) STRICT""",
+        "CREATE INDEX external_intents_owner ON external_intents(session_id,state)",
+        """CREATE TRIGGER external_intent_identity_immutable BEFORE UPDATE ON external_intents
+            WHEN NEW.operation_id IS NOT OLD.operation_id OR NEW.job_id IS NOT OLD.job_id
+                OR NEW.run_id IS NOT OLD.run_id OR NEW.session_id IS NOT OLD.session_id
+                OR NEW.operation_type IS NOT OLD.operation_type OR NEW.mode IS NOT OLD.mode
+                OR NEW.origin_epoch IS NOT OLD.origin_epoch
+                OR NEW.authorized_owner_hash IS NOT OLD.authorized_owner_hash
+                OR NEW.resource_id IS NOT OLD.resource_id OR NEW.resource_nonce IS NOT OLD.resource_nonce
+                OR NEW.image_id IS NOT OLD.image_id OR NEW.config_digest IS NOT OLD.config_digest
+                OR NEW.created_at IS NOT OLD.created_at OR NEW.reconcile_epoch<OLD.reconcile_epoch
+                OR (OLD.dispatched_at IS NOT NULL AND NEW.dispatched_at IS NOT OLD.dispatched_at)
+                OR (OLD.cleanup_dispatched_at IS NOT NULL AND NEW.cleanup_dispatched_at IS NOT OLD.cleanup_dispatched_at)
+            BEGIN SELECT RAISE(ABORT, 'external intent identity is immutable'); END""",
+        """CREATE TRIGGER external_intent_terminal BEFORE UPDATE ON external_intents
+            WHEN OLD.state IN ('VERIFIED_ABSENT','VERIFIED_CLEANED','TERMINAL_FAILURE')
+            BEGIN SELECT RAISE(ABORT, 'external intent is terminal'); END""",
+        """CREATE TRIGGER external_intent_unresolved_delete BEFORE DELETE ON external_intents
+            WHEN OLD.state NOT IN ('VERIFIED_ABSENT','VERIFIED_CLEANED')
+            BEGIN SELECT RAISE(ABORT, 'external outcome is unresolved'); END""",
+        """CREATE TRIGGER external_intent_run_delete BEFORE DELETE ON runs
+            WHEN EXISTS(SELECT 1 FROM external_intents WHERE run_id=OLD.run_id
+                AND state NOT IN ('VERIFIED_ABSENT','VERIFIED_CLEANED'))
+            BEGIN SELECT RAISE(ABORT, 'external outcome is unresolved'); END""",
     ),
 }

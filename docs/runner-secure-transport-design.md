@@ -13,6 +13,10 @@ tests, **not** the amendments or actual transport recommended here. See
 receiver/memfd/freezer/collector mechanisms remain proposals; no such mechanism
 has been implemented or runtime-verified.
 
+Step 7L adds [durable simulated intent/recovery](runner-external-intents.md), not
+a real dispatch fence, quiescence proof, Engine driver or approval of Option B/D.
+Independent native evidence and architecture approval remain required.
+
 Decision: do not implement Options A or C as an archive shortcut. Recommend
 **Option B input plus an Option D host-side collector, conditionally**, subject
 to explicit PRD amendment approval and native Linux security experiments. If the

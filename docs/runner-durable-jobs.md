@@ -2,6 +2,9 @@
 
 Implemented 2026-10-24 against checkpoint `38ec781`, preserving Step 7I/J work.
 This is trusted operator infrastructure, not a public API or an executing runner.
+Step 7L adds a separate [simulated external-intent contract](runner-external-intents.md).
+Once such an intent exists, this harmless-preparation claim/retry path is blocked;
+only its bounded inspection/cleanup reconciliation may resolve uncertainty.
 No daemon operations, real transport, generated code, uploads, stdin receiver,
 collector or external effects are implemented. The PRD transport amendments
 remain unapproved. LSM, native Linux and SEC01-SEC10 runtime gates remain.
