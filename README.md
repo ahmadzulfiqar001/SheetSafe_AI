@@ -70,9 +70,18 @@ Runtime controls remain unverified. See the
 for actual hashes, inherited base assets and limitations, and the
 [runner plan](docs/runner-foundation-plan.md) for pending work.
 
+## Step 8A synthetic ingestion foundation
+
+Strict CSV/XLSX metadata/profile contracts and separate worker algorithms are
+tested only on synthetic fixtures. Internal metadata reservation reuses existing
+session ownership, private storage and dataset tables; versions remain PENDING.
+No upload route, production parser adapter, READY transition or publication is
+enabled. XML hardening adds defusedxml; no parser image was built or executed.
+See [ingestion limits, failures and trust boundary](docs/dataset-ingestion.md).
+
 ## Not implemented or enabled
 
-Private/customer uploads, upload/download APIs, spreadsheet parsing, real Docker
+Private/customer uploads, upload/download APIs, production spreadsheet parsing, real Docker
 execution transport, Vultr inference, agent planning, self-healing, independent numerical
 validation and Streamlit screens are not implemented. The `validated` storage
 category is reserved; result publication is blocked. Installed libraries do not
@@ -130,7 +139,7 @@ Never place real keys, uploads or runtime receipts in the source tree.
 
 ```powershell
 uv run --frozen --no-sync python -m pytest -q -rs
-uv run --frozen --no-sync python -m compileall -q backend runner tests
+uv run --frozen --no-sync python -m compileall -q backend runner ingestion parser_worker tests
 git diff --check
 ```
 
@@ -140,7 +149,12 @@ to run them. If a different Windows identity cannot access existing pytest temp
 or cache directories, use a fresh, dedicated `--basetemp var/<unique-test-name>`
 and `-p no:cacheprovider`. Never point pytest's base temp at existing user data.
 
-The final Step 7M-A Windows verification reported 1083 passed, 1 skipped and 1
+The Step 8A Windows verification reported **1197 passed, 1 skipped and 1 warning**
+in 64.85s. New synthetic ingestion tests: 114 passed; related existing storage,
+session and runner/security tests: 779 passed, 1 skipped, 1 warning. Commands and
+limits are recorded in the [ingestion evidence](docs/dataset-ingestion.md#actual-verification).
+
+The earlier Step 7M-A Windows verification reported 1083 passed, 1 skipped and 1
 Starlette/httpx deprecation warning (66.37s). The original cancellation/renewal
 race also passed in 30 fresh processes (150 parameterized cases). Only tests
 were corrected for bounded SQLite contention; production code is unchanged.
