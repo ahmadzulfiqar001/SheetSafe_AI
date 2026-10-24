@@ -17,6 +17,11 @@ Step 7L adds [durable simulated intent/recovery](runner-external-intents.md), no
 a real dispatch fence, quiescence proof, Engine driver or approval of Option B/D.
 Independent native evidence and architecture approval remain required.
 
+The later [Step 7M admission/PRD decision](runner-admission-decision.md) and
+[native Linux acceptance plan](linux-sandbox-acceptance.md) make the late-start
+gap and same-UID collector limitation explicit. The preference below remains
+conditional; neither document authorizes transport implementation or execution.
+
 Decision: do not implement Options A or C as an archive shortcut. Recommend
 **Option B input plus an Option D host-side collector, conditionally**, subject
 to explicit PRD amendment approval and native Linux security experiments. If the

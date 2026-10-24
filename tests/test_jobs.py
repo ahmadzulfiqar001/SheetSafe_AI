@@ -6,7 +6,7 @@ from dataclasses import replace
 import socket
 import sqlite3
 import subprocess
-from threading import Barrier
+from threading import Barrier, Event
 import time
 
 import pytest
@@ -442,21 +442,165 @@ def test_cancellation_racing_renewal_is_irreversible(setup, iteration):
         try:
             return store.renew(lease)
         except JobError as error:
+            assert error.code in {JobCode.BLOCKED, JobCode.DATABASE_BUSY}
             return error.code
     def cancel():
         gate.wait(timeout=5)
-        store.cancel(first.principal, job_id)
+        try:
+            store.cancel(first.principal, job_id)
+        except JobError as error:
+            assert error.code is JobCode.DATABASE_BUSY
+            return error.code
     with ThreadPoolExecutor(max_workers=2) as workers:
         renewal = workers.submit(renew)
         cancellation = workers.submit(cancel)
         renewal.result(timeout=5)
-        cancellation.result(timeout=5)
+        cancelled = cancellation.result(timeout=5)
+    if cancelled is JobCode.DATABASE_BUSY:
+        # A busy failure is not durable cancellation. Both competing operations
+        # have finished; permit exactly one fresh, authorized retry, no sleep.
+        uncommitted = row(database, job_id)
+        assert uncommitted["prep_state"] == "CREATED"
+        assert uncommitted["cancel_requested_at"] is None
+        assert uncommitted["lease_owner"] == lease.owner
+        store.cancel(first.principal, job_id)
     record = row(database, job_id)
     assert record["prep_state"] == "CANCELLED" and record["lease_owner"] is None
     before = count_events(database)
     store.cancel(first.principal, job_id)
     assert count_events(database) == before
     assert_code(JobCode.BLOCKED, lambda: store.renew(lease))
+
+
+@pytest.mark.parametrize("writer", ["renew", "cancel"])
+def test_cancel_renewal_real_busy_schedules_preserve_commit_contract(setup, monkeypatch, writer):
+    """Force real contention until native BUSY, without timing sleeps/retries."""
+    database, store, clock, first, *_ = setup
+    job_id = register(setup)
+    lease = store.claim(job_id)
+    clock.value += 1
+    with database.connection() as connection:
+        assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == 100
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    held, release = Event(), Event()
+    opened, closed, rolled_back, failures = [], [], [], []
+    original_connect = sqlite3.connect
+    class ObservedConnection(sqlite3.Connection):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            opened.append(self)
+
+        def execute(self, sql, *args, **kwargs):
+            try:
+                return super().execute(sql, *args, **kwargs)
+            except sqlite3.Error as error:
+                failures.append((self, sql == "BEGIN IMMEDIATE", error.sqlite_errorcode,
+                    error.sqlite_errorname, self.in_transaction))
+                raise
+
+        def rollback(self):
+            result = super().rollback()
+            rolled_back.append((self, self.in_transaction))
+            return result
+
+        def close(self):
+            super().close()
+            closed.append(self)
+
+    def connect(*args, **kwargs):
+        return original_connect(*args, **kwargs, factory=ObservedConnection)
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    original_event = database.append_audit_event
+    target_event = "JOB_RENEWED" if writer == "renew" else "JOB_PREPARATION_CHANGED"
+    def hold_writer(connection, **kwargs):
+        event_id = original_event(connection, **kwargs)
+        if kwargs["event_type"] == target_event:
+            assert connection.in_transaction
+            held.set()
+            assert release.wait(5), "writer release was not signaled"
+        return event_id
+    monkeypatch.setattr(database, "append_audit_event", hold_writer)
+    actions = {"renew": lambda: store.renew(lease),
+        "cancel": lambda: store.cancel(first.principal, job_id)}
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        winner = workers.submit(actions[writer])
+        try:
+            assert held.wait(5), "writer did not acquire its transaction"
+            loser = workers.submit(actions["cancel" if writer == "renew" else "renew"])
+            with pytest.raises(JobError) as caught:
+                loser.result(timeout=5)
+            assert caught.value.code is JobCode.DATABASE_BUSY
+            assert len(failures) == 1
+            failed_connection, at_begin, native_code, native_name, in_transaction = failures[0]
+            assert at_begin and native_code == sqlite3.SQLITE_BUSY and native_name == "SQLITE_BUSY"
+            assert in_transaction is False
+            assert (failed_connection, False) in rolled_back and failed_connection in closed
+            snapshot = row(database, job_id)
+            assert snapshot["prep_state"] == "CREATED" and snapshot["cancel_requested_at"] is None
+        finally:
+            release.set()
+        winner.result(timeout=5)
+    if writer == "renew":
+        active = row(database, job_id)
+        assert active["cancel_requested_at"] is None and active["lease_owner"] == lease.owner
+        assert active["lease_expires_at"] > clock()
+        store.cancel(first.principal, job_id)  # One retry after confirmed writer release.
+    assert row(database, job_id)["prep_state"] == "CANCELLED"
+    assert row(database, job_id)["lease_owner"] is None
+    assert_code(JobCode.BLOCKED, lambda: store.renew(lease))
+    assert_code(JobCode.BLOCKED, lambda: store.advance(lease, State.CREATED, State.RECEIVING))
+    events = count_events(database)
+    store.cancel(first.principal, job_id)
+    assert count_events(database) == events
+    assert len(opened) == len(closed) and all(connection in closed for connection in opened)
+
+
+def test_cancellation_commit_failure_is_not_durable_success(setup, monkeypatch):
+    database, store, clock, first, *_ = setup
+    job_id = register(setup)
+    lease = store.claim(job_id)
+    clock.value += 1
+    previous, events = row(database, job_id), count_events(database)
+    observed = []
+    original_connect = sqlite3.connect
+    class FailingCommit(sqlite3.Connection):
+        def commit(self):
+            observed.append(("commit", self.in_transaction))
+            raise sqlite3.OperationalError("synthetic cancellation commit failure")
+
+        def rollback(self):
+            super().rollback()
+            observed.append(("rollback", self.in_transaction))
+
+        def close(self):
+            super().close()
+            observed.append(("close",))
+
+    def connect(*args, **kwargs):
+        return original_connect(*args, **kwargs, factory=FailingCommit)
+    with monkeypatch.context() as patch:
+        patch.setattr(sqlite3, "connect", connect)
+        assert_code(JobCode.DATABASE_FAILURE, lambda: store.cancel(first.principal, job_id))
+    assert observed == [("commit", True), ("rollback", False), ("close",)]
+    assert row(database, job_id) == previous and count_events(database) == events
+    assert store.renew(lease).expires_at > previous["lease_expires_at"]
+    store.cancel(first.principal, job_id)  # One explicit authorized recovery after rollback.
+    assert row(database, job_id)["prep_state"] == "CANCELLED"
+    assert_code(JobCode.BLOCKED, lambda: store.renew(lease))
+
+
+def test_busy_preparation_cannot_consume_input_or_report_ready(setup):
+    database, store, _, _, *_ = setup
+    job_id = register(setup)
+    lease = store.claim(job_id)
+    manifest = store.manifest(lease)
+    transport = FakeTransport([encode_frame(manifest, 0, SYNTHETIC_PAYLOAD), None])
+    previous, events = row(database, job_id), count_events(database)
+    with database.transaction():
+        assert_code(JobCode.DATABASE_BUSY, lambda: prepare_synthetic(store, lease, manifest.to_bytes(), transport))
+    assert row(database, job_id) == previous and count_events(database) == events
+    assert transport.reads == 0 and transport.closes == 1
+    assert SandboxPolicy().execution_enabled is False
 
 
 @pytest.mark.parametrize("operation", ["registration", "claim", "transition", "renewal"])

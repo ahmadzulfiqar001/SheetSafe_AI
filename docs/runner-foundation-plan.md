@@ -37,6 +37,13 @@ verified. See [host readiness, Linux commands and checkpoint proposal](runner-ho
 The next review is the stopped-input/collector architecture decision and future
 native-host evidence, with no automatic VM provisioning or container execution.
 
+Step 7L was checkpointed as `18662e3`. Step 7M's
+[admission and amendment decision](runner-admission-decision.md) and
+[native Linux runbook](linux-sandbox-acceptance.md) prioritize actual host evidence
+then a separately approved operator-only smoke experiment, instead of another
+simulated runner subsystem. Dynamic transport and strict late-start fencing
+remain conditional; no SEC runtime control is marked verified by these documents.
+
 Steps 7E-H were checkpointed and pushed as `38ec781`. Step 7I's
 [transport design comparison](runner-secure-transport-design.md) recommends bounded
 pre-candidate stdin input with a scoped host-side collector only conditionally:
