@@ -1,0 +1,38 @@
+# Root build context: deny all, reopen directories, re-deny their children,
+# then permit only these reviewed source/build files. No fixtures or host data.
+**
+!ingestion/
+ingestion/**
+!ingestion/__init__.py
+!ingestion/contracts.py
+!ingestion/parser_jobs.py
+!parser_worker/
+parser_worker/**
+!parser_worker/__init__.py
+!parser_worker/common.py
+!parser_worker/csv_parser.py
+!parser_worker/xlsx_archive.py
+!parser_worker/xlsx_parser.py
+!parser_worker/entrypoint.py
+!parser_worker/image/
+parser_worker/image/**
+!parser_worker/image/Dockerfile
+!parser_worker/image/Dockerfile.dockerignore
+!parser_worker/image/bootstrap.py
+!parser_worker/image/stage_runtime.py
+!parser_worker/image/requirements.lock
+# Offline build inputs remain Git-ignored. Never reopen a whole wheel directory.
+!var/
+var/**
+!var/parser-wheelhouse/
+var/parser-wheelhouse/**
+!var/parser-wheelhouse/linux-amd64-cp312/
+var/parser-wheelhouse/linux-amd64-cp312/**
+!var/parser-wheelhouse/linux-amd64-cp312/annotated_types-0.8.0-py3-none-any.whl
+!var/parser-wheelhouse/linux-amd64-cp312/defusedxml-0.7.1-py2.py3-none-any.whl
+!var/parser-wheelhouse/linux-amd64-cp312/et_xmlfile-2.0.0-py3-none-any.whl
+!var/parser-wheelhouse/linux-amd64-cp312/openpyxl-3.1.5-py2.py3-none-any.whl
+!var/parser-wheelhouse/linux-amd64-cp312/pydantic-2.14.1-py3-none-any.whl
+!var/parser-wheelhouse/linux-amd64-cp312/pydantic_core-2.50.1-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+!var/parser-wheelhouse/linux-amd64-cp312/typing_extensions-4.16.0-py3-none-any.whl
+!var/parser-wheelhouse/linux-amd64-cp312/typing_inspection-0.4.4-py3-none-any.whl

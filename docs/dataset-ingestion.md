@@ -1,6 +1,10 @@
 # Step 8A — synthetic CSV/XLSX ingestion foundation
 
 Date: 2026-10-24. **SYNTHETIC FIXTURES ONLY / PRIVATE UPLOADS DISABLED**.
+Later update: Step 8A was checkpointed as e28c3b3; the
+[Step 8B foundation](parser-worker.md) adds a closed worker entrypoint and unbuilt
+image definition. Statements about absent CLI/checkpoint status below record the
+Step 8A snapshot, not permission to run a parser now.
 No container, upload route, production parser dispatch, collector, input transport,
 inference call or publication capability was added. Step 7M transport amendments
 remain unapproved. SEC01-SEC10 runtime enforcement remains UNVERIFIED.

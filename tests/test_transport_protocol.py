@@ -51,8 +51,14 @@ def test_server_identity_and_manifest_round_trip_do_not_grant_authority(manifest
     assert not SandboxPolicy().execution_enabled
     with pytest.raises(TypeError):
         protocol.JobBinding("session_a", "run_a", 1, job_id="caller")
-    with pytest.raises(ValueError):
+    original_binding = manifest.binding.fields()
+    # This stdlib guard raises ValueError in CPython 3.12.13, TypeError in 3.13.17.
+    with pytest.raises((ValueError, TypeError), match=(
+        r"^field job_id is declared with init=False, "
+        r"it cannot be specified with replace\(\)$"
+    )):
         replace(manifest.binding, job_id="caller")
+    assert manifest.binding.fields() == original_binding
     with pytest.raises(FrozenInstanceError):
         manifest.binding.run_id = "other"
 

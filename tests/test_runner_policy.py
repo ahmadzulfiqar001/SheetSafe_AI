@@ -51,10 +51,16 @@ def test_any_attempted_request_override_is_rejected(key, value):
 
 @pytest.mark.parametrize("field_name", [item.name for item in fields(SandboxPolicy)])
 def test_policy_fields_cannot_be_supplied_or_replaced(field_name):
+    policy = SandboxPolicy()
     with pytest.raises(TypeError):
         SandboxPolicy(**{field_name: None})
-    with pytest.raises(ValueError):
-        replace(SandboxPolicy(), **{field_name: None})
+    # This stdlib guard raises ValueError in CPython 3.12.13, TypeError in 3.13.17.
+    with pytest.raises((ValueError, TypeError), match=(
+        rf"^field {field_name} is declared with init=False, "
+        r"it cannot be specified with replace\(\)$"
+    )):
+        replace(policy, **{field_name: None})
+    assert policy == SandboxPolicy()
 
 
 def test_policy_request_and_nested_configuration_are_frozen():

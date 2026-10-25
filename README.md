@@ -79,6 +79,32 @@ No upload route, production parser adapter, READY transition or publication is
 enabled. XML hardening adds defusedxml; no parser image was built or executed.
 See [ingestion limits, failures and trust boundary](docs/dataset-ingestion.md).
 
+## Step 8B dedicated parser worker foundation
+
+A separate fixed parser policy, versioned job/reply contracts, fake-tested
+PARSE_CSV/PARSE_XLSX entrypoint and minimal parser image definition exist.
+Step 8C-R subsequently built and statically inspected the parser image; its
+approved execution identity remains unset. Runtime controls remain unverified and the production entrypoint exits 78 because
+transport is unavailable. No upload, dispatch, container or publication enabled.
+See [parser packaging, security and native acceptance](docs/parser-worker.md).
+Step 8B Windows verification: **1324 passed, 1 skipped, 1 warning** in 71.84s;
+combined worker/ingestion tests: 241 passed. These are static/fake/synthetic tests,
+not native parser-sandbox acceptance.
+
+## Step 8C-R parser image build and static inspection
+
+The historical Step 8C Engine outage is resolved: actual Linux Engine API calls
+succeed. Eight exact locked public wheels were downloaded, hash-verified and
+installed offline during a network-disabled build. Static layer inspection
+verified image configuration, source/wheel/base provenance and native dependency
+file presence; build-only and native GUI/test assets were excluded. See the
+[actual recovery, build and inspection record](docs/parser-worker.md#step-8c-r-engine-availability-offline-wheels-and-final-image).
+The image has no execution approval. No container was started; runtime imports
+and SEC01-SEC10 remain unverified. LSM_NOT_ADVERTISED, native Linux acceptance
+and the unapproved transport amendment still block execution/uploads/dispatch.
+Final Step 8C-R suite: **1329 passed, 1 skipped, 1 warning** in 67.41s;
+focused parser/ingestion checks: 246 passed; runner security regression: 697 passed.
+
 ## Not implemented or enabled
 
 Private/customer uploads, upload/download APIs, production spreadsheet parsing, real Docker
