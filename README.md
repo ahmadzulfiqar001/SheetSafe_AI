@@ -117,11 +117,22 @@ credentials, and reject sensitive metadata or prompt-injection patterns before
 network dispatch. Live network calls remain disabled in this milestone; all
 tests use deterministic `httpx.MockTransport`.
 
+## Step 11A Streamlit dashboard and typed FastAPI client
+
+`frontend/app.py` and `frontend/api_client.py` provide the Streamlit control-plane
+dashboard (`Dashboard`, `My Datasets`, `AI Analysis`, `Analysis History` and
+`Settings / Privacy`). The UI connects to `/api/v1/health`, `/api/v1/ready`,
+`POST /api/v1/sessions` and `DELETE /api/v1/sessions/{session_id}` using a
+bounded HTTPX client that seals `HttpOnly` session cookies and `X-CSRF-Token`
+secrets inside non-printable `SecretStr` holders. File upload submission and live
+AI execution remain explicitly disabled by security gates, and no fabricated
+datasets or analysis results are displayed.
+
 ## Not implemented or enabled
 
 Private/customer uploads, upload/download APIs, production spreadsheet parsing, real Docker
 execution transport, live Vultr inference calls, self-healing execution, independent numerical
-validation and Streamlit screens are not implemented. The `validated` storage
+validation are not implemented. The `validated` storage
 category is reserved; result publication is blocked. Installed libraries do not
 mean their product features are operational.
 
@@ -177,7 +188,7 @@ Never place real keys, uploads or runtime receipts in the source tree.
 
 ```powershell
 uv run --frozen --no-sync python -m pytest -q -rs
-uv run --frozen --no-sync python -m compileall -q backend runner ingestion parser_worker tests
+uv run --frozen --no-sync python -m compileall -q backend frontend runner ingestion parser_worker tests
 git diff --check
 ```
 
