@@ -4,11 +4,12 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+VULTR_INFERENCE_BASE_URL = "https://api.vultrinference.com/v1"
 
 
 class Settings(BaseSettings):
@@ -43,6 +44,16 @@ class Settings(BaseSettings):
     cleanup_retention_batch_size: int = Field(default=500, ge=1, le=5000)
     cleanup_max_attempts: int = Field(default=5, ge=1, le=10)
     cleanup_adapter_timeout_seconds: float = Field(default=2, ge=0.01, le=10)
+    vultr_inference_base_url: str = VULTR_INFERENCE_BASE_URL
+    vultr_inference_api_key: SecretStr | None = Field(default=None, repr=False)
+    vultr_inference_model: str | None = None
+    vultr_inference_connect_timeout_seconds: float = Field(default=5.0, ge=0.1, le=10.0)
+    vultr_inference_read_timeout_seconds: float = Field(default=20.0, ge=0.5, le=30.0)
+    vultr_inference_max_request_bytes: int = Field(default=32768, ge=1024, le=65536)
+    vultr_inference_max_response_bytes: int = Field(default=65536, ge=2048, le=131072)
+    vultr_inference_max_input_tokens: int = Field(default=4096, ge=256, le=8192)
+    vultr_inference_max_output_tokens: int = Field(default=1024, ge=128, le=2048)
+    vultr_inference_max_retries: int = Field(default=1, ge=0, le=2)
 
     @field_validator("database_path", mode="before")
     @classmethod
@@ -78,6 +89,23 @@ class Settings(BaseSettings):
             or any(urlsplit(origin).hostname not in loopback_hosts for origin in self.allowed_origins)
         ):
             raise ValueError("Insecure cookies require explicit loopback-only development settings")
+        if self.vultr_inference_base_url != VULTR_INFERENCE_BASE_URL:
+            raise ValueError("Vultr inference base URL must match the official HTTPS endpoint")
+        if self.vultr_inference_api_key is not None:
+            secret = self.vultr_inference_api_key.get_secret_value()
+            if (
+                not 16 <= len(secret) <= 256
+                or secret != secret.strip()
+                or any(ord(ch) <= 32 or ord(ch) >= 127 for ch in secret)
+            ):
+                raise ValueError("Invalid Vultr inference credential format")
+        if self.vultr_inference_model is not None:
+            if (
+                not 1 <= len(self.vultr_inference_model) <= 96
+                or self.vultr_inference_model != self.vultr_inference_model.strip()
+                or any(ord(ch) <= 32 or ord(ch) >= 127 or ch in {"'", '"', "\\", ";", "?"} for ch in self.vultr_inference_model)
+            ):
+                raise ValueError("Invalid Vultr inference model identifier")
         return self
 
     @property

@@ -105,10 +105,22 @@ and the unapproved transport amendment still block execution/uploads/dispatch.
 Final Step 8C-R suite: **1329 passed, 1 skipped, 1 warning** in 67.41s;
 focused parser/ingestion checks: 246 passed; runner security regression: 697 passed.
 
+## Step 9A Vultr inference client and privacy-safe planning foundation
+
+`backend/inference.py` implements the official Vultr Serverless Inference
+(`https://api.vultrinference.com/v1`) HTTPX client and versioned Pydantic
+contracts for minimal schema conversion, user analysis questions, AI analysis
+plans, proposed operations, required column bindings, explicit clarifications and
+a separate non-executing generated-code contract. Outbound requests exclude raw
+files, preview cells, worksheet names, storage paths, session tokens and
+credentials, and reject sensitive metadata or prompt-injection patterns before
+network dispatch. Live network calls remain disabled in this milestone; all
+tests use deterministic `httpx.MockTransport`.
+
 ## Not implemented or enabled
 
 Private/customer uploads, upload/download APIs, production spreadsheet parsing, real Docker
-execution transport, Vultr inference, agent planning, self-healing, independent numerical
+execution transport, live Vultr inference calls, self-healing execution, independent numerical
 validation and Streamlit screens are not implemented. The `validated` storage
 category is reserved; result publication is blocked. Installed libraries do not
 mean their product features are operational.

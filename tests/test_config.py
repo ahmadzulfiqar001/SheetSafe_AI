@@ -20,6 +20,11 @@ def clear_settings_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         "SHEETSAFE_CLEANUP_INTERVAL_SECONDS", "SHEETSAFE_CLEANUP_BATCH_SIZE",
         "SHEETSAFE_CLEANUP_RETENTION_BATCH_SIZE", "SHEETSAFE_CLEANUP_MAX_ATTEMPTS",
         "SHEETSAFE_CLEANUP_ADAPTER_TIMEOUT_SECONDS",
+        "SHEETSAFE_VULTR_INFERENCE_BASE_URL", "SHEETSAFE_VULTR_INFERENCE_API_KEY",
+        "SHEETSAFE_VULTR_INFERENCE_MODEL", "SHEETSAFE_VULTR_INFERENCE_CONNECT_TIMEOUT_SECONDS",
+        "SHEETSAFE_VULTR_INFERENCE_READ_TIMEOUT_SECONDS", "SHEETSAFE_VULTR_INFERENCE_MAX_REQUEST_BYTES",
+        "SHEETSAFE_VULTR_INFERENCE_MAX_RESPONSE_BYTES", "SHEETSAFE_VULTR_INFERENCE_MAX_INPUT_TOKENS",
+        "SHEETSAFE_VULTR_INFERENCE_MAX_OUTPUT_TOKENS", "SHEETSAFE_VULTR_INFERENCE_MAX_RETRIES",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -137,3 +142,40 @@ def test_origin_allowlist_can_be_loaded_from_environment(monkeypatch: pytest.Mon
 def test_cleanup_controls_remain_bounded(overrides: dict) -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **overrides)
+
+
+def test_vultr_inference_settings_remain_closed_and_redact_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    default_settings = Settings(_env_file=None)
+    assert default_settings.vultr_inference_base_url == "https://api.vultrinference.com/v1"
+    assert default_settings.vultr_inference_api_key is None
+    assert default_settings.vultr_inference_model is None
+
+    secret_value = "synthetic-vultr-secret-key-0123456789"
+    monkeypatch.setenv("SHEETSAFE_VULTR_INFERENCE_API_KEY", secret_value)
+    monkeypatch.setenv("SHEETSAFE_VULTR_INFERENCE_MODEL", "approved-model-v1")
+    configured = Settings(_env_file=None)
+    assert configured.vultr_inference_api_key is not None
+    assert configured.vultr_inference_api_key.get_secret_value() == secret_value
+    assert secret_value not in repr(configured)
+    assert secret_value not in str(configured)
+
+    for bad_override in (
+        {"vultr_inference_base_url": "http://api.vultrinference.com/v1"},
+        {"vultr_inference_base_url": "https://evil.example/v1"},
+        {"vultr_inference_api_key": "short"},
+        {"vultr_inference_api_key": "bad key with spaces 123456"},
+        {"vultr_inference_model": ""},
+        {"vultr_inference_model": "bad;model"},
+        {"vultr_inference_connect_timeout_seconds": 0.01},
+        {"vultr_inference_read_timeout_seconds": 35.0},
+        {"vultr_inference_max_request_bytes": 100000},
+        {"vultr_inference_max_response_bytes": 200000},
+        {"vultr_inference_max_input_tokens": 100},
+        {"vultr_inference_max_output_tokens": 5000},
+        {"vultr_inference_max_retries": 5},
+    ):
+        with pytest.raises(ValidationError) as exc_info:
+            Settings(_env_file=None, **bad_override)
+        assert secret_value not in str(exc_info.value)
