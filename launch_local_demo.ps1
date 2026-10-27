@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    SheetSafe AI — Local Development & Presentation Demo Launcher (Windows PowerShell)
+    SheetSafe AI - Local Development & Presentation Demo Launcher (Windows PowerShell)
 
 .DESCRIPTION
     Launches the SheetSafe AI local demonstration environment for the Vultr Agent Rush Hackathon.
@@ -55,7 +55,7 @@ function Ensure-LocalEnv {
     if (-not (Test-Path -LiteralPath $EnvLocalPath)) {
         Write-Host "Creating local loopback configuration: $EnvLocalPath" -ForegroundColor Cyan
         $LocalEnvContent = @"
-# SheetSafe AI — Local Demonstration Settings (Loopback Only)
+# SheetSafe AI - Local Demonstration Settings (Loopback Only)
 SHEETSAFE_ENVIRONMENT=development
 SHEETSAFE_ALLOWED_ORIGINS=["http://localhost:8501","http://127.0.0.1:8501","http://127.0.0.1:8000","http://localhost:8000"]
 SHEETSAFE_ALLOW_INSECURE_LOCAL_COOKIES=true
@@ -98,7 +98,7 @@ switch ($Component) {
     "help" {
         Ensure-LocalEnv
         Write-Host ""
-        Write-Host "=== SheetSafe AI — Local Demo Startup Instructions ===" -ForegroundColor Green
+        Write-Host "=== SheetSafe AI - Local Demo Startup Instructions ===" -ForegroundColor Green
         Write-Host ""
         Write-Host "To run the full presentation demo, open TWO PowerShell terminals:"
         Write-Host ""
