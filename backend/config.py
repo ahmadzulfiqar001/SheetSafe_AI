@@ -54,6 +54,9 @@ class Settings(BaseSettings):
     vultr_inference_max_input_tokens: int = Field(default=4096, ge=256, le=8192)
     vultr_inference_max_output_tokens: int = Field(default=1024, ge=128, le=2048)
     vultr_inference_max_retries: int = Field(default=1, ge=0, le=2)
+    synthetic_planning_enabled: bool = False
+    planning_requests_per_session_per_minute: int = Field(default=10, ge=1, le=60)
+    max_runs_per_session: int = Field(default=25, ge=1, le=100)
 
     @field_validator("database_path", mode="before")
     @classmethod
@@ -89,6 +92,8 @@ class Settings(BaseSettings):
             or any(urlsplit(origin).hostname not in loopback_hosts for origin in self.allowed_origins)
         ):
             raise ValueError("Insecure cookies require explicit loopback-only development settings")
+        if self.synthetic_planning_enabled and self.environment == "production":
+            raise ValueError("Synthetic fixture planning workflow is forbidden in production")
         if self.vultr_inference_base_url != VULTR_INFERENCE_BASE_URL:
             raise ValueError("Vultr inference base URL must match the official HTTPS endpoint")
         if self.vultr_inference_api_key is not None:

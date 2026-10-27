@@ -163,5 +163,6 @@ def test_no_production_parser_path_or_upload_route():
                 else [node.module or ""] if isinstance(node, ast.ImportFrom) else [])
             assert not any(m.split(".")[0] in {"parser_worker", "openpyxl", "pandas", "csv", "zipfile"} for m in modules)
     assert set(create_app().openapi()["paths"]).issubset({"/api/v1/health", "/api/v1/ready",
-        "/api/v1/sessions", "/api/v1/sessions/{session_id}"})
+        "/api/v1/sessions", "/api/v1/sessions/{session_id}",
+        "/api/v1/planning/synthetic-dataset", "/api/v1/planning/preview", "/api/v1/planning/runs"})
     fails(Code.PARSER_UNAVAILABLE, lambda: UnavailableParserSandbox().profile(request(DATA), DATA))

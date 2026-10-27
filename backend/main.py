@@ -10,8 +10,10 @@ from starlette.concurrency import run_in_threadpool
 
 from backend.api.errors import SafeCORSMiddleware, install_error_handlers
 from backend.api.health import router as health_router
+from backend.api.planning import router as planning_router
 from backend.api.sessions import router as sessions_router
 from backend.config import Settings
+from backend.planning import PlanningService
 from backend.security.lifecycle import LifecycleCoordinator
 from backend.security.sessions import SessionService
 from backend.storage.database import Database
@@ -32,6 +34,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         application.state.database = None
         application.state.sessions = None
+        application.state.planning = None
         application.state.lifecycle = None
         application.state.cleanup_task = None
         application.state.storage = None
@@ -57,6 +60,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             application.state.lifecycle = lifecycle
             application.state.cleanup_task = cleanup_task
             application.state.sessions = SessionService(database, settings, lifecycle)
+            application.state.planning = PlanningService(database, storage, settings)
             yield
         finally:
             stop.set()
@@ -70,6 +74,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 # normal shutdown, startup failure or interrupted shutdown.
                 application.state.database = None
                 application.state.sessions = None
+                application.state.planning = None
                 application.state.lifecycle = None
                 application.state.cleanup_task = None
                 application.state.storage = None
@@ -84,6 +89,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     application.state.database = None
     application.state.sessions = None
+    application.state.planning = None
+    application.state.inference_transport = None
     application.state.lifecycle = None
     application.state.cleanup_task = None
     application.state.storage = None
@@ -97,6 +104,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     install_error_handlers(application)
     application.include_router(health_router, prefix="/api/v1")
     application.include_router(sessions_router, prefix="/api/v1")
+    application.include_router(planning_router, prefix="/api/v1")
     return application
 
 

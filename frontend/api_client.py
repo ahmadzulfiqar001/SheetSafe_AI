@@ -8,7 +8,7 @@ Security invariants:
 - Enforces Origin, X-SheetSafe-Request, and X-CSRF-Token headers per the
   backend session protocol.
 - Explicitly blocks unimplemented endpoints (real uploads, dataset profiling
-  dispatch, live AI execution) rather than fabricating responses.
+  dispatch, live AI code execution) rather than fabricating responses.
 """
 
 from dataclasses import dataclass, field
@@ -25,7 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 DEFAULT_API_BASE_URL = "http://127.0.0.1:8000"
 DEFAULT_CLIENT_ORIGIN = "http://localhost:8501"
-MAX_API_RESPONSE_BYTES = 16 * 1024
+MAX_API_RESPONSE_BYTES = 32 * 1024
 
 
 class FrontendClientCode(StrEnum):
@@ -33,11 +33,14 @@ class FrontendClientCode(StrEnum):
     BACKEND_UNREACHABLE = "BACKEND_UNREACHABLE"
     BACKEND_TIMEOUT = "BACKEND_TIMEOUT"
     NOT_READY = "NOT_READY"
+    INVALID_REQUEST = "INVALID_REQUEST"
     UNAUTHENTICATED = "UNAUTHENTICATED"
     FORBIDDEN = "FORBIDDEN"
     NOT_FOUND = "NOT_FOUND"
     CONFLICT = "CONFLICT"
+    UNPROCESSABLE_REQUEST = "UNPROCESSABLE_REQUEST"
     RATE_LIMITED = "RATE_LIMITED"
+    UPSTREAM_CONTRACT_ERROR = "UPSTREAM_CONTRACT_ERROR"
     SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE"
     MALFORMED_RESPONSE = "MALFORMED_RESPONSE"
     FEATURE_DISABLED_BY_GATE = "FEATURE_DISABLED_BY_GATE"
@@ -55,6 +58,7 @@ class FrontendClientError(ValueError):
         retryable: bool = False,
         request_id: str | None = None,
         retry_after: int | None = None,
+        backend_code: str | None = None,
     ) -> None:
         self.code = code
         self.safe_message = message
@@ -62,6 +66,7 @@ class FrontendClientError(ValueError):
         self.retryable = retryable
         self.request_id = request_id
         self.retry_after = retry_after
+        self.backend_code = backend_code or code.value
         super().__init__(f"{code.value}: {message}")
 
 
@@ -118,6 +123,115 @@ class SessionDeletionReceiptView(StrictFrontendModel):
     request_id: str | None = None
 
 
+class SchemaColumnView(StrictFrontendModel):
+    column_id: str = Field(pattern=r"^col_[0-9]{3}$")
+    name: str = Field(min_length=1, max_length=128)
+    inferred_type: Literal["empty", "text", "integer", "number", "boolean", "date", "mixed"]
+    missing_count: int = Field(ge=0)
+
+
+class DatasetSchemaView(StrictFrontendModel):
+    version: Literal[1] = 1
+    row_count: int = Field(ge=1)
+    column_count: int = Field(ge=1)
+    columns: tuple[SchemaColumnView, ...]
+    schema_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class SyntheticDatasetView(StrictFrontendModel):
+    dataset_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    session_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    version: Literal[1] = 1
+    state: Literal["READY"] = "READY"
+    is_synthetic_fixture: Literal[True] = True
+    fixture_id: Literal["synthetic_quarterly_revenue_v1"]
+    fixture_label: str
+    dataset_schema: DatasetSchemaView
+    request_id: str | None = None
+
+
+class RequiredColumnView(StrictFrontendModel):
+    column_id: str = Field(pattern=r"^col_[0-9]{3}$")
+    name: str = Field(min_length=1, max_length=128)
+    expected_type: Literal["empty", "text", "integer", "number", "boolean", "date", "mixed"]
+
+
+class OperationStepView(StrictFrontendModel):
+    step_number: int = Field(ge=1, le=8)
+    operation: str
+    target_columns: tuple[str, ...]
+    group_by_columns: tuple[str, ...] = ()
+    aggregation: str | None = None
+    sort_direction: Literal["asc", "desc"] | None = None
+    limit_rows: int | None = None
+    rationale: str
+
+
+class AnalysisPlanView(StrictFrontendModel):
+    version: Literal[1] = 1
+    schema_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    intent_summary: str
+    required_columns: tuple[RequiredColumnView, ...]
+    operations: tuple[OperationStepView, ...]
+    expected_result_type: str
+
+
+class ClarificationView(StrictFrontendModel):
+    version: Literal[1] = 1
+    reason_code: str
+    clarification_prompt: str
+    candidate_columns: tuple[str, ...] = ()
+
+
+class PlanningEnvelopeView(StrictFrontendModel):
+    version: Literal[1] = 1
+    status: Literal["PLAN_READY", "CLARIFICATION_REQUIRED"]
+    plan: AnalysisPlanView | None = None
+    clarification: ClarificationView | None = None
+
+
+class PlanningPreviewView(StrictFrontendModel):
+    run_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    session_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    dataset_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    dataset_version: int = Field(ge=1)
+    run_state: Literal["AWAIT_CONFIRMATION", "NEEDS_CLARIFICATION"]
+    provider_mode: Literal["SIMULATED_MOCK"] = "SIMULATED_MOCK"
+    simulated_response: Literal[True] = True
+    provider_label: str
+    is_synthetic_dataset: bool = True
+    execution_enabled: Literal[False] = False
+    model: str
+    question: str
+    dataset_schema: DatasetSchemaView
+    envelope: PlanningEnvelopeView
+    plan_sha256: str | None = None
+    request_id: str | None = None
+
+
+class PersistedRunSummaryView(StrictFrontendModel):
+    run_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    session_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    dataset_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    dataset_version: int = Field(ge=1)
+    state: str
+    question: str
+    provider_mode: Literal["SIMULATED_MOCK"] = "SIMULATED_MOCK"
+    simulated_response: Literal[True] = True
+    execution_enabled: Literal[False] = False
+    plan_sha256: str | None = None
+    expected_result_type: str | None = None
+    intent_summary: str | None = None
+    clarification_reason: str | None = None
+    created_at: int = Field(gt=0)
+    updated_at: int = Field(gt=0)
+
+
+class SessionRunsListView(StrictFrontendModel):
+    session_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    runs: tuple[PersistedRunSummaryView, ...]
+
+
 @dataclass(slots=True)
 class _SealedSessionJar:
     """Opaque in-memory holder for the HttpOnly session cookie and CSRF token.
@@ -132,6 +246,14 @@ class _SealedSessionJar:
 
     def __repr__(self) -> str:
         return f"<_SealedSessionJar session_id={self.view.session_id!r}>"
+
+
+def _coerce_tuples(value: object) -> object:
+    if isinstance(value, list):
+        return tuple(_coerce_tuples(item) for item in value)
+    if isinstance(value, dict):
+        return {k: _coerce_tuples(v) for k, v in value.items()}
+    return value
 
 
 def validate_canonical_origin(url: str, *, allow_path: bool = False) -> str:
@@ -221,6 +343,14 @@ class SheetSafeApiClient:
 
     def clear_local_session(self) -> None:
         self._sealed_session = None
+
+    def _require_sealed_session(self) -> _SealedSessionJar:
+        if self._sealed_session is None:
+            raise FrontendClientError(
+                FrontendClientCode.UNAUTHENTICATED,
+                "An active authenticated session is required.",
+            )
+        return self._sealed_session
 
     def _request_raw(
         self,
@@ -323,23 +453,29 @@ class SheetSafeApiClient:
             if retry_after_hdr and re.fullmatch(r"[0-9]{1,4}", retry_after_hdr.strip())
             else None
         )
+        backend_code: str | None = None
         try:
             envelope = ApiErrorEnvelope.model_validate(self._parse_json(raw))
             request_id = envelope.request_id
             message = envelope.message
             retryable = envelope.retryable
+            backend_code = envelope.code
         except Exception:
             request_id = headers.get("X-Request-ID")
             message = "Request was rejected by the backend control plane."
-            retryable = status_code in {429, 503}
+            retryable = status_code in {429, 503, 504}
 
         mapping = {
+            400: FrontendClientCode.INVALID_REQUEST,
             401: FrontendClientCode.UNAUTHENTICATED,
             403: FrontendClientCode.FORBIDDEN,
             404: FrontendClientCode.NOT_FOUND,
             409: FrontendClientCode.CONFLICT,
+            422: FrontendClientCode.UNPROCESSABLE_REQUEST,
             429: FrontendClientCode.RATE_LIMITED,
+            502: FrontendClientCode.UPSTREAM_CONTRACT_ERROR,
             503: FrontendClientCode.NOT_READY if "ready" in message.lower() else FrontendClientCode.SERVICE_UNAVAILABLE,
+            504: FrontendClientCode.BACKEND_TIMEOUT,
         }
         code = mapping.get(status_code, FrontendClientCode.SERVICE_UNAVAILABLE)
         raise FrontendClientError(
@@ -349,6 +485,7 @@ class SheetSafeApiClient:
             retryable=retryable,
             request_id=request_id,
             retry_after=retry_after,
+            backend_code=backend_code,
         )
 
     def check_health(self) -> HealthStatus:
@@ -495,12 +632,7 @@ class SheetSafeApiClient:
 
     def revoke_active_session(self) -> SessionDeletionReceiptView:
         """Immediately revoke the active session via DELETE /api/v1/sessions/{session_id}."""
-        if self._sealed_session is None:
-            raise FrontendClientError(
-                FrontendClientCode.UNAUTHENTICATED,
-                "No active session is present to revoke.",
-            )
-        jar = self._sealed_session
+        jar = self._require_sealed_session()
         cookie_header = f"{jar.view.cookie_name}={jar._cookie_value.get_secret_value()}"
         status_code, headers, raw = self._request_raw(
             "DELETE",
@@ -531,6 +663,110 @@ class SheetSafeApiClient:
         self._sealed_session = None
         return receipt
 
+    def bootstrap_synthetic_dataset(self) -> SyntheticDatasetView:
+        """Provision or retrieve the session-owned synthetic demonstration dataset."""
+        jar = self._require_sealed_session()
+        cookie_header = f"{jar.view.cookie_name}={jar._cookie_value.get_secret_value()}"
+        status_code, headers, raw = self._request_raw(
+            "POST",
+            "/api/v1/planning/synthetic-dataset",
+            headers={
+                "Origin": self._client_origin,
+                "X-CSRF-Token": jar._csrf_token.get_secret_value(),
+                "Cookie": cookie_header,
+            },
+            json_body={},
+        )
+        if status_code != 200:
+            if status_code == 401:
+                self._sealed_session = None
+            self._raise_api_error(status_code, headers, raw)
+
+        payload = _coerce_tuples(self._parse_json(raw))
+        if type(payload) is not dict:
+            raise FrontendClientError(
+                FrontendClientCode.MALFORMED_RESPONSE,
+                "Invalid synthetic dataset payload.",
+            )
+        try:
+            return SyntheticDatasetView.model_validate({
+                **payload,
+                "request_id": headers.get("X-Request-ID"),
+            })
+        except Exception:
+            raise FrontendClientError(
+                FrontendClientCode.MALFORMED_RESPONSE,
+                "Backend returned an invalid synthetic dataset schema.",
+            ) from None
+
+    def create_planning_preview(
+        self,
+        question: str,
+        *,
+        dataset_id: str | None = None,
+    ) -> PlanningPreviewView:
+        """Call POST /api/v1/planning/preview for an authenticated session."""
+        jar = self._require_sealed_session()
+        cookie_header = f"{jar.view.cookie_name}={jar._cookie_value.get_secret_value()}"
+        body: dict[str, object] = {"question": question}
+        if dataset_id is not None:
+            body["dataset_id"] = dataset_id
+        status_code, headers, raw = self._request_raw(
+            "POST",
+            "/api/v1/planning/preview",
+            headers={
+                "Origin": self._client_origin,
+                "X-CSRF-Token": jar._csrf_token.get_secret_value(),
+                "Cookie": cookie_header,
+            },
+            json_body=body,
+        )
+        if status_code != 200:
+            if status_code == 401:
+                self._sealed_session = None
+            self._raise_api_error(status_code, headers, raw)
+
+        payload = _coerce_tuples(self._parse_json(raw))
+        if type(payload) is not dict:
+            raise FrontendClientError(
+                FrontendClientCode.MALFORMED_RESPONSE,
+                "Invalid planning preview payload.",
+            )
+        try:
+            return PlanningPreviewView.model_validate({
+                **payload,
+                "request_id": headers.get("X-Request-ID"),
+            })
+        except Exception:
+            raise FrontendClientError(
+                FrontendClientCode.MALFORMED_RESPONSE,
+                "Backend returned an invalid planning preview schema.",
+            ) from None
+
+    def list_planning_runs(self) -> tuple[PersistedRunSummaryView, ...]:
+        """Call GET /api/v1/planning/runs for the active session."""
+        jar = self._require_sealed_session()
+        cookie_header = f"{jar.view.cookie_name}={jar._cookie_value.get_secret_value()}"
+        status_code, headers, raw = self._request_raw(
+            "GET",
+            "/api/v1/planning/runs",
+            headers={"Cookie": cookie_header},
+        )
+        if status_code != 200:
+            if status_code == 401:
+                self._sealed_session = None
+            self._raise_api_error(status_code, headers, raw)
+
+        payload = _coerce_tuples(self._parse_json(raw))
+        try:
+            parsed = SessionRunsListView.model_validate(payload)
+            return parsed.runs
+        except Exception:
+            raise FrontendClientError(
+                FrontendClientCode.MALFORMED_RESPONSE,
+                "Backend returned an invalid runs list schema.",
+            ) from None
+
     def submit_dataset_upload(self, *_args: object, **_kwargs: object) -> None:
         """Explicitly fail closed: real upload routes are disabled until parser sandbox gates pass."""
         raise FrontendClientError(
@@ -539,8 +775,8 @@ class SheetSafeApiClient:
         )
 
     def submit_analysis_run(self, *_args: object, **_kwargs: object) -> None:
-        """Explicitly fail closed: live AI execution requires an authorized dataset and verified sandbox."""
+        """Explicitly fail closed: live code execution requires a verified Linux sandbox."""
         raise FrontendClientError(
             FrontendClientCode.FEATURE_DISABLED_BY_GATE,
-            "Live AI analysis and sandboxed code execution are disabled until a validated dataset, Vultr API key configuration, and native Linux runner acceptance are active.",
+            "Generated-code execution and sandboxed container dispatch are disabled until native Linux runner acceptance (SEC01-SEC10) is active.",
         )

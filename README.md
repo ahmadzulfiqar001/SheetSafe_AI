@@ -117,6 +117,20 @@ credentials, and reject sensitive metadata or prompt-injection patterns before
 network dispatch. Live network calls remain disabled in this milestone; all
 tests use deterministic `httpx.MockTransport`.
 
+## Step 9B FastAPI AI planning workflow (offline simulated preview)
+
+`backend/planning.py` and `backend/api/planning.py` connect authenticated
+synthetic sessions to the Step 9A planning contracts through
+`POST /api/v1/planning/synthetic-dataset`, `POST /api/v1/planning/preview` and
+`GET /api/v1/planning/runs`. When `SHEETSAFE_SYNTHETIC_PLANNING_ENABLED=true` is
+set in non-production environments, the service provisions a server-owned
+synthetic demonstration dataset, calls `VultrInferenceClient` over a
+deterministic in-memory `httpx.MockTransport` (`provider_mode=SIMULATED_MOCK`),
+persists run state (`AWAIT_CONFIRMATION`, `NEEDS_CLARIFICATION`, `BLOCKED_POLICY`,
+`TIMED_OUT`, `PROVIDER_UNAVAILABLE`, `CANCELLED`) and appends content-free audit
+events. Unparsed `PENDING` datasets are never promoted to `READY`, generated
+Python is never executed, and live Vultr calls remain disabled.
+
 ## Step 11A Streamlit dashboard and typed FastAPI client
 
 `frontend/app.py` and `frontend/api_client.py` provide the Streamlit control-plane

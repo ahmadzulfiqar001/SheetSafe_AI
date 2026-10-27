@@ -8,11 +8,19 @@ import secrets
 from fastapi import Depends, HTTPException, Request
 
 from backend.config import Settings
+from backend.planning import PlanningService
 from backend.security.sessions import SessionPrincipal, SessionService
 
 
 def session_service(request: Request) -> SessionService:
     service = getattr(request.app.state, "sessions", None)
+    if service is None:
+        raise HTTPException(503)
+    return service
+
+
+def planning_service(request: Request) -> PlanningService:
+    service = getattr(request.app.state, "planning", None)
     if service is None:
         raise HTTPException(503)
     return service

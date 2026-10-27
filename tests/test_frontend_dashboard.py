@@ -436,7 +436,7 @@ def test_streamlit_dashboard_renders_all_pages_and_respects_gates(
     assert live_client.active_session is not None
     created_session_id = live_client.active_session.session_id
 
-    # Navigate to "My Datasets" and confirm upload submit button is disabled and 0 datasets shown
+    # Navigate to "My Datasets" and confirm upload submit button is disabled and 0 user datasets shown
     at.sidebar.radio[0].set_value("My Datasets").run()
     assert not at.exception
     upload_buttons = [
@@ -444,28 +444,28 @@ def test_streamlit_dashboard_renders_all_pages_and_respects_gates(
     ]
     assert len(upload_buttons) == 1
     assert upload_buttons[0].disabled is True
-    assert any("0 datasets" in info.value for info in at.info)
+    assert any("0 user datasets" in info.value for info in at.info)
 
-    # Navigate to "AI Analysis" and confirm AI plan button is disabled
+    # Navigate to "AI Analysis" and confirm sandbox execution button is disabled
     at.sidebar.radio[0].set_value("AI Analysis").run()
     assert not at.exception
-    plan_buttons = [
-        b for b in at.button if "Generate AI Analysis Plan" in b.label
+    exec_buttons = [
+        b for b in at.button if "Execute Generated Python in Sandbox" in b.label
     ]
-    assert len(plan_buttons) == 1
-    assert plan_buttons[0].disabled is True
+    assert len(exec_buttons) == 1
+    assert exec_buttons[0].disabled is True
     assert any("No active `AIAnalysisPlan`" in info.value for info in at.info)
 
-    # Navigate to "Analysis History" and confirm 0 analysis runs
+    # Navigate to "Analysis History" and confirm 0 persisted runs
     at.sidebar.radio[0].set_value("Analysis History").run()
     assert not at.exception
-    assert any("0 analysis runs" in info.value for info in at.info)
+    assert any("0 persisted runs" in info.value for info in at.info)
 
     # Navigate to "Settings / Privacy" and revoke the active session
     at.sidebar.radio[0].set_value("Settings / Privacy").run()
     assert not at.exception
     revoke_buttons = [
-        b for b in at.button if "Revoke Session & Request Immediate Deletion" in b.label
+        b for b in at.button if "Revoke Session & Queue Deletion" in b.label
     ]
     assert len(revoke_buttons) == 1
     revoke_buttons[0].click().run()
@@ -475,6 +475,8 @@ def test_streamlit_dashboard_renders_all_pages_and_respects_gates(
     assert receipt is not None
     assert receipt.session_id == created_session_id
     assert receipt.access_revoked is True
+    assert receipt.cleanup_status == "not_started"
+    assert any("not yet complete" in s.value for s in at.success)
 
 
 def test_streamlit_dashboard_handles_offline_backend_cleanly() -> None:

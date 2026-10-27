@@ -1,9 +1,12 @@
-"""SheetSafe AI — Streamlit Dashboard (Step 11A).
+"""SheetSafe AI — Streamlit Dashboard (Step 11A + Step 9B AI Planning Preview).
 
 Connects to the live FastAPI control plane (`/api/v1/health`, `/api/v1/ready`,
-`POST /api/v1/sessions`, `DELETE /api/v1/sessions/{session_id}`).
-Never fabricates analysis outputs, never imports backend internals (SQLite,
-storage, parser_worker, runner), and never displays secret credentials.
+`POST /api/v1/sessions`, `DELETE /api/v1/sessions/{session_id}`,
+`POST /api/v1/planning/synthetic-dataset`, `POST /api/v1/planning/preview`,
+`GET /api/v1/planning/runs`).
+Never fabricates analytical results or charts, clearly labels offline mock
+planning as DEMO / SIMULATED, distinguishes immediate access revocation from
+pending physical cleanup, and never exposes session secrets.
 """
 
 from datetime import datetime, timezone
@@ -17,8 +20,10 @@ from frontend.api_client import (
     DEFAULT_API_BASE_URL,
     DEFAULT_CLIENT_ORIGIN,
     FrontendClientError,
+    PlanningPreviewView,
     SessionDeletionReceiptView,
     SheetSafeApiClient,
+    SyntheticDatasetView,
 )
 
 
@@ -124,11 +129,21 @@ def _custom_styles() -> str:
             font-size: 0.9rem;
             margin-bottom: 0.85rem;
         }
+        .ss-sim-banner {
+            background-color: #fffbeb;
+            border-left: 4px solid #d97706;
+            padding: 0.85rem 1rem;
+            border-radius: 6px;
+            color: #78350f;
+            font-size: 0.9rem;
+            margin-bottom: 0.85rem;
+        }
     </style>
     """
 
 
 def _init_state() -> None:
+    """Initialize per-user Streamlit session state. Never uses global or cached state."""
     if "api_client" not in st.session_state:
         api_url = os.environ.get("SHEETSAFE_UI_API_BASE_URL", DEFAULT_API_BASE_URL)
         origin = os.environ.get("SHEETSAFE_UI_CLIENT_ORIGIN", DEFAULT_CLIENT_ORIGIN)
@@ -142,8 +157,21 @@ def _init_state() -> None:
         st.session_state["activity_log"] = []
     if "last_deletion_receipt" not in st.session_state:
         st.session_state["last_deletion_receipt"] = None
+    if "synthetic_dataset" not in st.session_state:
+        st.session_state["synthetic_dataset"] = None
+    if "latest_plan_preview" not in st.session_state:
+        st.session_state["latest_plan_preview"] = None
+    if "planning_error" not in st.session_state:
+        st.session_state["planning_error"] = None
     if "ui_notice" not in st.session_state:
         st.session_state["ui_notice"] = None
+
+
+def _clear_ephemeral_session_views() -> None:
+    """Clear session-scoped dataset and planning views upon revocation or expiry."""
+    st.session_state["synthetic_dataset"] = None
+    st.session_state["latest_plan_preview"] = None
+    st.session_state["planning_error"] = None
 
 
 def _record_activity(event_type: str, detail: str, request_id: str | None = None) -> None:
@@ -183,6 +211,17 @@ def _status_badge_html(snapshot: BackendStatusSnapshot) -> str:
     return '<span class="ss-badge-err">OFFLINE</span>'
 
 
+def _revocation_notice_text(receipt: SessionDeletionReceiptView) -> str:
+    return (
+        f"Session `{receipt.session_id}` access is immediately revoked "
+        f"(`access_revoked={receipt.access_revoked}`, `cancellation_status={receipt.cancellation_status}`). "
+        f"Deletion receipt: `{receipt.receipt_id}`. "
+        f"Physical storage and metadata cleanup is queued (`cleanup_status={receipt.cleanup_status}`) "
+        f"for asynchronous background verification by the retention worker (target window: 5 minutes) — "
+        f"physical erasure is not yet complete."
+    )
+
+
 def _render_header(snapshot: BackendStatusSnapshot, session: ActiveSessionView | None) -> None:
     st.markdown(
         """
@@ -220,7 +259,7 @@ def _render_header(snapshot: BackendStatusSnapshot, session: ActiveSessionView |
         st.metric(
             label="Vultr AI Execution",
             value="Disabled",
-            delta="Zero Live Cloud Spend",
+            delta="Simulated Planning Only",
             delta_color="off",
         )
 
@@ -255,26 +294,35 @@ def _render_sidebar(snapshot: BackendStatusSnapshot, session: ActiveSessionView 
                 try:
                     with st.spinner("Revoking session via DELETE /api/v1/sessions/{id}..."):
                         receipt = client.revoke_active_session()
+                    _clear_ephemeral_session_views()
                     st.session_state["last_deletion_receipt"] = receipt
                     _record_activity(
                         "SESSION_REVOKED",
-                        f"Session {receipt.session_id[:8]}... revoked; receipt {receipt.receipt_id[:8]}...",
+                        (
+                            f"Session {receipt.session_id[:8]}... access revoked; "
+                            f"receipt {receipt.receipt_id[:8]}... (cleanup_status={receipt.cleanup_status})"
+                        ),
                         receipt.request_id,
                     )
                     st.session_state["ui_notice"] = (
                         "success",
-                        f"Session access immediately revoked. Deletion receipt: `{receipt.receipt_id}`.",
+                        _revocation_notice_text(receipt),
                     )
                     st.rerun()
                 except FrontendClientError as exc:
+                    if exc.status_code == 401:
+                        _clear_ephemeral_session_views()
                     _record_activity("SESSION_REVOKE_FAILED", exc.safe_message, exc.request_id)
-                    st.session_state["ui_notice"] = ("error", f"{exc.code.value}: {exc.safe_message}")
+                    st.session_state["ui_notice"] = ("error", f"{exc.backend_code}: {exc.safe_message}")
                     st.rerun()
         else:
             st.info("No active session. Start a synthetic session in Settings / Privacy or Dashboard.")
 
         st.divider()
-        st.caption("Security Posture: `HttpOnly` + `SameSite=Strict` cookies &bull; `X-CSRF-Token` enforced &bull; Zero raw rows sent to LLM.")
+        st.caption(
+            "Security Posture: `HttpOnly` + `SameSite=Strict` cookies &bull; `X-CSRF-Token` enforced "
+            "&bull; Zero raw rows sent to LLM &bull; Offline Mock Planning labeled DEMO/SIMULATED."
+        )
     return selected_page
 
 
@@ -288,8 +336,8 @@ def _render_dashboard_page(snapshot: BackendStatusSnapshot, session: ActiveSessi
             <div class="ss-card">
                 <h4>Operational vs. Gated Subsystems</h4>
                 <p>SheetSafe AI enforces a strict fail-closed architecture. Only verified control-plane
-                operations are active; untrusted file parsing and sandboxed code execution remain locked until
-                native Linux security gates pass.</p>
+                operations and clearly labeled offline simulated planning are active; untrusted file parsing
+                and sandboxed code execution remain locked until native Linux security gates pass.</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -306,14 +354,14 @@ def _render_dashboard_page(snapshot: BackendStatusSnapshot, session: ActiveSessi
                 "Security Guarantee": "256-bit credential hashed in DB, HttpOnly/SameSite=Strict cookie, HMAC CSRF token, exact Origin check.",
             },
             {
+                "Subsystem": "Step 9B AI Planning Preview (/api/v1/planning/preview)",
+                "State": "DEMO / SIMULATED (OFFLINE MOCK)" if snapshot.readiness_ok else "UNAVAILABLE",
+                "Security Guarantee": "Uses server-owned synthetic fixture and deterministic HTTPX mock transport; zero live Vultr calls.",
+            },
+            {
                 "Subsystem": "CSV / XLSX Dataset Upload & Isolated Parser Worker",
                 "State": "GATED (DISABLED)",
                 "Security Guarantee": "Parser image statically built (sha256:8e7cc828...); blocked awaiting native Linux SEC01-SEC10 & AM01-AM04 transport approval.",
-            },
-            {
-                "Subsystem": "Vultr Serverless Inference Planning Client (Step 9A)",
-                "State": "FOUNDATION VERIFIED (OFFLINE)",
-                "Security Guarantee": "Schema-only projection excludes preview rows/cells/PII; live network calls disabled until API key & dataset are active.",
             },
             {
                 "Subsystem": "Sandboxed Candidate Execution & Independent Validator",
@@ -344,6 +392,7 @@ def _render_dashboard_page(snapshot: BackendStatusSnapshot, session: ActiveSessi
                 try:
                     with st.spinner("Calling POST /api/v1/sessions..."):
                         created = client.create_synthetic_session()
+                    _clear_ephemeral_session_views()
                     _record_activity(
                         "SESSION_CREATED",
                         f"Created synthetic session {created.session_id[:8]}... (cookie: {created.cookie_name})",
@@ -357,7 +406,7 @@ def _render_dashboard_page(snapshot: BackendStatusSnapshot, session: ActiveSessi
                     _record_activity("SESSION_CREATE_FAILED", exc.safe_message, exc.request_id)
                     st.session_state["ui_notice"] = (
                         "error",
-                        f"Session creation failed ({exc.code.value}): {exc.safe_message}",
+                        f"Session creation failed ({exc.backend_code}): {exc.safe_message}",
                     )
                     st.rerun()
             if not snapshot.readiness_ok:
@@ -375,13 +424,13 @@ def _render_dashboard_page(snapshot: BackendStatusSnapshot, session: ActiveSessi
 
         receipt: SessionDeletionReceiptView | None = st.session_state.get("last_deletion_receipt")
         if receipt is not None:
-            st.markdown("##### Latest Deletion Receipt")
+            st.markdown("##### Latest Deletion Receipt (Access Revoked; Cleanup Queued)")
             st.code(
                 f"receipt_id:          {receipt.receipt_id}\n"
                 f"session_id:          {receipt.session_id}\n"
-                f"access_revoked:      {receipt.access_revoked}\n"
+                f"access_revoked:      {receipt.access_revoked} (Immediate)\n"
                 f"cancellation_status: {receipt.cancellation_status}\n"
-                f"cleanup_status:      {receipt.cleanup_status}",
+                f"cleanup_status:      {receipt.cleanup_status} (Queued for retention worker; not yet physically erased)",
                 language="yaml",
             )
 
@@ -400,10 +449,10 @@ def _render_datasets_page(session: ActiveSessionView | None) -> None:
     st.markdown(
         """
         <div class="ss-gate-note">
-            <strong>Security Gate Notice (Uploads Disabled):</strong> Real CSV/XLSX upload submission and parser
-            dispatch are disabled in this milestone. Spreadsheet parsing is strictly forbidden inside the FastAPI or
-            Streamlit process and requires the isolated <code>sheetsafe-parser</code> container on an accepted native
-            Linux host.
+            <strong>Security Gate Notice (Real User Uploads Disabled):</strong> Real CSV/XLSX upload submission and
+            parser container dispatch are disabled in this milestone. Spreadsheet parsing is strictly forbidden inside
+            the FastAPI or Streamlit process and requires the isolated <code>sheetsafe-parser</code> container on an
+            accepted native Linux host.
         </div>
         """,
         unsafe_allow_html=True,
@@ -411,7 +460,7 @@ def _render_datasets_page(session: ActiveSessionView | None) -> None:
 
     col_upload, col_limits = st.columns([3, 2])
     with col_upload:
-        st.markdown("#### Upload & Parsing Configuration")
+        st.markdown("#### Upload & Parsing Configuration (Gated)")
         selected_type = st.selectbox(
             "Declared File Format",
             options=["csv — UTF-8 Delimited Text (.csv)", "xlsx — Transitional OOXML Workbook (.xlsx)"],
@@ -465,100 +514,276 @@ def _render_datasets_page(session: ActiveSessionView | None) -> None:
         st.dataframe(limits_table, width="stretch", hide_index=True)
 
     st.divider()
-    st.markdown("#### Active Session Datasets & Clarification States")
+    st.markdown("#### Active Session Datasets & Synthetic Demonstration Fixture")
     if session is None:
         st.info("No active session. Start a synthetic session to view session-scoped dataset state.")
     else:
-        st.info(
-            f"Session `{session.session_id[:12]}...` has **0 datasets** (`private_uploads_enabled=False`). "
-            "No fake or placeholder dataset profiles are displayed."
-        )
-
-    with st.expander("View Ingestion Lifecycle & Clarification States (Reference Contract)"):
-        st.markdown(
-            """
-            - **`PENDING`**: Opaque original bytes sealed in `PrivateStorage` with verified SHA-256; awaiting isolated parser claim.
-            - **`PROFILING`**: Dedicated `sheetsafe-parser` container running under UID `10001:10001` with `ReadonlyRootfs=True`.
-            - **`NEEDS_CLARIFICATION`**: Triggered on `AMBIGUOUS_DELIMITER`, `DUPLICATE_COLUMNS`, or `FORMULA_VALUES_MISSING` (requires values-only export).
-            - **`READY`**: Validated `DatasetProfile` committed; eligible for privacy-safe AI schema conversion.
-            - **`REJECTED` / `FAILED`**: Deterministic ingestion code (`MALFORMED_CSV`, `UNSAFE_ARCHIVE`, `ROW_LIMIT`, `TIMED_OUT`, etc.) with zero partial profile leakage.
-            """
-        )
+        syn_ds: SyntheticDatasetView | None = st.session_state.get("synthetic_dataset")
+        if syn_ds is None:
+            st.info(
+                f"Session `{session.session_id[:12]}...` has **0 user datasets** (`private_uploads_enabled=False`). "
+                "You can provision the server-owned synthetic demonstration dataset in the **AI Analysis** tab "
+                "when `SHEETSAFE_SYNTHETIC_PLANNING_ENABLED=true`."
+            )
+        else:
+            st.warning(
+                f"**{syn_ds.fixture_label}** (`dataset_id={syn_ds.dataset_id}`, "
+                f"`is_synthetic_fixture={syn_ds.is_synthetic_fixture}`, `state={syn_ds.state}`). "
+                "This is a server-owned offline development fixture, not an uploaded user file."
+            )
+            cols_rows = [
+                {
+                    "column_id": col.column_id,
+                    "name": col.name,
+                    "inferred_type": col.inferred_type,
+                    "missing_count": col.missing_count,
+                }
+                for col in syn_ds.dataset_schema.columns
+            ]
+            st.dataframe(cols_rows, width="stretch", hide_index=True)
 
 
 def _render_analysis_page(session: ActiveSessionView | None) -> None:
-    st.subheader("AI Analysis Planning & Sandboxed Execution Workspace")
+    st.subheader("AI Analysis Planning Workspace (Step 9B Offline Simulated Workflow)")
 
     st.markdown(
         """
-        <div class="ss-gate-note">
-            <strong>Execution Gate Notice:</strong> Live AI analysis planning and candidate Python execution require
-            (1) an authorized <code>READY</code> dataset in the current session, (2) server-side
-            <code>SHEETSAFE_VULTR_INFERENCE_API_KEY</code> and <code>SHEETSAFE_VULTR_INFERENCE_MODEL</code>, and
-            (3) native Linux runner acceptance. No fabricated charts or synthetic AI answers are generated here.
+        <div class="ss-sim-banner">
+            <strong>DEMO / SIMULATED PLANNING MODE:</strong> This workspace connects to FastAPI
+            <code>POST /api/v1/planning/preview</code> using a server-owned synthetic demonstration dataset and
+            a deterministic in-memory HTTPX mock provider (<code>provider_mode = SIMULATED_MOCK</code>).
+            <strong>No live Vultr API calls are made, no generated Python code is executed, and no analytical
+            results or charts are fabricated.</strong>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    col_q, col_contract = st.columns([3, 2])
+    client: SheetSafeApiClient = st.session_state["api_client"]
+    syn_ds: SyntheticDatasetView | None = st.session_state.get("synthetic_dataset")
+    latest_preview: PlanningPreviewView | None = st.session_state.get("latest_plan_preview")
+    planning_error: str | None = st.session_state.get("planning_error")
+
+    col_q, col_schema = st.columns([3, 2])
     with col_q:
-        st.markdown("#### Natural-Language Analysis Question")
+        st.markdown("#### 1. Select Demonstration Dataset & Enter Analysis Question")
+        st.text_input(
+            "Selected Dataset Source",
+            value=(
+                f"{syn_ds.fixture_label} [{syn_ds.dataset_id[:8]}...]"
+                if syn_ds is not None
+                else "DEMO / SYNTHETIC FIXTURE — Quarterly Regional Revenue & Headcount (Server-Owned)"
+            ),
+            disabled=True,
+        )
+
+        if session is None:
+            st.info("Start a synthetic session on the Dashboard or Settings / Privacy page to enable planning preview.")
+        else:
+            if st.button("Load / Verify Synthetic Demo Dataset Schema", width="stretch"):
+                try:
+                    with st.spinner("Provisioning synthetic demo dataset via POST /api/v1/planning/synthetic-dataset..."):
+                        loaded_ds = client.bootstrap_synthetic_dataset()
+                    st.session_state["synthetic_dataset"] = loaded_ds
+                    st.session_state["planning_error"] = None
+                    _record_activity(
+                        "SYNTHETIC_DATASET_READY",
+                        f"Dataset {loaded_ds.dataset_id[:8]}... schema={loaded_ds.dataset_schema.schema_sha256[:12]}...",
+                        loaded_ds.request_id,
+                    )
+                    st.rerun()
+                except FrontendClientError as exc:
+                    if exc.status_code == 401:
+                        _clear_ephemeral_session_views()
+                    st.session_state["planning_error"] = f"{exc.backend_code}: {exc.safe_message}"
+                    _record_activity("SYNTHETIC_DATASET_FAILED", exc.safe_message, exc.request_id)
+                    st.rerun()
+
         question_input = st.text_area(
             "Enter an analysis question (3 to 500 characters; treated strictly as untrusted data)",
-            value="",
+            value="What is total revenue_usd grouped by department, sorted highest to lowest?",
             max_chars=500,
-            height=110,
-            placeholder="e.g., What is the total quarterly revenue grouped by department, sorted highest to lowest?",
+            height=105,
+            help=(
+                "Questions are checked against prompt-injection overrides, filesystem paths, "
+                "inline PII (emails/SSNs/cards), and forbidden runtime capabilities before dispatch."
+            ),
         )
-        st.caption(
-            "Questions are checked locally and server-side against prompt-injection overrides, "
-            "filesystem paths, inline PII (emails/SSNs/cards), and forbidden runtime capabilities before dispatch."
-        )
-        st.button(
-            "Generate AI Analysis Plan (Requires Ready Dataset & Vultr Config)",
-            disabled=True,
+
+        plan_btn_clicked = st.button(
+            "Generate Simulated AI Analysis Plan (DEMO / SIMULATED)",
+            disabled=session is None,
             width="stretch",
             type="primary",
         )
-        if question_input.strip():
+        if plan_btn_clicked and session is not None:
+            try:
+                with st.spinner("Calling POST /api/v1/planning/preview (Simulated Mock Transport)..."):
+                    target_ds_id = syn_ds.dataset_id if syn_ds is not None else None
+                    preview_outcome = client.create_planning_preview(
+                        question_input,
+                        dataset_id=target_ds_id,
+                    )
+                st.session_state["latest_plan_preview"] = preview_outcome
+                st.session_state["planning_error"] = None
+                if syn_ds is None:
+                    st.session_state["synthetic_dataset"] = SyntheticDatasetView(
+                        dataset_id=preview_outcome.dataset_id,
+                        session_id=preview_outcome.session_id,
+                        fixture_id="synthetic_quarterly_revenue_v1",
+                        fixture_label=(
+                            "DEMO / SYNTHETIC FIXTURE — Quarterly Regional Revenue & Headcount "
+                            "(Server-Owned Offline Dataset)"
+                        ),
+                        dataset_schema=preview_outcome.dataset_schema,
+                        request_id=preview_outcome.request_id,
+                    )
+                _record_activity(
+                    "PLAN_PREVIEW_CREATED",
+                    (
+                        f"Run {preview_outcome.run_id[:8]}... state={preview_outcome.run_state} "
+                        f"mode={preview_outcome.provider_mode}"
+                    ),
+                    preview_outcome.request_id,
+                )
+                st.rerun()
+            except FrontendClientError as exc:
+                if exc.status_code == 401:
+                    _clear_ephemeral_session_views()
+                st.session_state["planning_error"] = f"{exc.backend_code}: {exc.safe_message}"
+                _record_activity("PLAN_PREVIEW_FAILED", f"{exc.backend_code}: {exc.safe_message}", exc.request_id)
+                st.rerun()
+
+        st.button(
+            "Execute Generated Python in Sandbox (Disabled — Execution Gate Locked)",
+            disabled=True,
+            width="stretch",
+        )
+
+    with col_schema:
+        st.markdown("#### 2. Validated Schema Metadata (`ValidatedDatasetSchema.v1`)")
+        active_schema = (
+            latest_preview.dataset_schema
+            if latest_preview is not None
+            else syn_ds.dataset_schema
+            if syn_ds is not None
+            else None
+        )
+        if active_schema is None:
             st.info(
-                "Question captured in UI preview only. Submission is disabled because no `READY` dataset is attached to this session."
+                "Load the synthetic demonstration dataset or submit a planning preview to inspect "
+                "the validated `ValidatedDatasetSchema` (column IDs, vetted names, inferred types, "
+                "and missing counts — zero raw cells or preview rows)."
+            )
+        else:
+            st.caption(
+                f"Rows: `{active_schema.row_count}` &bull; Columns: `{active_schema.column_count}` "
+                f"&bull; Schema SHA-256: `{active_schema.schema_sha256[:16]}...`"
+            )
+            schema_table = [
+                {
+                    "Column ID": col.column_id,
+                    "Column Name": col.name,
+                    "Inferred Type": col.inferred_type,
+                    "Missing Count": col.missing_count,
+                }
+                for col in active_schema.columns
+            ]
+            st.dataframe(schema_table, width="stretch", hide_index=True)
+            st.caption(
+                "Strictly Excluded from Outbound Payload: Raw CSV/XLSX bytes, preview rows, cell values, "
+                "worksheet names, storage paths, session tokens, and API credentials."
             )
 
-    with col_contract:
-        st.markdown("#### Outbound AI Privacy Envelope (`ValidatedDatasetSchema.v1`)")
-        st.markdown(
-            """
-            When enabled, **only** these fields leave the backend toward `https://api.vultrinference.com/v1`:
-            - `row_count` & `column_count`
-            - `schema_sha256` (64-char hex digest)
-            - Per column: `column_id` (`col_001`..), vetted `name`, `inferred_type`, `missing_count`
-            - `untrusted_user_question` (inside a fenced JSON data literal)
-
-            **Strictly Excluded:** Raw CSV/XLSX bytes, preview rows, cell values, worksheet names, storage paths, session tokens, and API keys.
-            """
-        )
+    if planning_error is not None:
+        st.error(f"Planning Request Rejected — {planning_error}")
 
     st.divider()
     tab_plan, tab_ops, tab_validation = st.tabs([
-        "Analysis Plan & Result Contract",
+        "Simulated AI Plan & Clarification Output",
         "Allowlisted Declarative Operations",
         "Sandbox & Independent Validation Gates",
     ])
 
     with tab_plan:
-        st.info(
-            "No active `AIAnalysisPlan` or execution artifacts exist for this session. "
-            "Results appear here only after `VALIDATION_PASSED` and `CLEANUP_CONFIRMED`."
-        )
-        st.markdown(
-            """
-            **Supported `ExpectedResultType` Targets:**
-            `SCALAR_METRIC` &bull; `SUMMARY_TABLE` &bull; `GROUPED_TABLE` &bull; `RANKED_TABLE` &bull;
-            `TIME_SERIES_TABLE` &bull; `BAR_CHART` &bull; `LINE_CHART`
-            """
-        )
+        if latest_preview is None:
+            st.info(
+                "No active `AIAnalysisPlan` preview in this view yet. Start a synthetic session and click "
+                "**Generate Simulated AI Analysis Plan (DEMO / SIMULATED)** above."
+            )
+        else:
+            st.warning(
+                f"**{latest_preview.provider_label}** &bull; "
+                f"`provider_mode={latest_preview.provider_mode}` &bull; "
+                f"`simulated_response={latest_preview.simulated_response}` &bull; "
+                f"`execution_enabled={latest_preview.execution_enabled}` (No Code Executed)"
+            )
+            m1, m2, m3, m4 = st.columns(4)
+            with m1:
+                st.metric("Persisted Run State", latest_preview.run_state)
+            with m2:
+                st.metric("Envelope Status", latest_preview.envelope.status)
+            with m3:
+                st.metric("Provider Mode", latest_preview.provider_mode)
+            with m4:
+                st.metric(
+                    "Expected Result Type",
+                    (
+                        latest_preview.envelope.plan.expected_result_type
+                        if latest_preview.envelope.plan is not None
+                        else "CLARIFICATION"
+                    ),
+                )
+
+            st.markdown(
+                f"- **Run ID**: `{latest_preview.run_id}`  \n"
+                f"- **Dataset ID**: `{latest_preview.dataset_id}` (`is_synthetic_dataset={latest_preview.is_synthetic_dataset}`)  \n"
+                f"- **Simulated Model ID**: `{latest_preview.model}`  \n"
+                f"- **Validated Question**: `{latest_preview.question}`  \n"
+                f"- **Plan SHA-256**: `{latest_preview.plan_sha256 or 'N/A (Clarification Required)'}`"
+            )
+
+            if latest_preview.envelope.status == "PLAN_READY" and latest_preview.envelope.plan is not None:
+                plan = latest_preview.envelope.plan
+                st.markdown(f"##### Plan Intent Summary (DEMO / SIMULATED)\n> {plan.intent_summary}")
+
+                st.markdown("##### Required Columns (`RequiredColumnRef`)")
+                req_cols_rows = [
+                    {
+                        "Column ID": rc.column_id,
+                        "Column Name": rc.name,
+                        "Expected Type": rc.expected_type,
+                    }
+                    for rc in plan.required_columns
+                ]
+                st.dataframe(req_cols_rows, width="stretch", hide_index=True)
+
+                st.markdown("##### Proposed Declarative Operations (`ProposedOperation`)")
+                op_rows = [
+                    {
+                        "Step": op.step_number,
+                        "Operation": op.operation,
+                        "Target Columns": ", ".join(op.target_columns),
+                        "Group By": ", ".join(op.group_by_columns) if op.group_by_columns else "—",
+                        "Aggregation": op.aggregation or "—",
+                        "Sort": op.sort_direction or "—",
+                        "Limit": str(op.limit_rows) if op.limit_rows is not None else "—",
+                        "Rationale": op.rationale,
+                    }
+                    for op in plan.operations
+                ]
+                st.dataframe(op_rows, width="stretch", hide_index=True)
+
+            elif (
+                latest_preview.envelope.status == "CLARIFICATION_REQUIRED"
+                and latest_preview.envelope.clarification is not None
+            ):
+                clar = latest_preview.envelope.clarification
+                st.info(
+                    f"**Clarification Required (`{clar.reason_code}`)** — {clar.clarification_prompt}"
+                )
+                if clar.candidate_columns:
+                    st.caption(f"Candidate Columns: `{', '.join(clar.candidate_columns)}`")
 
     with tab_ops:
         ops_table = [
@@ -579,16 +804,44 @@ def _render_analysis_page(session: ActiveSessionView | None) -> None:
 
 
 def _render_history_page(session: ActiveSessionView | None) -> None:
-    st.subheader("Analysis History & Control-Plane Audit Log")
+    st.subheader("Analysis History & Persisted Run State")
 
+    client: SheetSafeApiClient = st.session_state["api_client"]
     if session is None:
-        st.info("No active session. No analysis runs have been executed.")
+        st.info("No active session. Start a synthetic session to inspect session-owned SQLite planning runs.")
     else:
-        st.info(
-            f"Session `{session.session_id[:12]}...` has **0 analysis runs**. "
-            "Runs are listed only when backed by real SQLite `runs` and `attempts` records."
-        )
+        try:
+            runs = client.list_planning_runs()
+        except FrontendClientError as exc:
+            if exc.status_code == 401:
+                _clear_ephemeral_session_views()
+            st.error(f"Could not fetch session runs ({exc.backend_code}): {exc.safe_message}")
+            runs = ()
 
+        if not runs:
+            st.info(
+                f"Session `{session.session_id[:12]}...` currently has **0 persisted runs** in SQLite."
+            )
+        else:
+            st.warning(
+                f"Showing **{len(runs)}** persisted SQLite planning run(s) for session `{session.session_id[:12]}...` "
+                "(`provider_mode=SIMULATED_MOCK`, `execution_enabled=False`)."
+            )
+            runs_table = [
+                {
+                    "Run ID": r.run_id[:12] + "...",
+                    "State": r.state,
+                    "Provider Mode": r.provider_mode,
+                    "Result / Clarification": r.expected_result_type or r.clarification_reason or "—",
+                    "Question": r.question,
+                    "Summary": r.intent_summary or "—",
+                    "Updated (UTC)": _format_utc(r.updated_at),
+                }
+                for r in runs
+            ]
+            st.dataframe(runs_table, width="stretch", hide_index=True)
+
+    st.divider()
     st.markdown("#### Current UI Session Control-Plane Events")
     activity_log: list[dict[str, str]] = st.session_state.get("activity_log", [])
     if not activity_log:
@@ -605,12 +858,12 @@ def _render_privacy_settings_page(snapshot: BackendStatusSnapshot, session: Acti
         st.markdown(
             """
             <div class="ss-card">
-                <h4>Data Storage &amp; Retention Policy</h4>
+                <h4>Data Storage, Immediate Revocation &amp; Asynchronous Cleanup Policy</h4>
                 <ul>
                     <li><strong>Current Mode:</strong> Synthetic-only foundation (<code>private_uploads_enabled = False</code>).</li>
                     <li><strong>Session Lifetime:</strong> Maximum 1 hour (3,600 seconds), non-sliding server-enforced expiry.</li>
-                    <li><strong>Immediate Revocation:</strong> Clicking <em>Delete My Data Now</em> issues <code>DELETE /api/v1/sessions/{session_id}</code> with the session's <code>HttpOnly</code> cookie, exact <code>Origin</code>, and HMAC-bound <code>X-CSRF-Token</code>.</li>
-                    <li><strong>Deletion Target:</strong> Access is revoked immediately inside the SQLite writer transaction, active runs are marked for cancellation, and the retention worker purges registered storage/metadata within the 5-minute target window.</li>
+                    <li><strong>Immediate Access Revocation vs. Physical Cleanup:</strong> Clicking <em>Delete My Data Now</em> issues <code>DELETE /api/v1/sessions/{session_id}</code> with the session's <code>HttpOnly</code> cookie, exact <code>Origin</code>, and HMAC-bound <code>X-CSRF-Token</code>. Access is revoked <strong>immediately</strong> inside the SQLite writer transaction (<code>access_revoked = True</code>) and active runs are marked for cancellation (<code>cancellation_status = requested</code>).</li>
+                    <li><strong>Honest Cleanup Status Reporting:</strong> The deletion receipt returns <code>cleanup_status = not_started</code> because physical storage and metadata purging are performed asynchronously by the background <code>LifecycleCoordinator</code> retention worker (target window: 5 minutes). The UI never claims physical erasure has completed while cleanup is pending.</li>
                     <li><strong>Audit Separation:</strong> Content-free security audit events retain only SHA-256 digests, byte/token counts, and pseudonymous IDs for 24 hours — never filenames, cell values, questions, or credentials.</li>
                 </ul>
             </div>
@@ -621,12 +874,15 @@ def _render_privacy_settings_page(snapshot: BackendStatusSnapshot, session: Acti
         st.markdown(
             """
             <div class="ss-card">
-                <h4>Browser &amp; Streamlit Session Security Note</h4>
+                <h4>Browser &amp; Server-Side Streamlit Cookie Architecture</h4>
                 <p>FastAPI issues session credentials exclusively via <code>HttpOnly; SameSite=Strict</code> cookies
                 (<code>__Host-sheetsafe_session</code> over HTTPS, or <code>sheetsafe_dev_session</code> in explicit
-                loopback development mode). The typed <code>SheetSafeApiClient</code> keeps the cookie and
-                <code>csrf_token</code> sealed inside non-printable <code>SecretStr</code> fields and never exposes
-                them to UI widgets, query strings, logs, or exception messages.</p>
+                loopback development mode). Because Streamlit renders on the server and makes server-to-server HTTPX
+                requests to FastAPI on behalf of each browser tab, each Streamlit user session holds its own isolated
+                <code>SheetSafeApiClient</code> instance in <code>st.session_state</code> (never in global variables or
+                <code>@st.cache_resource</code>). The client stores the raw cookie and <code>csrf_token</code> inside
+                non-printable <code>SecretStr(repr=False)</code> fields and never exposes them to page HTML, logs,
+                or exception messages.</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -649,6 +905,7 @@ def _render_privacy_settings_page(snapshot: BackendStatusSnapshot, session: Acti
                 try:
                     with st.spinner("Creating synthetic session..."):
                         created = client.create_synthetic_session()
+                    _clear_ephemeral_session_views()
                     _record_activity(
                         "SESSION_CREATED",
                         f"Created synthetic session {created.session_id[:8]}...",
@@ -662,11 +919,11 @@ def _render_privacy_settings_page(snapshot: BackendStatusSnapshot, session: Acti
                     _record_activity("SESSION_CREATE_FAILED", exc.safe_message, exc.request_id)
                     st.session_state["ui_notice"] = (
                         "error",
-                        f"Could not create session ({exc.code.value}): {exc.safe_message}",
+                        f"Could not create session ({exc.backend_code}): {exc.safe_message}",
                     )
                     st.rerun()
-                if not snapshot.readiness_ok:
-                    st.caption("Backend must be ONLINE & READY to create a session.")
+            if not snapshot.readiness_ok:
+                st.caption("Backend must be ONLINE & READY to create a session.")
         else:
             st.success(f"Active Session ID: `{session.session_id}`")
             st.markdown(
@@ -677,27 +934,33 @@ def _render_privacy_settings_page(snapshot: BackendStatusSnapshot, session: Acti
                 """
             )
             if st.button(
-                "Revoke Session & Request Immediate Deletion",
+                "Revoke Session & Queue Deletion",
                 type="primary",
                 width="stretch",
             ):
                 try:
                     with st.spinner("Sending authenticated DELETE /api/v1/sessions/{id}..."):
                         receipt = client.revoke_active_session()
+                    _clear_ephemeral_session_views()
                     st.session_state["last_deletion_receipt"] = receipt
                     _record_activity(
                         "SESSION_REVOKED",
-                        f"Revoked session {receipt.session_id[:8]}... (receipt {receipt.receipt_id[:8]}...)",
+                        (
+                            f"Revoked session {receipt.session_id[:8]}... "
+                            f"(receipt {receipt.receipt_id[:8]}..., cleanup_status={receipt.cleanup_status})"
+                        ),
                         receipt.request_id,
                     )
                     st.session_state["ui_notice"] = (
                         "success",
-                        f"Session `{receipt.session_id}` revoked. Receipt ID: `{receipt.receipt_id}`.",
+                        _revocation_notice_text(receipt),
                     )
                     st.rerun()
                 except FrontendClientError as exc:
+                    if exc.status_code == 401:
+                        _clear_ephemeral_session_views()
                     _record_activity("SESSION_REVOKE_FAILED", exc.safe_message, exc.request_id)
-                    st.session_state["ui_notice"] = ("error", f"{exc.code.value}: {exc.safe_message}")
+                    st.session_state["ui_notice"] = ("error", f"{exc.backend_code}: {exc.safe_message}")
                     st.rerun()
 
 

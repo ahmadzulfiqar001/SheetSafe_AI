@@ -12,6 +12,7 @@ from starlette.exceptions import HTTPException
 from starlette.middleware.cors import CORSMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from backend.planning import PlanningError
 from backend.security.sessions import SessionError
 
 
@@ -111,6 +112,18 @@ def install_error_handlers(application: FastAPI) -> None:
         headers = {"Retry-After": str(error.retry_after)} if error.retry_after is not None else None
         code, message, retryable = _HTTP_ERRORS[error.status_code]
         return error_response(request, error.status_code, code, message, retryable, headers=headers)
+
+    @application.exception_handler(PlanningError)
+    async def handle_planning_error(request: Request, error: PlanningError) -> JSONResponse:
+        headers = {"Retry-After": str(error.retry_after)} if error.retry_after is not None else None
+        return error_response(
+            request,
+            error.status_code,
+            error.code.value,
+            error.safe_message,
+            error.retryable,
+            headers=headers,
+        )
 
     @application.exception_handler(HTTPException)
     async def handle_http_error(request: Request, error: HTTPException) -> JSONResponse:
