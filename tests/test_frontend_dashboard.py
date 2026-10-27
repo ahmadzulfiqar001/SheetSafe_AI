@@ -495,3 +495,12 @@ def test_streamlit_dashboard_handles_offline_backend_cleanly() -> None:
     start_buttons = [b for b in at.button if b.label == "Start Synthetic Session"]
     assert len(start_buttons) == 1
     assert start_buttons[0].disabled is True
+
+    # Navigate to AI Analysis while backend is offline and confirm planning button is disabled
+    at.sidebar.radio[0].set_value("AI Analysis").run()
+    assert not at.exception
+    plan_buttons = [
+        b for b in at.button if "Generate Simulated AI Analysis Plan" in b.label
+    ]
+    assert len(plan_buttons) == 1
+    assert plan_buttons[0].disabled is True

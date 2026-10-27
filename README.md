@@ -142,6 +142,29 @@ secrets inside non-printable `SecretStr` holders. File upload submission and liv
 AI execution remain explicitly disabled by security gates, and no fabricated
 datasets or analysis results are displayed.
 
+## Step 10A-B Deterministic code compiler and independent verification preview
+
+ackend/codegen.py and alidator/ast_policy.py compile validated AIAnalysisPlan
+specifications into deterministic Python analysis candidate functions without executing
+untrusted code. Candidates must pass a defense-in-depth AST admission validator
+inspecting statement types, tree depth, and allowlisted imports. An independent,
+pure-stdlib numerical verifier (alidator/numerical_verifier.py) computes trusted
+expected reference outcomes over the server-owned synthetic fixture (synthetic_quarterly_revenue_v1),
+visibly labeled SYNTHETIC_EXPECTED_RESULT_COMPUTED with candidate_output_verified=False
+and publication_authorized=False.
+
+## Step 11C & Step 12A Interactive analysis UI and local demo presentation
+
+The Streamlit workspace features an interactive presentation workflow:
+- Preset scenario selector (GROUPED_TABLE, BAR_CHART, LINE_CHART, TIME_SERIES_TABLE,
+  COMPUTE_RATIO, SCALAR_METRIC, and CLARIFICATION_REQUIRED).
+- Interactive visualizations (st.bar_chart and st.line_chart) and human-readable column headers.
+- Per-column descriptive statistics, dataset completeness insights, and missing-value counts.
+- Downloadable demonstration reports in Markdown and formula-injection-neutralized CSV
+  (=, +, -, @, | prefixed with ').
+- One-command PowerShell launcher (.\launch_local_demo.ps1) and complete demo walkthrough guide
+  ([docs/local-demo-guide.md](docs/local-demo-guide.md)).
+
 ## Not implemented or enabled
 
 Private/customer uploads, upload/download APIs, production spreadsheet parsing, real Docker

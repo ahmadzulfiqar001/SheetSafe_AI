@@ -505,7 +505,7 @@ def _render_dashboard_page(snapshot: BackendStatusSnapshot, session: ActiveSessi
         st.dataframe(activity_log, width="stretch", hide_index=True)
 
 
-def _render_datasets_page(session: ActiveSessionView | None) -> None:
+def _render_datasets_page(snapshot: BackendStatusSnapshot, session: ActiveSessionView | None) -> None:
     st.subheader("My Datasets & Isolated Ingestion Workspace")
 
     st.markdown(
@@ -587,6 +587,28 @@ def _render_datasets_page(session: ActiveSessionView | None) -> None:
                 "You can provision the server-owned synthetic demonstration dataset in the **AI Analysis** tab "
                 "when `SHEETSAFE_SYNTHETIC_PLANNING_ENABLED=true`."
             )
+            if st.button(
+                "Provision Synthetic Demo Dataset Schema",
+                key="btn_load_syn_ds_datasets_page",
+                disabled=not snapshot.readiness_ok,
+                width="stretch",
+            ):
+                client: SheetSafeApiClient = st.session_state["api_client"]
+                try:
+                    with st.spinner("Provisioning synthetic demo dataset via POST /api/v1/planning/synthetic-dataset..."):
+                        loaded_ds = client.bootstrap_synthetic_dataset()
+                    st.session_state["synthetic_dataset"] = loaded_ds
+                    _record_activity(
+                        "SYNTHETIC_DATASET_READY",
+                        f"Dataset {loaded_ds.dataset_id[:8]}... schema={loaded_ds.dataset_schema.schema_sha256[:12]}...",
+                        loaded_ds.request_id,
+                    )
+                    st.rerun()
+                except FrontendClientError as exc:
+                    if exc.status_code == 401:
+                        _clear_ephemeral_session_views()
+                    st.session_state["ui_notice"] = ("error", f"{exc.backend_code}: {exc.safe_message}")
+                    st.rerun()
         else:
             st.warning(
                 f"**{syn_ds.fixture_label}** (`dataset_id={syn_ds.dataset_id}`, "
@@ -605,7 +627,7 @@ def _render_datasets_page(session: ActiveSessionView | None) -> None:
             st.dataframe(cols_rows, width="stretch", hide_index=True)
 
 
-def _render_analysis_page(session: ActiveSessionView | None) -> None:
+def _render_analysis_page(snapshot: BackendStatusSnapshot, session: ActiveSessionView | None) -> None:
     st.subheader("AI Analysis Planning Workspace (Step 9B Offline Simulated Workflow)")
 
     st.markdown(
@@ -644,7 +666,11 @@ def _render_analysis_page(session: ActiveSessionView | None) -> None:
         if session is None:
             st.info("Start a synthetic session on the Dashboard or Settings / Privacy page to enable planning preview.")
         else:
-            if st.button("Load / Verify Synthetic Demo Dataset Schema", width="stretch"):
+            if st.button(
+                "Load / Verify Synthetic Demo Dataset Schema",
+                disabled=not snapshot.readiness_ok,
+                width="stretch",
+            ):
                 try:
                     with st.spinner("Provisioning synthetic demo dataset via POST /api/v1/planning/synthetic-dataset..."):
                         loaded_ds = client.bootstrap_synthetic_dataset()
@@ -694,12 +720,15 @@ def _render_analysis_page(session: ActiveSessionView | None) -> None:
         )
         effective_question = question_input
 
+        backend_ready = snapshot.readiness_ok
         plan_btn_clicked = st.button(
             "Generate Simulated AI Analysis Plan (DEMO / SIMULATED)",
-            disabled=session is None,
+            disabled=(session is None or not backend_ready),
             width="stretch",
             type="primary",
         )
+        if session is not None and not backend_ready:
+            st.caption("Backend is currently OFFLINE or NOT READY. Start FastAPI to enable planning.")
         if plan_btn_clicked and session is not None:
             try:
                 with st.spinner("Calling POST /api/v1/planning/preview (Simulated Mock Transport)..."):
@@ -734,6 +763,7 @@ def _render_analysis_page(session: ActiveSessionView | None) -> None:
             except FrontendClientError as exc:
                 if exc.status_code == 401:
                     _clear_ephemeral_session_views()
+                st.session_state["latest_plan_preview"] = None
                 st.session_state["planning_error"] = f"{exc.backend_code}: {exc.safe_message}"
                 _record_activity("PLAN_PREVIEW_FAILED", f"{exc.backend_code}: {exc.safe_message}", exc.request_id)
                 st.rerun()
@@ -780,7 +810,13 @@ def _render_analysis_page(session: ActiveSessionView | None) -> None:
             )
 
     if planning_error is not None:
-        st.error(f"Planning Request Rejected — {planning_error}")
+        col_err, col_dismiss = st.columns([5, 1])
+        with col_err:
+            st.error(f"Planning Request Rejected — {planning_error}")
+        with col_dismiss:
+            if st.button("Dismiss", key="btn_dismiss_planning_error", width="stretch"):
+                st.session_state["planning_error"] = None
+                st.rerun()
 
     st.divider()
     tab_plan, tab_code, tab_verif, tab_ops, tab_validation = st.tabs([
@@ -1301,9 +1337,9 @@ def render_app() -> None:
     if selected_page == "Dashboard":
         _render_dashboard_page(snapshot, session)
     elif selected_page == "My Datasets":
-        _render_datasets_page(session)
+        _render_datasets_page(snapshot, session)
     elif selected_page == "AI Analysis":
-        _render_analysis_page(session)
+        _render_analysis_page(snapshot, session)
     elif selected_page == "Analysis History":
         _render_history_page(session)
     elif selected_page == "Settings / Privacy":

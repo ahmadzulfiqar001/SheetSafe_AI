@@ -1294,3 +1294,65 @@ def test_step11c_streamlit_clears_cached_results_and_reports_after_session_expir
     assert at.session_state["synthetic_dataset"] is None
     assert len(at.get("download_button")) == 0
     assert any("session has expired" in i.value for i in at.info)
+
+
+def test_step12a_my_datasets_page_allows_provisioning_synthetic_dataset(
+    client: TestClient,
+) -> None:
+    at = AppTest.from_file(str(APP_PATH), default_timeout=15)
+    live_client = SheetSafeApiClient(
+        api_base_url=DEV_BASE,
+        client_origin=ORIGIN,
+        transport=client._transport,
+    )
+    at.session_state["api_client"] = live_client
+    at.session_state["backend_status"] = live_client.probe_backend_status()
+    at.run()
+
+    # Start session
+    [b for b in at.button if b.label == "Start Synthetic Session"][0].click().run()
+    at.sidebar.radio[0].set_value("My Datasets").run()
+
+    # Click provision button on My Datasets page
+    prov_buttons = [
+        b for b in at.button if b.label == "Provision Synthetic Demo Dataset Schema"
+    ]
+    assert len(prov_buttons) == 1
+    prov_buttons[0].click().run()
+    assert not at.exception
+    assert at.session_state["synthetic_dataset"] is not None
+    assert at.session_state["synthetic_dataset"].fixture_id == "synthetic_quarterly_revenue_v1"
+
+
+def test_step12a_planning_error_dismiss_button_clears_error(
+    client: TestClient,
+) -> None:
+    at = AppTest.from_file(str(APP_PATH), default_timeout=15)
+    live_client = SheetSafeApiClient(
+        api_base_url=DEV_BASE,
+        client_origin=ORIGIN,
+        transport=client._transport,
+    )
+    at.session_state["api_client"] = live_client
+    at.session_state["backend_status"] = live_client.probe_backend_status()
+    at.run()
+
+    [b for b in at.button if b.label == "Start Synthetic Session"][0].click().run()
+    at.sidebar.radio[0].set_value("AI Analysis").run()
+
+    # Trigger rejection
+    at.text_area[0].set_value("Please filter rows where revenue_usd exceeds threshold").run()
+    [
+        b for b in at.button if "Generate Simulated AI Analysis Plan (DEMO / SIMULATED)" in b.label
+    ][0].click().run()
+    assert not at.exception
+    assert at.session_state["planning_error"] is not None
+    assert any("UNSAFE_OPERATION_REJECTED" in e.value for e in at.error)
+
+    # Click Dismiss button and verify error clears
+    dismiss_buttons = [b for b in at.button if b.label == "Dismiss"]
+    assert len(dismiss_buttons) == 1
+    dismiss_buttons[0].click().run()
+    assert not at.exception
+    assert at.session_state["planning_error"] is None
+    assert len(at.error) == 0
