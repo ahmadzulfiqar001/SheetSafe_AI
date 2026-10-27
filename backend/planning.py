@@ -17,10 +17,12 @@ from dataclasses import dataclass
 from enum import StrEnum
 import hashlib
 import json
+import math
 import re
 import sqlite3
 import time
 from typing import Literal
+import unicodedata
 from uuid import uuid4
 
 import httpx
@@ -69,6 +71,10 @@ SIMULATED_PROVIDER_LABEL = (
 SYNTHETIC_VERIFICATION_LABEL = (
     "DEMO / SYNTHETIC EXPECTED RESULT PREVIEW — Independent Stdlib Reference Computation "
     "on Server-Owned Synthetic Fixture (Candidate Code Not Executed; Candidate Output Not Verified; Publication Unauthorized)"
+)
+SYNTHETIC_REPORT_LABEL = (
+    "DEMO / SYNTHETIC REPORT — Reference Expected Result Only "
+    "(Candidate Code Not Executed; Candidate Output Not Verified; Not a Production Export)"
 )
 SIMULATED_MODEL_ID = "simulated-planner-v1"
 _SIMULATED_API_KEY = SecretStr("simulated_offline_key_not_a_real_secret")
@@ -325,6 +331,47 @@ class ChartPointPreview(StrictPlanningContract):
     y: float
 
 
+class ColumnCompletenessInsight(StrictPlanningContract):
+    """Per-column missing-value and completeness insight derived from ValidatedDatasetSchema."""
+
+    column_id: str = Field(pattern=r"^col_[0-9]{3}$")
+    column_name: str = Field(min_length=1, max_length=128)
+    inferred_type: Literal["empty", "text", "integer", "number", "boolean", "date", "mixed"]
+    row_count: int = Field(ge=1)
+    missing_count: int = Field(ge=0)
+    present_count: int = Field(ge=0)
+    completeness_pct: float = Field(ge=0.0, le=100.0)
+    referenced_in_plan: bool = False
+
+
+class NumericColumnSummaryPreview(StrictPlanningContract):
+    """Independent descriptive summary for a numeric output column in the synthetic preview."""
+
+    column_id: str = Field(min_length=1, max_length=64)
+    display_label: str = Field(min_length=1, max_length=160)
+    non_null_count: int = Field(ge=0, le=200)
+    null_count: int = Field(ge=0, le=200)
+    total_sum: float
+    mean_value: float
+    min_value: float
+    max_value: float
+
+
+class DemonstrationReportPreview(StrictPlanningContract):
+    """Bounded, formula-injection-neutralized demonstration report for local download."""
+
+    version: Literal[1] = 1
+    demonstration_only: Literal[True] = True
+    report_label: str = SYNTHETIC_REPORT_LABEL
+    markdown_filename: str = Field(pattern=r"^sheetsafe_demo_report_[0-9a-f]{12}\.md$")
+    csv_filename: str = Field(pattern=r"^sheetsafe_demo_table_[0-9a-f]{12}\.csv$")
+    markdown_content: str = Field(min_length=32, max_length=16384)
+    csv_content: str = Field(min_length=10, max_length=16384)
+    markdown_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    csv_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    formula_injection_neutralized: Literal[True] = True
+
+
 class SyntheticVerificationPreview(StrictPlanningContract):
     """Demonstration-only reference expected-result preview over the synthetic fixture.
 
@@ -346,12 +393,21 @@ class SyntheticVerificationPreview(StrictPlanningContract):
     verified_output_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     result_type: str = Field(min_length=1, max_length=64)
     columns: tuple[str, ...]
+    column_headers: dict[str, str]
     row_count: int = Field(ge=1, le=200)
     rows: tuple[dict[str, str | int | float | bool | None], ...]
     scalar_value: float | int | None = None
+    chart_kind: Literal["BAR", "LINE", "NONE"] = "NONE"
+    chart_x_label: str | None = None
+    chart_y_label: str | None = None
     chart_series: tuple[ChartPointPreview, ...] = ()
+    numeric_summaries: tuple[NumericColumnSummaryPreview, ...] = ()
+    missing_value_insights: tuple[ColumnCompletenessInsight, ...] = ()
+    total_missing_cells: int = Field(default=0, ge=0)
+    dataset_completeness_pct: float = Field(default=100.0, ge=0.0, le=100.0)
     zero_division_count: int = Field(default=0, ge=0)
     max_abs_error: float = Field(default=0.0, ge=0.0)
+    demo_report: DemonstrationReportPreview
 
 
 class PlanningPreviewOutcome(StrictPlanningContract):
@@ -475,6 +531,156 @@ def build_deterministic_mock_transport() -> httpx.MockTransport:
                         }
                     ],
                     "expected_result_type": "SUMMARY_TABLE",
+                },
+            }
+        elif "bar chart" in question_text or "bar_chart" in question_text:
+            group_col = (
+                col_by_name.get("region")
+                if "region" in question_text and "region" in col_by_name
+                else col_by_name.get("department") or col_by_id.get("col_002") or columns[0]
+            )
+            metric_col = (
+                col_by_name.get("headcount")
+                if "headcount" in question_text and "headcount" in col_by_name
+                else col_by_name.get("revenue_usd") or col_by_id.get("col_004") or columns[-1]
+            )
+            envelope_dict = {
+                "version": 1,
+                "status": "PLAN_READY",
+                "plan": {
+                    "version": 1,
+                    "schema_sha256": schema_sha256,
+                    "intent_summary": (
+                        f"Group records by {group_col['name']}, compute total {metric_col['name']}, "
+                        f"and project a categorical bar chart series (DEMO / SIMULATED offline plan)."
+                    ),
+                    "required_columns": [
+                        {
+                            "column_id": group_col["column_id"],
+                            "name": group_col["name"],
+                            "expected_type": group_col["inferred_type"],
+                        },
+                        {
+                            "column_id": metric_col["column_id"],
+                            "name": metric_col["name"],
+                            "expected_type": metric_col["inferred_type"],
+                        },
+                    ],
+                    "operations": [
+                        {
+                            "step_number": 1,
+                            "operation": "GROUP_AGGREGATE",
+                            "target_columns": [metric_col["column_id"]],
+                            "group_by_columns": [group_col["column_id"]],
+                            "aggregation": "sum",
+                            "rationale": f"Sum {metric_col['name']} grouped by {group_col['name']}.",
+                        },
+                        {
+                            "step_number": 2,
+                            "operation": "SORT_VALUES",
+                            "target_columns": [metric_col["column_id"]],
+                            "group_by_columns": [],
+                            "sort_direction": "desc",
+                            "rationale": f"Rank grouped {metric_col['name']} totals from highest to lowest.",
+                        },
+                        {
+                            "step_number": 3,
+                            "operation": "CHART_SERIES",
+                            "target_columns": [group_col["column_id"], metric_col["column_id"]],
+                            "group_by_columns": [],
+                            "rationale": f"Emit bar chart coordinates ({group_col['name']} vs {metric_col['name']}).",
+                        },
+                    ],
+                    "expected_result_type": "BAR_CHART",
+                },
+            }
+        elif "line chart" in question_text or "line_chart" in question_text:
+            date_col = col_by_name.get("quarter") or col_by_id.get("col_001") or columns[0]
+            rev_col = col_by_name.get("revenue_usd") or col_by_id.get("col_004") or columns[-1]
+            envelope_dict = {
+                "version": 1,
+                "status": "PLAN_READY",
+                "plan": {
+                    "version": 1,
+                    "schema_sha256": schema_sha256,
+                    "intent_summary": (
+                        "Roll up quarterly revenue_usd over quarter dates and project a chronological "
+                        "line chart series (DEMO / SIMULATED offline plan)."
+                    ),
+                    "required_columns": [
+                        {
+                            "column_id": date_col["column_id"],
+                            "name": date_col["name"],
+                            "expected_type": date_col["inferred_type"],
+                        },
+                        {
+                            "column_id": rev_col["column_id"],
+                            "name": rev_col["name"],
+                            "expected_type": rev_col["inferred_type"],
+                        },
+                    ],
+                    "operations": [
+                        {
+                            "step_number": 1,
+                            "operation": "TIME_SERIES_ROLLUP",
+                            "target_columns": [date_col["column_id"], rev_col["column_id"]],
+                            "group_by_columns": [],
+                            "rationale": "Aggregate revenue_usd across verified quarter date periods.",
+                        },
+                        {
+                            "step_number": 2,
+                            "operation": "SORT_VALUES",
+                            "target_columns": [date_col["column_id"]],
+                            "group_by_columns": [],
+                            "sort_direction": "asc",
+                            "rationale": "Order quarterly rollup chronologically from earliest to latest.",
+                        },
+                        {
+                            "step_number": 3,
+                            "operation": "CHART_SERIES",
+                            "target_columns": [date_col["column_id"], rev_col["column_id"]],
+                            "group_by_columns": [],
+                            "rationale": "Emit chronological line chart coordinates (quarter vs revenue_usd).",
+                        },
+                    ],
+                    "expected_result_type": "LINE_CHART",
+                },
+            }
+        elif (
+            "scalar" in question_text
+            or "grand total" in question_text
+            or "overall average" in question_text
+        ):
+            rev_col = col_by_name.get("revenue_usd") or col_by_id.get("col_004") or columns[-1]
+            agg = "mean" if ("average" in question_text or "mean" in question_text) else "sum"
+            envelope_dict = {
+                "version": 1,
+                "status": "PLAN_READY",
+                "plan": {
+                    "version": 1,
+                    "schema_sha256": schema_sha256,
+                    "intent_summary": (
+                        f"Compute overall scalar {agg} of {rev_col['name']} across validated records "
+                        "(DEMO / SIMULATED offline plan)."
+                    ),
+                    "required_columns": [
+                        {
+                            "column_id": rev_col["column_id"],
+                            "name": rev_col["name"],
+                            "expected_type": rev_col["inferred_type"],
+                        },
+                    ],
+                    "operations": [
+                        {
+                            "step_number": 1,
+                            "operation": "SUMMARY_STATS",
+                            "target_columns": [rev_col["column_id"]],
+                            "group_by_columns": [],
+                            "aggregation": agg,
+                            "rationale": f"Compute scalar {agg} over {rev_col['name']}.",
+                        },
+                    ],
+                    "expected_result_type": "SCALAR_METRIC",
                 },
             }
         elif "ratio" in question_text or "per headcount" in question_text or "per employee" in question_text:
@@ -718,6 +924,274 @@ def _map_codegen_error(error: CodeGenError | VerificationError) -> tuple[Plannin
     return (PlanningCode.UNSAFE_OPERATION_REJECTED, "BLOCKED_POLICY")
 
 
+_RATIO_COL_RE = re.compile(r"^ratio_(col_[0-9]{3})_(col_[0-9]{3})$")
+# Spreadsheet-sensitive leading characters (ASCII and full-width variants). Leading
+# whitespace and control/format characters are stripped before this check so they
+# cannot hide a formula trigger (e.g. "\t=1", "\u200b=1", "\u00a0+1").
+_FORMULA_TRIGGER_PREFIXES = (
+    "=", "+", "-", "@", "|", "\t", "\r", "\n",
+    "\uff1d", "\uff0b", "\uff0d", "\uff20", "\uff5c",
+)
+# Byte budgets keep the demo report well inside the contract maxima (16 KiB each)
+# and the Streamlit client's 32 KiB total response limit.
+DEMO_REPORT_MARKDOWN_BUDGET_BYTES = 8192
+DEMO_REPORT_CSV_BUDGET_BYTES = 6144
+_DEMO_REPORT_MARKDOWN_TABLE_ROW_CAP = 50
+_DEMO_REPORT_CSV_ROW_CAP = 200
+_MARKDOWN_ESCAPE_TABLE = str.maketrans(
+    {
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        "\\": "\\\\",
+        "`": "\\`",
+        "*": "\\*",
+        "[": "\\[",
+        "]": "\\]",
+        "|": "\\|",
+    }
+)
+
+
+def _sanitize_control_characters(text: str) -> str:
+    """Replace control, format and line/paragraph separator characters with spaces."""
+    return "".join(
+        " " if unicodedata.category(ch) in {"Cc", "Cf", "Zl", "Zp"} else ch
+        for ch in text
+    )
+
+
+def _neutralize_spreadsheet_cell(value: str | int | float | bool | None) -> str:
+    """Format a primitive cell for CSV export while neutralizing formula injection.
+
+    Numeric and boolean cells are emitted as literals. Text cells have control and
+    invisible format characters replaced with spaces; if the remaining text begins
+    (after leading whitespace) with a spreadsheet-sensitive prefix, a leading single
+    quote is added so spreadsheet applications treat the cell as plain text.
+    """
+    if value is None:
+        return ""
+    if type(value) is bool:
+        return "TRUE" if value else "FALSE"
+    if type(value) in (int, float):
+        return str(value)
+    raw = str(value)
+    text = _sanitize_control_characters(raw)
+    stripped = text.lstrip()
+    if raw[:1] != text[:1] or stripped.startswith(_FORMULA_TRIGGER_PREFIXES):
+        return f"'{text}"
+    return text
+
+
+def _escape_markdown_text(value: object) -> str:
+    """Escape dynamic text so Markdown renderers cannot produce raw HTML or links."""
+    text = _sanitize_control_characters(str(value))
+    return text.translate(_MARKDOWN_ESCAPE_TABLE)
+
+
+class _BoundedLineWriter:
+    """Accumulate lines within a UTF-8 byte budget, appending a truncation notice once."""
+
+    def __init__(self, budget_bytes: int, truncation_notice: str) -> None:
+        self._budget = budget_bytes
+        self._notice = truncation_notice
+        self._notice_bytes = len(truncation_notice.encode("utf-8")) + 1
+        self._lines: list[str] = []
+        self._used = 0
+        self.truncated = False
+
+    def add(self, line: str) -> bool:
+        if self.truncated:
+            return False
+        line_bytes = len(line.encode("utf-8")) + 1
+        if self._used + line_bytes + self._notice_bytes > self._budget:
+            self._lines.append(self._notice)
+            self._used += self._notice_bytes
+            self.truncated = True
+            return False
+        self._lines.append(line)
+        self._used += line_bytes
+        return True
+
+    def render(self) -> str:
+        return "\n".join(self._lines) + "\n"
+
+
+def _encode_csv_row(cells: list[str]) -> str:
+    """Encode a list of already-neutralized string cells as an RFC-4180 CSV line."""
+    encoded: list[str] = []
+    for cell in cells:
+        if "," in cell or '"' in cell or "\n" in cell or "\r" in cell:
+            encoded.append('"' + cell.replace('"', '""') + '"')
+        else:
+            encoded.append(cell)
+    return ",".join(encoded)
+
+
+def _build_column_headers(
+    output_columns: tuple[str, ...],
+    validated_schema: ValidatedDatasetSchema,
+) -> dict[str, str]:
+    """Map validated output column IDs to human-readable headers."""
+    col_by_id = {c.column_id: c.name for c in validated_schema.columns}
+    headers: dict[str, str] = {}
+    for col_id in output_columns:
+        if col_id in col_by_id:
+            headers[col_id] = f"{col_by_id[col_id]} ({col_id})"
+        else:
+            ratio_match = _RATIO_COL_RE.match(col_id)
+            if ratio_match is not None:
+                num_id, den_id = ratio_match.group(1), ratio_match.group(2)
+                num_name = col_by_id.get(num_id, num_id)
+                den_name = col_by_id.get(den_id, den_id)
+                headers[col_id] = f"ratio_{num_name}_{den_name} ({col_id})"
+            else:
+                headers[col_id] = col_id
+    return headers
+
+
+def _build_demonstration_report(
+    *,
+    plan: AIAnalysisPlan,
+    validated_schema: ValidatedDatasetSchema,
+    code_sha256: str,
+    plan_sha256: str,
+    verified_output_sha256: str,
+    result_type: str,
+    columns: tuple[str, ...],
+    column_headers: dict[str, str],
+    rows: tuple[dict[str, str | int | float | bool | None], ...],
+    scalar_value: float | int | None,
+    zero_division_count: int,
+    numeric_summaries: tuple[NumericColumnSummaryPreview, ...],
+    missing_value_insights: tuple[ColumnCompletenessInsight, ...],
+) -> DemonstrationReportPreview:
+    """Build bounded, formula-injection-neutralized Markdown and CSV demo reports.
+
+    Both outputs stay within fixed UTF-8 byte budgets and record a visible
+    truncation notice instead of failing when the reference table is large.
+    Dynamic Markdown text is escaped so renderers cannot emit raw HTML or links.
+    """
+    short_hash = verified_output_sha256[:12]
+    md_filename = f"sheetsafe_demo_report_{short_hash}.md"
+    csv_filename = f"sheetsafe_demo_table_{short_hash}.csv"
+    total_rows = len(rows)
+
+    csv_writer = _BoundedLineWriter(
+        DEMO_REPORT_CSV_BUDGET_BYTES,
+        _encode_csv_row(["# DEMO / SYNTHETIC — TRUNCATED: remaining rows omitted to respect report size limit"]),
+    )
+    csv_writer.add(
+        _encode_csv_row(
+            [
+                "# DEMO / SYNTHETIC REPORT",
+                "Reference Expected Result Only (Candidate Code Not Executed; Not a Production Export)",
+                f"expected_output_sha256={verified_output_sha256}",
+            ]
+        )
+    )
+    csv_writer.add(
+        _encode_csv_row([_neutralize_spreadsheet_cell(column_headers.get(c, c)) for c in columns])
+    )
+    for row in rows[:_DEMO_REPORT_CSV_ROW_CAP]:
+        if not csv_writer.add(
+            _encode_csv_row([_neutralize_spreadsheet_cell(row.get(c)) for c in columns])
+        ):
+            break
+    csv_content = csv_writer.render()
+
+    md = _BoundedLineWriter(
+        DEMO_REPORT_MARKDOWN_BUDGET_BYTES,
+        "\n> **DEMO / SYNTHETIC — TRUNCATED**: remaining sections omitted to respect report size limit.",
+    )
+    header_lines = [
+        f"# SheetSafe AI — {SYNTHETIC_REPORT_LABEL}",
+        "",
+        "> **SECURITY & PROVENANCE NOTICE**: This report is generated strictly from the server-owned",
+        "> synthetic demonstration fixture (`synthetic_quarterly_revenue_v1`). Generated Python code",
+        "> was **NOT** executed (`execution_authorized=False`), no candidate output was verified",
+        "> (`candidate_output_verified=False`), and publication remains locked (`publication_authorized=False`).",
+        "",
+        "## 1. Consistency Digests (Reference Expected Result — Not Candidate Verification)",
+        "- **Preview Status**: `SYNTHETIC_EXPECTED_RESULT_COMPUTED`",
+        f"- **Result Type**: `{_escape_markdown_text(result_type)}`",
+        f"- **Expected Output Rows**: `{total_rows}`",
+        f"- **Zero-Division Count**: `{zero_division_count}`",
+        f"- **Schema SHA-256**: `{validated_schema.schema_sha256}`",
+        f"- **Plan SHA-256**: `{plan_sha256}`",
+        f"- **Candidate Code SHA-256 (not executed)**: `{code_sha256}`",
+        f"- **Expected Output SHA-256**: `{verified_output_sha256}`",
+    ]
+    if scalar_value is not None:
+        header_lines.append(f"- **Expected Scalar Metric**: `{scalar_value}`")
+    header_lines.extend(
+        [
+            "",
+            "## 2. Simulated Plan Intent (DEMO / SIMULATED provider output)",
+            _escape_markdown_text(plan.intent_summary),
+            "",
+            "## 3. Reference Expected Result Table (DEMO / SYNTHETIC)",
+            "| " + " | ".join(_escape_markdown_text(column_headers.get(c, c)) for c in columns) + " |",
+            "| " + " | ".join("---" for _ in columns) + " |",
+        ]
+    )
+    for line in header_lines:
+        md.add(line)
+
+    for row in rows[:_DEMO_REPORT_MARKDOWN_TABLE_ROW_CAP]:
+        cells = [_escape_markdown_text(_neutralize_spreadsheet_cell(row.get(c))) for c in columns]
+        if not md.add("| " + " | ".join(cells) + " |"):
+            break
+    if total_rows > _DEMO_REPORT_MARKDOWN_TABLE_ROW_CAP:
+        md.add(
+            f"> Table preview limited to the first {_DEMO_REPORT_MARKDOWN_TABLE_ROW_CAP} of {total_rows} rows."
+        )
+
+    if numeric_summaries:
+        for line in (
+            "",
+            "## 4. Reference Numeric Column Summary (DEMO / SYNTHETIC)",
+            "| Column | Non-Null | Null | Sum | Mean | Min | Max |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
+        ):
+            md.add(line)
+        for ns in numeric_summaries:
+            md.add(
+                f"| {_escape_markdown_text(ns.display_label)} | {ns.non_null_count} | {ns.null_count} | "
+                f"{ns.total_sum} | {ns.mean_value} | {ns.min_value} | {ns.max_value} |"
+            )
+
+    if missing_value_insights:
+        for line in (
+            "",
+            "## 5. Dataset Completeness & Missing-Value Insights (DEMO / SYNTHETIC)",
+            "| Column ID | Name | Type | Missing | Present | Completeness (%) | In Plan |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
+        ):
+            md.add(line)
+        for mvi in missing_value_insights:
+            md.add(
+                f"| {mvi.column_id} | {_escape_markdown_text(mvi.column_name)} | {mvi.inferred_type} | "
+                f"{mvi.missing_count} | {mvi.present_count} | {mvi.completeness_pct}% | "
+                f"{mvi.referenced_in_plan} |"
+            )
+
+    markdown_content = md.render()
+    md_sha256 = hashlib.sha256(markdown_content.encode("utf-8")).hexdigest()
+    csv_sha256 = hashlib.sha256(csv_content.encode("utf-8")).hexdigest()
+    return DemonstrationReportPreview(
+        demonstration_only=True,
+        report_label=SYNTHETIC_REPORT_LABEL,
+        markdown_filename=md_filename,
+        csv_filename=csv_filename,
+        markdown_content=markdown_content,
+        csv_content=csv_content,
+        markdown_sha256=md_sha256,
+        csv_sha256=csv_sha256,
+        formula_injection_neutralized=True,
+    )
+
+
 def _build_code_and_verification_previews(
     plan: AIAnalysisPlan,
     validated_schema: ValidatedDatasetSchema,
@@ -784,6 +1258,131 @@ def _build_code_and_verification_previews(
             allow_nan=False,
         ).encode("utf-8")
     ).hexdigest()
+
+    column_headers = _build_column_headers(expected.columns, validated_schema)
+
+    # Derive interactive chart points and chart kind for visualizable result types
+    chart_points: tuple[ChartPointPreview, ...] = ()
+    chart_kind: Literal["BAR", "LINE", "NONE"] = "NONE"
+    chart_x_label: str | None = None
+    chart_y_label: str | None = None
+
+    if expected.chart_series:
+        chart_points = tuple(ChartPointPreview(x=pt.x, y=pt.y) for pt in expected.chart_series[:100])
+        chart_kind = "LINE" if expected.result_type in {"LINE_CHART", "TIME_SERIES_TABLE"} else "BAR"
+        chart_ops = [op for op in plan.operations if op.operation == "CHART_SERIES"]
+        if chart_ops and len(chart_ops[-1].target_columns) == 2:
+            x_id, y_id = chart_ops[-1].target_columns
+            chart_x_label = column_headers.get(x_id, x_id)
+            chart_y_label = column_headers.get(y_id, y_id)
+        elif len(expected.columns) >= 2:
+            chart_x_label = column_headers.get(expected.columns[0], expected.columns[0])
+            chart_y_label = column_headers.get(expected.columns[-1], expected.columns[-1])
+    elif expected.result_type == "TIME_SERIES_TABLE" and len(expected.columns) >= 2:
+        x_col = expected.columns[0]
+        y_col = expected.columns[-1]
+        derived_pts: list[ChartPointPreview] = []
+        for row in expected.rows[:100]:
+            xv = row.get(x_col)
+            yv = row.get(y_col)
+            if xv is not None and type(yv) in (int, float):
+                derived_pts.append(ChartPointPreview(x=xv, y=round(float(yv), 6)))
+        if derived_pts:
+            chart_points = tuple(derived_pts)
+            chart_kind = "LINE"
+            chart_x_label = column_headers.get(x_col, x_col)
+            chart_y_label = column_headers.get(y_col, y_col)
+    elif expected.result_type in {"GROUPED_TABLE", "SUMMARY_TABLE"} and len(expected.columns) >= 2:
+        x_col = expected.columns[0]
+        y_col = expected.columns[-1]
+        derived_pts = []
+        for row in expected.rows[:100]:
+            xv = row.get(x_col)
+            yv = row.get(y_col)
+            if xv is not None and type(yv) in (int, float):
+                derived_pts.append(ChartPointPreview(x=xv, y=round(float(yv), 6)))
+        if derived_pts:
+            chart_points = tuple(derived_pts)
+            chart_kind = "BAR"
+            chart_x_label = column_headers.get(x_col, x_col)
+            chart_y_label = column_headers.get(y_col, y_col)
+
+    # Compute per-column numerical descriptive summaries
+    numeric_summaries_list: list[NumericColumnSummaryPreview] = []
+    for col_id in expected.columns:
+        nums = [
+            float(row[col_id])
+            for row in expected.rows
+            if type(row.get(col_id)) in (int, float)
+        ]
+        if nums:
+            non_null_count = len(nums)
+            null_count = len(expected.rows) - non_null_count
+            total_sum = round(math.fsum(nums), 6)
+            mean_val = round(total_sum / non_null_count, 6)
+            min_val = round(min(nums), 6)
+            max_val = round(max(nums), 6)
+            numeric_summaries_list.append(
+                NumericColumnSummaryPreview(
+                    column_id=col_id,
+                    display_label=column_headers.get(col_id, col_id),
+                    non_null_count=non_null_count,
+                    null_count=null_count,
+                    total_sum=total_sum,
+                    mean_value=mean_val,
+                    min_value=min_val,
+                    max_value=max_val,
+                )
+            )
+    numeric_summaries = tuple(numeric_summaries_list)
+
+    # Compute missing-value & completeness insights from ValidatedDatasetSchema
+    referenced_set = set(compiled.candidate.referenced_columns)
+    missing_insights_list: list[ColumnCompletenessInsight] = []
+    for col in validated_schema.columns:
+        present_cnt = max(0, validated_schema.row_count - col.missing_count)
+        comp_pct = (
+            round((present_cnt / validated_schema.row_count) * 100.0, 2)
+            if validated_schema.row_count > 0
+            else 100.0
+        )
+        missing_insights_list.append(
+            ColumnCompletenessInsight(
+                column_id=col.column_id,
+                column_name=col.name,
+                inferred_type=col.inferred_type,
+                row_count=validated_schema.row_count,
+                missing_count=col.missing_count,
+                present_count=present_cnt,
+                completeness_pct=comp_pct,
+                referenced_in_plan=(col.column_id in referenced_set),
+            )
+        )
+    missing_value_insights = tuple(missing_insights_list)
+    total_cells = validated_schema.row_count * validated_schema.column_count
+    total_missing_cells = sum(col.missing_count for col in validated_schema.columns)
+    dataset_completeness_pct = (
+        round(((total_cells - total_missing_cells) / total_cells) * 100.0, 2)
+        if total_cells > 0
+        else 100.0
+    )
+
+    demo_report = _build_demonstration_report(
+        plan=plan,
+        validated_schema=validated_schema,
+        code_sha256=compiled.code_sha256,
+        plan_sha256=expected.plan_sha256,
+        verified_output_sha256=expected_output_sha256,
+        result_type=expected.result_type,
+        columns=expected.columns,
+        column_headers=column_headers,
+        rows=expected.rows,
+        scalar_value=expected.scalar_value,
+        zero_division_count=expected.zero_division_count,
+        numeric_summaries=numeric_summaries,
+        missing_value_insights=missing_value_insights,
+    )
+
     verification_preview = SyntheticVerificationPreview(
         demonstration_only=True,
         verification_label=SYNTHETIC_VERIFICATION_LABEL,
@@ -797,12 +1396,21 @@ def _build_code_and_verification_previews(
         verified_output_sha256=expected_output_sha256,
         result_type=expected.result_type,
         columns=expected.columns,
+        column_headers=column_headers,
         row_count=expected.row_count,
         rows=expected.rows,
         scalar_value=expected.scalar_value,
-        chart_series=tuple(ChartPointPreview(x=pt.x, y=pt.y) for pt in expected.chart_series),
+        chart_kind=chart_kind,
+        chart_x_label=chart_x_label,
+        chart_y_label=chart_y_label,
+        chart_series=chart_points,
+        numeric_summaries=numeric_summaries,
+        missing_value_insights=missing_value_insights,
+        total_missing_cells=total_missing_cells,
+        dataset_completeness_pct=dataset_completeness_pct,
         zero_division_count=expected.zero_division_count,
         max_abs_error=0.0,
+        demo_report=demo_report,
     )
     return code_preview, verification_preview
 

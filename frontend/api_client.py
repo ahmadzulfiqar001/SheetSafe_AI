@@ -238,6 +238,53 @@ class ChartPointView(StrictFrontendModel):
     y: float
 
 
+class ColumnCompletenessInsightView(StrictFrontendModel):
+    column_id: str = Field(pattern=r"^col_[0-9]{3}$")
+    column_name: str = Field(min_length=1, max_length=128)
+    inferred_type: Literal["empty", "text", "integer", "number", "boolean", "date", "mixed"]
+    row_count: int = Field(ge=1)
+    missing_count: int = Field(ge=0)
+    present_count: int = Field(ge=0)
+    completeness_pct: float = Field(ge=0.0, le=100.0)
+    referenced_in_plan: bool = False
+
+
+class NumericColumnSummaryView(StrictFrontendModel):
+    column_id: str = Field(min_length=1, max_length=64)
+    display_label: str = Field(min_length=1, max_length=160)
+    non_null_count: int = Field(ge=0, le=200)
+    null_count: int = Field(ge=0, le=200)
+    total_sum: float
+    mean_value: float
+    min_value: float
+    max_value: float
+
+
+class DemonstrationReportView(StrictFrontendModel):
+    version: Literal[1] = 1
+    demonstration_only: Literal[True] = True
+    report_label: str = Field(min_length=10, max_length=240)
+    markdown_filename: str = Field(pattern=r"^sheetsafe_demo_report_[0-9a-f]{12}\.md$")
+    csv_filename: str = Field(pattern=r"^sheetsafe_demo_table_[0-9a-f]{12}\.csv$")
+    markdown_content: str = Field(min_length=32, max_length=16384)
+    csv_content: str = Field(min_length=10, max_length=16384)
+    markdown_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    csv_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    formula_injection_neutralized: Literal[True] = True
+
+    @model_validator(mode="after")
+    def _verify_report_integrity(self) -> "DemonstrationReportView":
+        if "DEMO / SYNTHETIC" not in self.report_label:
+            raise ValueError("Demonstration report is missing required DEMO / SYNTHETIC label")
+        if "DEMO / SYNTHETIC" not in self.markdown_content or "DEMO / SYNTHETIC" not in self.csv_content:
+            raise ValueError("Demonstration report content is missing required DEMO / SYNTHETIC watermark")
+        md_hash = hashlib.sha256(self.markdown_content.encode("utf-8")).hexdigest()
+        csv_hash = hashlib.sha256(self.csv_content.encode("utf-8")).hexdigest()
+        if md_hash != self.markdown_sha256 or csv_hash != self.csv_sha256:
+            raise ValueError("Demonstration report SHA-256 integrity mismatch")
+        return self
+
+
 class SyntheticVerificationPreviewView(StrictFrontendModel):
     version: Literal[1] = 1
     demonstration_only: Literal[True] = True
@@ -254,12 +301,21 @@ class SyntheticVerificationPreviewView(StrictFrontendModel):
     verified_output_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     result_type: str = Field(min_length=1, max_length=64)
     columns: tuple[str, ...]
+    column_headers: dict[str, str]
     row_count: int = Field(ge=1, le=200)
     rows: tuple[dict[str, str | int | float | bool | None], ...]
     scalar_value: float | int | None = None
+    chart_kind: Literal["BAR", "LINE", "NONE"] = "NONE"
+    chart_x_label: str | None = None
+    chart_y_label: str | None = None
     chart_series: tuple[ChartPointView, ...] = ()
+    numeric_summaries: tuple[NumericColumnSummaryView, ...] = ()
+    missing_value_insights: tuple[ColumnCompletenessInsightView, ...] = ()
+    total_missing_cells: int = Field(default=0, ge=0)
+    dataset_completeness_pct: float = Field(default=100.0, ge=0.0, le=100.0)
     zero_division_count: int = Field(default=0, ge=0)
     max_abs_error: float = Field(default=0.0, ge=0.0)
+    demo_report: DemonstrationReportView
 
     @model_validator(mode="after")
     def _verify_synthetic_preview_contract(self) -> "SyntheticVerificationPreviewView":
@@ -267,6 +323,10 @@ class SyntheticVerificationPreviewView(StrictFrontendModel):
             raise ValueError("Synthetic verification preview is missing required DEMO label")
         if len(self.rows) != self.row_count:
             raise ValueError("Synthetic verification preview row_count mismatch")
+        if len(self.chart_series) > 100:
+            raise ValueError("Synthetic verification preview chart_series exceeds 100 points")
+        if set(self.column_headers.keys()) != set(self.columns):
+            raise ValueError("Synthetic verification preview column_headers must match columns")
         return self
 
 

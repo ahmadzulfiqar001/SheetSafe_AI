@@ -4,13 +4,17 @@ Connects to the live FastAPI control plane (`/api/v1/health`, `/api/v1/ready`,
 `POST /api/v1/sessions`, `DELETE /api/v1/sessions/{session_id}`,
 `POST /api/v1/planning/synthetic-dataset`, `POST /api/v1/planning/preview`,
 `GET /api/v1/planning/runs`).
-Never fabricates analytical results or charts, clearly labels offline mock
-planning as DEMO / SIMULATED, distinguishes immediate access revocation from
-pending physical cleanup, and never exposes session secrets.
+Never fabricates analytical results: tables, charts and demo reports are the
+independent reference expected results over the server-owned synthetic fixture,
+clearly labeled DEMO / SYNTHETIC and never presented as executed-candidate
+output. Offline mock planning is labeled DEMO / SIMULATED, immediate access
+revocation is distinguished from pending physical cleanup, and session secrets
+are never exposed.
 """
 
 from datetime import datetime, timezone
 import os
+import time
 
 import streamlit as st
 
@@ -46,6 +50,38 @@ SUPPORTED_OPERATIONS: tuple[tuple[str, str], ...] = (
     ("COMPUTE_RATIO", "Safe two-column numeric ratio with zero-division handling"),
     ("TIME_SERIES_ROLLUP", "Period aggregation over verified date columns"),
     ("CHART_SERIES", "Bounded bar or line chart specification for quarantined rendering"),
+)
+
+SYNTHETIC_DEMO_SCENARIOS: tuple[tuple[str, str | None], ...] = (
+    ("Custom / Typed Question Below", None),
+    (
+        "Grouped Revenue by Department (GROUPED_TABLE + Bar Chart)",
+        "What is total revenue_usd grouped by department, sorted highest to lowest?",
+    ),
+    (
+        "Categorical Bar Chart by Region (BAR_CHART)",
+        "Show a bar chart of total revenue_usd grouped by region.",
+    ),
+    (
+        "Quarterly Revenue Line Chart (LINE_CHART)",
+        "Show a line chart of quarterly revenue_usd trend over time.",
+    ),
+    (
+        "Quarterly Revenue Time-Series Rollup (TIME_SERIES_TABLE)",
+        "Show the quarterly revenue_usd trend over time.",
+    ),
+    (
+        "Revenue per Headcount Ratio (SUMMARY_TABLE / COMPUTE_RATIO)",
+        "What is the ratio of revenue_usd per headcount across records?",
+    ),
+    (
+        "Grand Total Scalar Metric (SCALAR_METRIC)",
+        "What is the scalar grand total of revenue_usd?",
+    ),
+    (
+        "Ambiguous Metric Clarification (CLARIFICATION_REQUIRED)",
+        "Which department has the best performance overall?",
+    ),
 )
 
 
@@ -172,6 +208,32 @@ def _clear_ephemeral_session_views() -> None:
     st.session_state["synthetic_dataset"] = None
     st.session_state["latest_plan_preview"] = None
     st.session_state["planning_error"] = None
+
+
+def _enforce_session_view_binding(client: SheetSafeApiClient) -> ActiveSessionView | None:
+    """Drop cached results that no longer belong to a live, unexpired local session.
+
+    The backend remains the authority (expired/revoked sessions receive 401); this
+    guard only ensures the UI never keeps displaying cached previews or reports after
+    the session's server-declared expiry or after a session change.
+    """
+    session = client.active_session
+    if session is not None and session.expires_at <= int(time.time()):
+        client.clear_local_session()
+        _clear_ephemeral_session_views()
+        st.session_state["ui_notice"] = (
+            "info",
+            "Your synthetic session has expired. Cached plans, results and reports were cleared; "
+            "start a new synthetic session to continue.",
+        )
+        return None
+    active_id = session.session_id if session is not None else None
+    for key in ("latest_plan_preview", "synthetic_dataset"):
+        cached = st.session_state.get(key)
+        if cached is not None and getattr(cached, "session_id", None) != active_id:
+            _clear_ephemeral_session_views()
+            break
+    return session
 
 
 def _record_activity(event_type: str, detail: str, request_id: str | None = None) -> None:
@@ -552,8 +614,10 @@ def _render_analysis_page(session: ActiveSessionView | None) -> None:
             <strong>DEMO / SIMULATED PLANNING MODE:</strong> This workspace connects to FastAPI
             <code>POST /api/v1/planning/preview</code> using a server-owned synthetic demonstration dataset and
             a deterministic in-memory HTTPX mock provider (<code>provider_mode = SIMULATED_MOCK</code>).
-            <strong>No live Vultr API calls are made, no generated Python code is executed, and no analytical
-            results or charts are fabricated.</strong>
+            <strong>No live Vultr API calls are made and no generated Python code is executed.</strong>
+            Tables, charts and downloadable reports show <strong>reference expected results</strong> computed by
+            the independent stdlib verifier over the synthetic fixture &mdash; they are not outputs of executed
+            candidate code and are never published as real analysis.
         </div>
         """,
         unsafe_allow_html=True,
@@ -599,9 +663,28 @@ def _render_analysis_page(session: ActiveSessionView | None) -> None:
                     _record_activity("SYNTHETIC_DATASET_FAILED", exc.safe_message, exc.request_id)
                     st.rerun()
 
+        scenario_labels = [label for label, _ in SYNTHETIC_DEMO_SCENARIOS]
+        scenario_map = dict(SYNTHETIC_DEMO_SCENARIOS)
+        selected_scenario = st.selectbox(
+            "Quick Synthetic Analysis Scenario (Optional Preset)",
+            options=scenario_labels,
+            index=0,
+            help=(
+                "Choose 'Custom / Typed Question Below' to submit the text area question directly, "
+                "or select a deterministic offline demonstration scenario."
+            ),
+        )
+        preset_question = scenario_map.get(selected_scenario)
+
+        # Selecting a preset pre-fills the text area; any edits the user then makes are
+        # submitted as typed (the text area value is always the submitted question).
         question_input = st.text_area(
             "Enter an analysis question (3 to 500 characters; treated strictly as untrusted data)",
-            value="What is total revenue_usd grouped by department, sorted highest to lowest?",
+            value=(
+                preset_question
+                if preset_question is not None
+                else "What is total revenue_usd grouped by department, sorted highest to lowest?"
+            ),
             max_chars=500,
             height=105,
             help=(
@@ -609,6 +692,7 @@ def _render_analysis_page(session: ActiveSessionView | None) -> None:
                 "inline PII (emails/SSNs/cards), and forbidden runtime capabilities before dispatch."
             ),
         )
+        effective_question = question_input
 
         plan_btn_clicked = st.button(
             "Generate Simulated AI Analysis Plan (DEMO / SIMULATED)",
@@ -621,7 +705,7 @@ def _render_analysis_page(session: ActiveSessionView | None) -> None:
                 with st.spinner("Calling POST /api/v1/planning/preview (Simulated Mock Transport)..."):
                     target_ds_id = syn_ds.dataset_id if syn_ds is not None else None
                     preview_outcome = client.create_planning_preview(
-                        question_input,
+                        effective_question,
                         dataset_id=target_ds_id,
                     )
                 st.session_state["latest_plan_preview"] = preview_outcome
@@ -859,27 +943,152 @@ def _render_analysis_page(session: ActiveSessionView | None) -> None:
             with vm4:
                 st.metric("Expected Output Rows", str(vp.row_count))
 
+            primary_numeric_display = (
+                f"{vp.scalar_value:,.2f}"
+                if vp.scalar_value is not None
+                else f"{vp.numeric_summaries[-1].total_sum:,.2f}"
+                if vp.numeric_summaries
+                else "N/A"
+            )
+            sm1, sm2, sm3, sm4 = st.columns(4)
+            with sm1:
+                st.metric("Result Type", vp.result_type)
+            with sm2:
+                st.metric(
+                    "Dataset Completeness",
+                    f"{vp.dataset_completeness_pct:.1f}% ({vp.total_missing_cells} missing)",
+                )
+            with sm3:
+                st.metric("Zero-Division Count", str(vp.zero_division_count))
+            with sm4:
+                st.metric("Primary Numeric Total / Scalar", primary_numeric_display)
+
+            if vp.scalar_value is not None:
+                st.metric("Independent Expected Scalar Metric (DEMO ONLY)", str(vp.scalar_value))
+
+            st.caption(
+                "Note: This view renders reference expected results computed by the pure-stdlib verifier over the "
+                "server-owned synthetic fixture (`synthetic_quarterly_revenue_v1`). Generated candidate code was "
+                "NOT executed and no candidate artifact was verified."
+            )
+
+            st.markdown("##### 1. Formatted Reference Result Table (`DEMO / SYNTHETIC PREVIEW`)")
+            formatted_rows = [
+                {
+                    vp.column_headers.get(col_id, col_id): row.get(col_id)
+                    for col_id in vp.columns
+                }
+                for row in vp.rows
+            ]
+            st.dataframe(formatted_rows, width="stretch", hide_index=True)
+
+            if vp.chart_series:
+                x_axis_label = vp.chart_x_label or "X"
+                y_axis_label = vp.chart_y_label or "Y"
+                chart_rows = [
+                    {x_axis_label: str(pt.x), y_axis_label: float(pt.y)}
+                    for pt in vp.chart_series
+                ]
+                if vp.chart_kind == "LINE":
+                    st.markdown(
+                        f"##### 2. Interactive Time-Series Line Chart — `{x_axis_label}` vs `{y_axis_label}` "
+                        "(`DEMO / SYNTHETIC PREVIEW`)"
+                    )
+                    st.line_chart(
+                        chart_rows,
+                        x=x_axis_label,
+                        y=y_axis_label,
+                        width="stretch",
+                    )
+                else:
+                    st.markdown(
+                        f"##### 2. Interactive Categorical Bar Chart — `{x_axis_label}` vs `{y_axis_label}` "
+                        "(`DEMO / SYNTHETIC PREVIEW`)"
+                    )
+                    st.bar_chart(
+                        chart_rows,
+                        x=x_axis_label,
+                        y=y_axis_label,
+                        width="stretch",
+                    )
+                st.caption(
+                    f"Reference Chart Coordinates (`chart_kind={vp.chart_kind}`, {len(vp.chart_series)} points — DEMO / SYNTHETIC)"
+                )
+                st.dataframe(chart_rows, width="stretch", hide_index=True)
+
+            st.markdown(
+                "##### 3. Reference Numerical Summary & Consistency Digests "
+                "(`DEMO / SYNTHETIC — Not Candidate Verification`)"
+            )
             st.markdown(
                 f"- **Expected Output SHA-256 (Consistency Digest)**: `{vp.verified_output_sha256}`  \n"
                 f"- **Bound Code SHA-256**: `{vp.code_sha256}`  \n"
                 f"- **Bound Plan SHA-256**: `{vp.plan_sha256}`  \n"
                 f"- **Bound Schema SHA-256**: `{vp.schema_sha256}`  \n"
-                f"- **Zero-Division Count**: `{vp.zero_division_count}`"
+                f"- **Zero-Division Count**: `{vp.zero_division_count}` &bull; **Max Abs Error**: `{vp.max_abs_error}`"
             )
+            if vp.numeric_summaries:
+                num_summary_rows = [
+                    {
+                        "Column": ns.display_label,
+                        "Non-Null Rows": ns.non_null_count,
+                        "Null Rows": ns.null_count,
+                        "Total Sum": ns.total_sum,
+                        "Mean": ns.mean_value,
+                        "Min": ns.min_value,
+                        "Max": ns.max_value,
+                    }
+                    for ns in vp.numeric_summaries
+                ]
+                st.dataframe(num_summary_rows, width="stretch", hide_index=True)
+
+            if vp.missing_value_insights:
+                st.markdown("##### 4. Missing-Value & Dataset Completeness Insights (`DEMO / SYNTHETIC`)")
+                missing_rows = [
+                    {
+                        "Column ID": mvi.column_id,
+                        "Column Name": mvi.column_name,
+                        "Inferred Type": mvi.inferred_type,
+                        "Dataset Rows": mvi.row_count,
+                        "Missing Cells": mvi.missing_count,
+                        "Present Cells": mvi.present_count,
+                        "Completeness (%)": f"{mvi.completeness_pct:.1f}%",
+                        "Referenced in Plan": "Yes" if mvi.referenced_in_plan else "No",
+                    }
+                    for mvi in vp.missing_value_insights
+                ]
+                st.dataframe(missing_rows, width="stretch", hide_index=True)
+
+            st.markdown("##### 5. Downloadable Demonstration Reports (`DEMO / SYNTHETIC — Non-Production`)")
             st.caption(
-                "Note: This table is a reference expected result computed by the pure-stdlib verifier over the "
-                "synthetic fixture. Generated candidate code was NOT executed and no candidate artifact was verified."
+                f"**{vp.demo_report.report_label}** — Text cells beginning with spreadsheet formula triggers "
+                f"(`=`, `+`, `-`, `@`, `|`, including after leading whitespace/control characters) are prefixed "
+                f"with `'` (`formula_injection_neutralized={vp.demo_report.formula_injection_neutralized}`)."
             )
-            if vp.scalar_value is not None:
-                st.metric("Independent Expected Scalar Metric (DEMO ONLY)", str(vp.scalar_value))
-
-            st.markdown("##### Reference Expected Result Table (DEMO / SYNTHETIC PREVIEW)")
-            st.dataframe(list(vp.rows), width="stretch", hide_index=True)
-
-            if vp.chart_series:
-                st.markdown("##### Reference Chart Series Points (DEMO / SYNTHETIC PREVIEW)")
-                chart_rows = [{"X": pt.x, "Y": pt.y} for pt in vp.chart_series]
-                st.dataframe(chart_rows, width="stretch", hide_index=True)
+            dl_col1, dl_col2 = st.columns(2)
+            with dl_col1:
+                st.download_button(
+                    label="Download Demo Markdown Report (.md — DEMO / SYNTHETIC)",
+                    data=vp.demo_report.markdown_content,
+                    file_name=vp.demo_report.markdown_filename,
+                    mime="text/markdown",
+                    width="stretch",
+                )
+            with dl_col2:
+                st.download_button(
+                    label="Download Formula-Safe Demo CSV (.csv — DEMO / SYNTHETIC)",
+                    data=vp.demo_report.csv_content,
+                    file_name=vp.demo_report.csv_filename,
+                    mime="text/csv",
+                    width="stretch",
+                )
+            with st.expander("Inspect Demonstration Report Content & SHA-256 Digests (DEMO / SYNTHETIC)"):
+                st.markdown(
+                    f"- **Markdown Filename**: `{vp.demo_report.markdown_filename}` (`SHA-256: {vp.demo_report.markdown_sha256}`)  \n"
+                    f"- **CSV Filename**: `{vp.demo_report.csv_filename}` (`SHA-256: {vp.demo_report.csv_sha256}`)"
+                )
+                # Rendered as plain preformatted text (no Markdown/HTML interpretation).
+                st.text(vp.demo_report.markdown_content)
 
     with tab_ops:
         ops_table = [
@@ -1073,7 +1282,7 @@ def render_app() -> None:
 
     client: SheetSafeApiClient = st.session_state["api_client"]
     snapshot: BackendStatusSnapshot = st.session_state["backend_status"]
-    session = client.active_session
+    session = _enforce_session_view_binding(client)
 
     notice = st.session_state.get("ui_notice")
     if notice is not None:

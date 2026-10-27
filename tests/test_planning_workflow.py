@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 import httpx
@@ -11,13 +12,20 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 from backend.config import Settings
+from backend.inference import build_validated_dataset_schema
 from backend.ingestion import prepare_synthetic_request
 from backend.main import create_app
 from backend.planning import (
+    DEMO_REPORT_CSV_BUDGET_BYTES,
+    DEMO_REPORT_MARKDOWN_BUDGET_BYTES,
+    DemonstrationReportPreview,
     SIMULATED_MODEL_ID,
     SYNTHETIC_FIXTURE_CSV_BYTES,
     SYNTHETIC_FIXTURE_ID,
     SYNTHETIC_FIXTURE_PROFILE,
+    _build_demonstration_report,
+    _escape_markdown_text,
+    _neutralize_spreadsheet_cell,
 )
 from backend.security.sessions import csrf_token_for
 from frontend.api_client import (
@@ -923,3 +931,366 @@ def test_step10b_streamlit_renders_code_preview_ast_receipt_and_unsupported_op_e
     ][0].click().run()
     assert not at.exception
     assert any("UNSAFE_OPERATION_REJECTED" in e.value for e in at.error)
+
+
+# ---------------------------------------------------------------------------
+# Step 11C Tests: Interactive Analysis Results UI, Charts, Insights & Reports
+# ---------------------------------------------------------------------------
+
+
+def test_step11c_bar_chart_line_chart_and_scalar_scenarios_produce_expected_result_previews(
+    client: TestClient,
+) -> None:
+    _, cred, csrf = _bootstrap_session(client)
+
+    # 1. Explicit BAR_CHART scenario
+    bar_resp = client.post(
+        "/api/v1/planning/preview",
+        json={"question": "Show a bar chart of total revenue_usd grouped by region."},
+        headers=_auth_headers(client, cred, csrf),
+    )
+    assert bar_resp.status_code == 200
+    bar_vp = bar_resp.json()["synthetic_verification_preview"]
+    assert bar_vp["result_type"] == "BAR_CHART"
+    assert bar_vp["chart_kind"] == "BAR"
+    assert bar_vp["chart_x_label"] == "region (col_003)"
+    assert bar_vp["chart_y_label"] == "revenue_usd (col_004)"
+    assert bar_vp["column_headers"] == {
+        "col_003": "region (col_003)",
+        "col_004": "revenue_usd (col_004)",
+    }
+    assert len(bar_vp["chart_series"]) == 3
+    assert bar_vp["chart_series"][0] == {"x": "North America", "y": 887101.25}
+    assert len(bar_vp["numeric_summaries"]) == 1
+    assert bar_vp["numeric_summaries"][0]["column_id"] == "col_004"
+    assert bar_vp["numeric_summaries"][0]["total_sum"] == pytest.approx(1455601.5)
+    assert bar_vp["numeric_summaries"][0]["max_value"] == pytest.approx(887101.25)
+    assert bar_vp["numeric_summaries"][0]["min_value"] == pytest.approx(154200.25)
+
+    # 2. Explicit LINE_CHART scenario
+    line_resp = client.post(
+        "/api/v1/planning/preview",
+        json={"question": "Show a line chart of quarterly revenue_usd trend over time."},
+        headers=_auth_headers(client, cred, csrf),
+    )
+    assert line_resp.status_code == 200
+    line_vp = line_resp.json()["synthetic_verification_preview"]
+    assert line_vp["result_type"] == "LINE_CHART"
+    assert line_vp["chart_kind"] == "LINE"
+    assert line_vp["chart_x_label"] == "quarter (col_001)"
+    assert line_vp["chart_y_label"] == "revenue_usd (col_004)"
+    assert line_vp["chart_series"] == [
+        {"x": "2025-03-31", "y": 623500.5},
+        {"x": "2025-06-30", "y": 616301.0},
+        {"x": "2025-09-30", "y": 215800.0},
+    ]
+
+    # 3. Explicit SCALAR_METRIC scenario
+    scalar_resp = client.post(
+        "/api/v1/planning/preview",
+        json={"question": "What is the scalar grand total of revenue_usd?"},
+        headers=_auth_headers(client, cred, csrf),
+    )
+    assert scalar_resp.status_code == 200
+    scalar_vp = scalar_resp.json()["synthetic_verification_preview"]
+    assert scalar_vp["result_type"] == "SCALAR_METRIC"
+    assert scalar_vp["scalar_value"] == pytest.approx(1455601.5)
+    assert scalar_vp["chart_kind"] == "NONE"
+    assert scalar_vp["chart_series"] == []
+    assert scalar_vp["candidate_output_verified"] is False
+    assert scalar_vp["publication_authorized"] is False
+    assert scalar_vp["sandbox_execution_verified"] is False
+
+
+def test_step11c_missing_value_insights_ratio_headers_and_formula_safe_demo_report(
+    client: TestClient,
+) -> None:
+    _, cred, csrf = _bootstrap_session(client)
+
+    ratio_resp = client.post(
+        "/api/v1/planning/preview",
+        json={"question": "What is the ratio of revenue_usd per headcount across records?"},
+        headers=_auth_headers(client, cred, csrf),
+    )
+    assert ratio_resp.status_code == 200
+    vp = ratio_resp.json()["synthetic_verification_preview"]
+
+    # Check human-readable ratio header
+    assert vp["column_headers"] == {
+        "col_004": "revenue_usd (col_004)",
+        "col_005": "headcount (col_005)",
+        "ratio_col_004_col_005": "ratio_revenue_usd_headcount (ratio_col_004_col_005)",
+    }
+
+    # Check missing-value insights across all 5 schema columns
+    assert vp["total_missing_cells"] == 0
+    assert vp["dataset_completeness_pct"] == 100.0
+    insights = vp["missing_value_insights"]
+    assert len(insights) == 5
+    by_col = {item["column_id"]: item for item in insights}
+    assert by_col["col_004"]["referenced_in_plan"] is True
+    assert by_col["col_005"]["referenced_in_plan"] is True
+    assert by_col["col_001"]["referenced_in_plan"] is False
+    assert by_col["col_004"]["completeness_pct"] == 100.0
+    assert by_col["col_004"]["present_count"] == 5
+
+    # Check demonstration report integrity and watermarks
+    rep = vp["demo_report"]
+    assert rep["demonstration_only"] is True
+    assert rep["formula_injection_neutralized"] is True
+    assert "DEMO / SYNTHETIC" in rep["report_label"]
+    assert "DEMO / SYNTHETIC" in rep["markdown_content"]
+    assert "DEMO / SYNTHETIC" in rep["csv_content"]
+    assert (
+        hashlib.sha256(rep["markdown_content"].encode("utf-8")).hexdigest()
+        == rep["markdown_sha256"]
+    )
+    assert (
+        hashlib.sha256(rep["csv_content"].encode("utf-8")).hexdigest()
+        == rep["csv_sha256"]
+    )
+
+    # Verify formula-injection neutralization helper neutralizes =, +, -, @, \t, \r
+    for dangerous in ("=SUM(A1:A10)", "+cmd|' /C calc'!A0", "-2+3", "@IMPORTXML()", "  =1+1", "\t=1+1"):
+        neutralized = _neutralize_spreadsheet_cell(dangerous)
+        assert neutralized.startswith("'")
+
+
+def test_step11c_formula_injection_defense_covers_whitespace_control_and_fullwidth_prefixes() -> None:
+    dangerous = (
+        "=HYPERLINK(\"http://x\")",
+        "+1",
+        "-1+1",
+        "@SUM(A1)",
+        "|calc",
+        "\t=1",
+        "\r=1",
+        "\n=1",
+        "\x00=1",
+        "\u200b=1",
+        "\ufeff=1",
+        "\u00a0+1",
+        "\u3000@x",
+        "   \t -2",
+        "\uff1dSUM(A1)",
+        "\uff0b1",
+        "\uff20x",
+    )
+    for value in dangerous:
+        cell = _neutralize_spreadsheet_cell(value)
+        assert cell.startswith("'"), repr(value)
+        assert not any(ch in cell for ch in ("\r", "\n", "\t", "\x00", "\u200b", "\ufeff"))
+
+    # Plain text and numeric/boolean literals are not altered.
+    assert _neutralize_spreadsheet_cell("North America") == "North America"
+    assert _neutralize_spreadsheet_cell("2025-03-31") == "2025-03-31"
+    assert _neutralize_spreadsheet_cell(-5) == "-5"
+    assert _neutralize_spreadsheet_cell(1234.5) == "1234.5"
+    assert _neutralize_spreadsheet_cell(True) == "TRUE"
+    assert _neutralize_spreadsheet_cell(None) == ""
+
+
+def _report_kwargs(rows, intent_summary="Synthetic intent", columns=("col_002", "col_004")):
+    schema = build_validated_dataset_schema(SYNTHETIC_FIXTURE_PROFILE)
+    return {
+        "plan": SimpleNamespace(intent_summary=intent_summary),
+        "validated_schema": schema,
+        "code_sha256": "a" * 64,
+        "plan_sha256": "b" * 64,
+        "verified_output_sha256": "c" * 64,
+        "result_type": "GROUPED_TABLE",
+        "columns": columns,
+        "column_headers": {c: f"{c} header" for c in columns},
+        "rows": rows,
+        "scalar_value": None,
+        "zero_division_count": 0,
+        "numeric_summaries": (),
+        "missing_value_insights": (),
+    }
+
+
+def test_step11c_markdown_report_escapes_html_script_and_link_injection() -> None:
+    hostile_rows = (
+        {"col_002": "<script>alert(1)</script>", "col_004": 1.0},
+        {"col_002": "[click](javascript:alert(1))", "col_004": 2.0},
+        {"col_002": "<img src=x onerror=alert(1)>", "col_004": 3.0},
+        {"col_002": "pipe|break `code`", "col_004": 4.0},
+    )
+    report = _build_demonstration_report(
+        **_report_kwargs(hostile_rows, intent_summary="<b>bold</b> [x](javascript:alert(2))")
+    )
+    md = report.markdown_content
+    assert "<script" not in md and "<img" not in md and "<b>" not in md
+    assert "&lt;script&gt;" in md and "&lt;img" in md
+    assert "[click](" not in md and "[x](" not in md
+    assert "\\[click\\](javascript" in md
+    assert "pipe\\|break \\`code\\`" in md
+    assert "DEMO / SYNTHETIC" in md
+    assert _escape_markdown_text("a<b>&c") == "a&lt;b&gt;&amp;c"
+
+    # The report content is shown in Streamlit via st.text (plain text), never st.markdown.
+    app_source = APP_PATH.read_text(encoding="utf-8")
+    assert "st.text(vp.demo_report.markdown_content)" in app_source
+    assert "st.markdown(vp.demo_report.markdown_content" not in app_source
+
+
+def test_step11c_demo_report_respects_byte_budgets_with_visible_truncation() -> None:
+    large_rows = tuple(
+        {"col_002": f"Department {i:03d} " + ("x" * 240), "col_004": float(i)}
+        for i in range(200)
+    )
+    report = _build_demonstration_report(**_report_kwargs(large_rows))
+    md_bytes = len(report.markdown_content.encode("utf-8"))
+    csv_bytes = len(report.csv_content.encode("utf-8"))
+    assert md_bytes <= DEMO_REPORT_MARKDOWN_BUDGET_BYTES
+    assert csv_bytes <= DEMO_REPORT_CSV_BUDGET_BYTES
+    assert "TRUNCATED" in report.markdown_content
+    assert "TRUNCATED" in report.csv_content
+    assert "DEMO / SYNTHETIC" in report.csv_content.splitlines()[0]
+    # Contract re-validation succeeds and digests match the bounded content.
+    revalidated = DemonstrationReportPreview.model_validate(report.model_dump())
+    assert hashlib.sha256(revalidated.csv_content.encode("utf-8")).hexdigest() == revalidated.csv_sha256
+    assert (
+        hashlib.sha256(revalidated.markdown_content.encode("utf-8")).hexdigest()
+        == revalidated.markdown_sha256
+    )
+
+    # Small synthetic reports are not truncated.
+    small = _build_demonstration_report(**_report_kwargs(large_rows[:3]))
+    assert "TRUNCATED" not in small.markdown_content
+    assert "TRUNCATED" not in small.csv_content
+    assert "expected_output_sha256=" in small.csv_content
+
+
+def test_step11c_api_client_rejects_tampered_demo_report_or_missing_watermark(
+    client: TestClient,
+) -> None:
+    api_client = SheetSafeApiClient(
+        api_base_url=DEV_BASE,
+        client_origin=ORIGIN,
+        transport=client._transport,
+    )
+    api_client.create_synthetic_session()
+    raw_valid = json.loads(
+        client.post(
+            "/api/v1/planning/preview",
+            json={"question": "Show a bar chart of total revenue_usd grouped by department."},
+            headers=_auth_headers(
+                client,
+                api_client._sealed_session._cookie_value.get_secret_value(),
+                api_client._sealed_session._csrf_token.get_secret_value(),
+            ),
+        ).text
+    )
+
+    # 1. Tampered markdown_content without updating markdown_sha256
+    bad_md_hash = json.loads(json.dumps(raw_valid))
+    bad_md_hash["synthetic_verification_preview"]["demo_report"]["markdown_content"] += "\ntampered"
+
+    # 2. Missing DEMO / SYNTHETIC watermark in report_label
+    bad_label = json.loads(json.dumps(raw_valid))
+    bad_label["synthetic_verification_preview"]["demo_report"]["report_label"] = "PRODUCTION REPORT"
+
+    # 3. Mismatched column_headers keys
+    bad_headers = json.loads(json.dumps(raw_valid))
+    bad_headers["synthetic_verification_preview"]["column_headers"] = {"col_999": "unknown"}
+
+    for payload in (bad_md_hash, bad_label, bad_headers):
+        def _handler(request: httpx.Request, body=payload) -> httpx.Response:
+            if request.url.path == "/api/v1/sessions":
+                return client._transport.handle_request(request)
+            return httpx.Response(200, json=body, headers={"X-Request-ID": "req_11c_tampered"})
+
+        c = SheetSafeApiClient(
+            api_base_url=DEV_BASE,
+            client_origin=ORIGIN,
+            transport=httpx.MockTransport(_handler),
+        )
+        c.create_synthetic_session()
+        with pytest.raises(FrontendClientError) as exc_info:
+            c.create_planning_preview("Show a bar chart of total revenue_usd.")
+        assert exc_info.value.code is FrontendClientCode.MALFORMED_RESPONSE
+
+
+def test_step11c_streamlit_interactive_results_charts_and_revocation_cleanup(
+    client: TestClient,
+) -> None:
+    at = AppTest.from_file(str(APP_PATH), default_timeout=15)
+    live_client = SheetSafeApiClient(
+        api_base_url=DEV_BASE,
+        client_origin=ORIGIN,
+        transport=client._transport,
+    )
+    at.session_state["api_client"] = live_client
+    at.session_state["backend_status"] = live_client.probe_backend_status()
+    at.run()
+    assert not at.exception
+
+    # Start synthetic session and navigate to AI Analysis page
+    [b for b in at.button if b.label == "Start Synthetic Session"][0].click().run()
+    at.sidebar.radio[0].set_value("AI Analysis").run()
+
+    # Select Line Chart preset scenario and generate preview
+    at.selectbox[0].set_value("Quarterly Revenue Line Chart (LINE_CHART)").run()
+    [
+        b for b in at.button if "Generate Simulated AI Analysis Plan (DEMO / SIMULATED)" in b.label
+    ][0].click().run()
+    assert not at.exception
+
+    metrics = {m.label: m.value for m in at.metric}
+    assert metrics["Preview Status"] == "SYNTHETIC_EXPECTED_RESULT_COMPUTED"
+    assert metrics["Result Type"] == "LINE_CHART"
+    assert metrics["Dataset Completeness"] == "100.0% (0 missing)"
+    assert metrics["Primary Numeric Total / Scalar"] == "1,455,601.50"
+    assert metrics["Candidate Output Verified"] == "False"
+    assert metrics["Publication Authorized"] == "False"
+
+    # Switch to Bar Chart preset scenario and verify BAR_CHART preview
+    at.selectbox[0].set_value("Categorical Bar Chart by Region (BAR_CHART)").run()
+    [
+        b for b in at.button if "Generate Simulated AI Analysis Plan (DEMO / SIMULATED)" in b.label
+    ][0].click().run()
+    assert not at.exception
+    metrics_bar = {m.label: m.value for m in at.metric}
+    assert metrics_bar["Result Type"] == "BAR_CHART"
+
+    # Revoke session on Settings / Privacy and confirm all preview state is wiped
+    at.sidebar.radio[0].set_value("Settings / Privacy").run()
+    [b for b in at.button if "Revoke Session & Queue Deletion" in b.label][0].click().run()
+    assert not at.exception
+    assert at.session_state["latest_plan_preview"] is None
+    assert at.session_state["synthetic_dataset"] is None
+
+
+def test_step11c_streamlit_clears_cached_results_and_reports_after_session_expiry(
+    client: TestClient,
+) -> None:
+    at = AppTest.from_file(str(APP_PATH), default_timeout=15)
+    live_client = SheetSafeApiClient(
+        api_base_url=DEV_BASE,
+        client_origin=ORIGIN,
+        transport=client._transport,
+    )
+    at.session_state["api_client"] = live_client
+    at.session_state["backend_status"] = live_client.probe_backend_status()
+    at.run()
+    [b for b in at.button if b.label == "Start Synthetic Session"][0].click().run()
+    at.sidebar.radio[0].set_value("AI Analysis").run()
+    at.selectbox[0].set_value("Revenue per Headcount Ratio (SUMMARY_TABLE / COMPUTE_RATIO)").run()
+    [
+        b for b in at.button if "Generate Simulated AI Analysis Plan (DEMO / SIMULATED)" in b.label
+    ][0].click().run()
+    assert not at.exception
+    assert at.session_state["latest_plan_preview"] is not None
+    assert len(at.get("download_button")) == 2
+
+    # Simulate passage of the server-declared expiry for the local session view.
+    sealed = live_client._sealed_session
+    sealed.view = sealed.view.model_copy(update={"expires_at": 1})
+    at.run()
+    assert not at.exception
+    assert live_client.active_session is None
+    assert at.session_state["latest_plan_preview"] is None
+    assert at.session_state["synthetic_dataset"] is None
+    assert len(at.get("download_button")) == 0
+    assert any("session has expired" in i.value for i in at.info)
