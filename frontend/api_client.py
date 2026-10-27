@@ -13,6 +13,7 @@ Security invariants:
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+import hashlib
 from http.cookies import SimpleCookie
 import json
 import re
@@ -20,7 +21,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 
 DEFAULT_API_BASE_URL = "http://127.0.0.1:8000"
@@ -190,6 +191,85 @@ class PlanningEnvelopeView(StrictFrontendModel):
     clarification: ClarificationView | None = None
 
 
+class ASTValidationReceiptView(StrictFrontendModel):
+    version: Literal[1] = 1
+    valid: Literal[True] = True
+    code_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    plan_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    schema_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    declared_imports: tuple[str, ...]
+    node_count: int = Field(ge=1)
+    max_depth: int = Field(ge=1)
+    execution_authorized: Literal[False] = False
+    sandbox_isolation_required: Literal[True] = True
+    security_notice: str = Field(min_length=10, max_length=240)
+
+
+class CodeGenerationPreviewView(StrictFrontendModel):
+    version: Literal[1] = 1
+    code_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    plan_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    schema_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    declared_imports: tuple[str, ...]
+    referenced_columns: tuple[str, ...]
+    output_columns: tuple[str, ...]
+    expected_result_type: str = Field(min_length=1, max_length=64)
+    python_source: str = Field(min_length=10, max_length=16384)
+    execution_authorized: Literal[False] = False
+    ast_receipt: ASTValidationReceiptView
+
+    @model_validator(mode="after")
+    def _verify_code_integrity(self) -> "CodeGenerationPreviewView":
+        """Verify internal payload consistency (not proof of code safety or provenance)."""
+        computed = hashlib.sha256(self.python_source.encode("utf-8")).hexdigest()
+        if computed != self.code_sha256:
+            raise ValueError("Candidate python_source SHA-256 mismatch")
+        if (
+            self.ast_receipt.code_sha256 != self.code_sha256
+            or self.ast_receipt.plan_sha256 != self.plan_sha256
+            or self.ast_receipt.schema_sha256 != self.schema_sha256
+        ):
+            raise ValueError("AST validation receipt hash consistency mismatch")
+        return self
+
+
+class ChartPointView(StrictFrontendModel):
+    x: str | int | float | bool
+    y: float
+
+
+class SyntheticVerificationPreviewView(StrictFrontendModel):
+    version: Literal[1] = 1
+    demonstration_only: Literal[True] = True
+    verification_label: str = Field(min_length=10, max_length=240)
+    validation_status: Literal["SYNTHETIC_EXPECTED_RESULT_COMPUTED"] = (
+        "SYNTHETIC_EXPECTED_RESULT_COMPUTED"
+    )
+    candidate_output_verified: Literal[False] = False
+    publication_authorized: Literal[False] = False
+    sandbox_execution_verified: Literal[False] = False
+    schema_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    plan_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    code_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    verified_output_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    result_type: str = Field(min_length=1, max_length=64)
+    columns: tuple[str, ...]
+    row_count: int = Field(ge=1, le=200)
+    rows: tuple[dict[str, str | int | float | bool | None], ...]
+    scalar_value: float | int | None = None
+    chart_series: tuple[ChartPointView, ...] = ()
+    zero_division_count: int = Field(default=0, ge=0)
+    max_abs_error: float = Field(default=0.0, ge=0.0)
+
+    @model_validator(mode="after")
+    def _verify_synthetic_preview_contract(self) -> "SyntheticVerificationPreviewView":
+        if "DEMO / SYNTHETIC" not in self.verification_label:
+            raise ValueError("Synthetic verification preview is missing required DEMO label")
+        if len(self.rows) != self.row_count:
+            raise ValueError("Synthetic verification preview row_count mismatch")
+        return self
+
+
 class PlanningPreviewView(StrictFrontendModel):
     run_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     session_id: str = Field(pattern=r"^[0-9a-f]{32}$")
@@ -206,7 +286,37 @@ class PlanningPreviewView(StrictFrontendModel):
     dataset_schema: DatasetSchemaView
     envelope: PlanningEnvelopeView
     plan_sha256: str | None = None
+    code_preview: CodeGenerationPreviewView | None = None
+    synthetic_verification_preview: SyntheticVerificationPreviewView | None = None
     request_id: str | None = None
+
+    @model_validator(mode="after")
+    def _verify_preview_bindings(self) -> "PlanningPreviewView":
+        """Check internal SHA-256 consistency across schema, plan, and preview payloads."""
+        if self.envelope.status == "PLAN_READY":
+            if self.envelope.plan is None or self.plan_sha256 is None:
+                raise ValueError("PLAN_READY outcome requires plan and plan_sha256")
+            if self.envelope.plan.schema_sha256 != self.dataset_schema.schema_sha256:
+                raise ValueError("Plan schema_sha256 does not match dataset_schema")
+            if self.code_preview is not None:
+                if (
+                    self.code_preview.schema_sha256 != self.dataset_schema.schema_sha256
+                    or self.code_preview.plan_sha256 != self.plan_sha256
+                ):
+                    raise ValueError("Code preview SHA-256 consistency mismatch")
+            if self.synthetic_verification_preview is not None:
+                if self.code_preview is None:
+                    raise ValueError("Synthetic verification preview requires code_preview")
+                if (
+                    self.synthetic_verification_preview.schema_sha256 != self.dataset_schema.schema_sha256
+                    or self.synthetic_verification_preview.plan_sha256 != self.plan_sha256
+                    or self.synthetic_verification_preview.code_sha256 != self.code_preview.code_sha256
+                ):
+                    raise ValueError("Synthetic verification preview consistency mismatch")
+        else:
+            if self.code_preview is not None or self.synthetic_verification_preview is not None:
+                raise ValueError("CLARIFICATION_REQUIRED must not include code or verification previews")
+        return self
 
 
 class PersistedRunSummaryView(StrictFrontendModel):
@@ -220,6 +330,7 @@ class PersistedRunSummaryView(StrictFrontendModel):
     simulated_response: Literal[True] = True
     execution_enabled: Literal[False] = False
     plan_sha256: str | None = None
+    code_sha256: str | None = None
     expected_result_type: str | None = None
     intent_summary: str | None = None
     clarification_reason: str | None = None

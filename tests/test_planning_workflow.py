@@ -723,3 +723,203 @@ def test_streamlit_ai_analysis_and_history_end_to_end_and_honest_revocation(
         "cleanup_status=not_started" in s.value and "physical erasure is not yet complete" in s.value
         for s in at.success
     )
+
+
+def test_step10b_code_preview_ast_receipt_and_synthetic_verification_chain(
+    client: TestClient,
+) -> None:
+    session_id, cred, csrf = _bootstrap_session(client)
+    plan_resp = client.post(
+        "/api/v1/planning/preview",
+        json={
+            "question": "What is total revenue_usd grouped by department, sorted highest to lowest?",
+        },
+        headers=_auth_headers(client, cred, csrf),
+    )
+    assert plan_resp.status_code == 200
+    body = plan_resp.json()
+
+    schema_sha = body["dataset_schema"]["schema_sha256"]
+    plan_sha = body["plan_sha256"]
+    assert body["execution_enabled"] is False
+
+    # Verify deterministic code preview and static AST validation receipt
+    code_prev = body["code_preview"]
+    assert code_prev is not None
+    assert code_prev["execution_authorized"] is False
+    assert code_prev["schema_sha256"] == schema_sha
+    assert code_prev["plan_sha256"] == plan_sha
+    assert hashlib.sha256(code_prev["python_source"].encode("utf-8")).hexdigest() == code_prev["code_sha256"]
+    assert "def run_analysis(records):" in code_prev["python_source"]
+
+    ast_rec = code_prev["ast_receipt"]
+    assert ast_rec["valid"] is True
+    assert ast_rec["execution_authorized"] is False
+    assert ast_rec["sandbox_isolation_required"] is True
+    assert ast_rec["code_sha256"] == code_prev["code_sha256"]
+    assert ast_rec["plan_sha256"] == plan_sha
+    assert ast_rec["schema_sha256"] == schema_sha
+    assert ast_rec["node_count"] >= 10
+    assert ast_rec["max_depth"] >= 3
+
+    # Verify demonstration-only independent synthetic expected-result preview
+    verif_prev = body["synthetic_verification_preview"]
+    assert verif_prev is not None
+    assert verif_prev["demonstration_only"] is True
+    assert "DEMO / SYNTHETIC" in verif_prev["verification_label"]
+    assert verif_prev["validation_status"] == "SYNTHETIC_EXPECTED_RESULT_COMPUTED"
+    assert verif_prev["candidate_output_verified"] is False
+    assert verif_prev["publication_authorized"] is False
+    assert verif_prev["sandbox_execution_verified"] is False
+    assert verif_prev["schema_sha256"] == schema_sha
+    assert verif_prev["plan_sha256"] == plan_sha
+    assert verif_prev["code_sha256"] == code_prev["code_sha256"]
+    assert len(verif_prev["verified_output_sha256"]) == 64
+    assert verif_prev["row_count"] == 3
+    assert verif_prev["rows"] == [
+        {"col_002": "Enterprise", "col_004": 887101.25},
+        {"col_002": "MidMarket", "col_004": 414300.0},
+        {"col_002": "Commercial", "col_004": 154200.25},
+    ]
+
+    # Confirm persisted SQLite run never falsely marks validation_status as PASSED or state as COMPLETE
+    with client.app.state.database.connection() as conn:
+        run_row = conn.execute("SELECT * FROM runs WHERE run_id=?", (body["run_id"],)).fetchone()
+        assert run_row["state"] == "AWAIT_CONFIRMATION"
+        assert run_row["validation_status"] == "PENDING"
+        assert run_row["cleanup_status"] == "PENDING"
+        interp = json.loads(run_row["interpretation_json"])
+        assert interp["code_sha256"] == code_prev["code_sha256"]
+
+    runs_resp = client.get(
+        "/api/v1/planning/runs",
+        headers={"Cookie": f"{client.app.state.settings.session_cookie_name}={cred}"},
+    )
+    assert runs_resp.status_code == 200
+    assert runs_resp.json()["runs"][0]["code_sha256"] == code_prev["code_sha256"]
+
+
+def test_step10b_unsupported_filter_rows_plan_rejected_honestly(
+    client: TestClient,
+) -> None:
+    session_id, cred, csrf = _bootstrap_session(client)
+    resp = client.post(
+        "/api/v1/planning/preview",
+        json={"question": "Please filter rows where revenue_usd exceeds threshold"},
+        headers=_auth_headers(client, cred, csrf),
+    )
+    assert resp.status_code == 422
+    assert resp.json()["code"] == "UNSAFE_OPERATION_REJECTED"
+
+    with client.app.state.database.connection() as conn:
+        run_row = conn.execute("SELECT * FROM runs WHERE session_id=?", (session_id,)).fetchone()
+        assert run_row is not None
+        assert run_row["state"] == "BLOCKED_POLICY"
+        assert run_row["validation_status"] == "PENDING"
+        assert run_row["plan_json"] == "{}"
+        events = [
+            r["event_type"]
+            for r in conn.execute(
+                "SELECT event_type FROM audit_events WHERE run_id=? ORDER BY sequence",
+                (run_row["run_id"],),
+            ).fetchall()
+        ]
+        assert events == ["RUN_CREATED", "INFERENCE_COMPLETED", "POLICY_DECISION", "RUN_STATE_CHANGED"]
+
+
+def test_step10b_api_client_rejects_tampered_code_or_unauthorized_publication(
+    client: TestClient,
+) -> None:
+    api_client = SheetSafeApiClient(
+        api_base_url=DEV_BASE,
+        client_origin=ORIGIN,
+        transport=client._transport,
+    )
+    api_client.create_synthetic_session()
+    valid_preview = api_client.create_planning_preview(
+        "What is the ratio of revenue_usd per headcount?"
+    )
+    assert valid_preview.code_preview is not None
+    assert valid_preview.synthetic_verification_preview is not None
+    raw_valid = json.loads(plan_json := client.post(
+        "/api/v1/planning/preview",
+        json={"question": "What is the ratio of revenue_usd per headcount?"},
+        headers=_auth_headers(
+            client,
+            api_client._sealed_session._cookie_value.get_secret_value(),
+            api_client._sealed_session._csrf_token.get_secret_value(),
+        ),
+    ).text)
+
+    # 1. Tampered python_source (code_sha256 mismatch) -> MALFORMED_RESPONSE
+    tampered_code = json.loads(json.dumps(raw_valid))
+    tampered_code["code_preview"]["python_source"] += "\n# tampered"
+
+    # 2. Tampered publication_authorized=True or candidate_output_verified=True -> MALFORMED_RESPONSE
+    tampered_pub = json.loads(json.dumps(raw_valid))
+    tampered_pub["synthetic_verification_preview"]["publication_authorized"] = True
+
+    tampered_cand_ver = json.loads(json.dumps(raw_valid))
+    tampered_cand_ver["synthetic_verification_preview"]["candidate_output_verified"] = True
+
+    # 3. Tampered plan_sha256 consistency -> MALFORMED_RESPONSE
+    tampered_plan_sha = json.loads(json.dumps(raw_valid))
+    tampered_plan_sha["code_preview"]["plan_sha256"] = "0" * 64
+    tampered_plan_sha["code_preview"]["ast_receipt"]["plan_sha256"] = "0" * 64
+
+    for bad_payload in (tampered_code, tampered_pub, tampered_cand_ver, tampered_plan_sha):
+        def _tampered_handler(request: httpx.Request, payload=bad_payload) -> httpx.Response:
+            if request.url.path == "/api/v1/sessions":
+                return client._transport.handle_request(request)
+            return httpx.Response(200, json=payload, headers={"X-Request-ID": "req_tampered"})
+
+        tampered_client = SheetSafeApiClient(
+            api_base_url=DEV_BASE,
+            client_origin=ORIGIN,
+            transport=httpx.MockTransport(_tampered_handler),
+        )
+        tampered_client.create_synthetic_session()
+        with pytest.raises(FrontendClientError) as exc_info:
+            tampered_client.create_planning_preview("What is total revenue_usd?")
+        assert exc_info.value.code is FrontendClientCode.MALFORMED_RESPONSE
+
+
+def test_step10b_streamlit_renders_code_preview_ast_receipt_and_unsupported_op_error(
+    client: TestClient,
+) -> None:
+    at = AppTest.from_file(str(APP_PATH), default_timeout=15)
+    live_client = SheetSafeApiClient(
+        api_base_url=DEV_BASE,
+        client_origin=ORIGIN,
+        transport=client._transport,
+    )
+    at.session_state["api_client"] = live_client
+    at.session_state["backend_status"] = live_client.probe_backend_status()
+    at.run()
+    assert not at.exception
+
+    # Start synthetic session and go to AI Analysis page
+    [b for b in at.button if b.label == "Start Synthetic Session"][0].click().run()
+    at.sidebar.radio[0].set_value("AI Analysis").run()
+    [
+        b for b in at.button if "Generate Simulated AI Analysis Plan (DEMO / SIMULATED)" in b.label
+    ][0].click().run()
+    assert not at.exception
+
+    # Verify st.code renders the compiled deterministic Python candidate without executing it
+    assert len(at.code) == 1
+    assert "def run_analysis(records):" in at.code[0].value
+    metrics = {m.label: m.value for m in at.metric}
+    assert metrics["AST Admission"] == "VALID (Static)"
+    assert metrics["Execution Authorized"] == "False"
+    assert metrics["Preview Status"] == "SYNTHETIC_EXPECTED_RESULT_COMPUTED"
+    assert metrics["Candidate Output Verified"] == "False"
+    assert metrics["Publication Authorized"] == "False"
+
+    # Trigger unsupported FILTER_ROWS operation from Streamlit UI and verify honest error message
+    at.text_area[0].set_value("Please filter rows where revenue_usd exceeds threshold").run()
+    [
+        b for b in at.button if "Generate Simulated AI Analysis Plan (DEMO / SIMULATED)" in b.label
+    ][0].click().run()
+    assert not at.exception
+    assert any("UNSAFE_OPERATION_REJECTED" in e.value for e in at.error)

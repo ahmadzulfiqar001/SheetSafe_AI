@@ -26,6 +26,11 @@ from uuid import uuid4
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
+from backend.codegen import (
+    CodeGenCode,
+    CodeGenError,
+    generate_analysis_code,
+)
 from backend.config import Settings, VULTR_INFERENCE_BASE_URL
 from backend.inference import (
     AIAnalysisPlan,
@@ -45,6 +50,11 @@ from backend.security.sessions import SessionError, SessionPrincipal, require_ac
 from backend.storage.database import Database, DatabaseVersionError
 from backend.storage.files import PrivateStorage
 from ingestion.contracts import ColumnProfile, DatasetProfile
+from validator.numerical_verifier import (
+    SyntheticTableFixture,
+    VerificationError,
+    compute_expected_analysis_result,
+)
 
 
 SYNTHETIC_FIXTURE_ID = "synthetic_quarterly_revenue_v1"
@@ -56,8 +66,50 @@ SYNTHETIC_FIXTURE_LABEL = (
 SIMULATED_PROVIDER_LABEL = (
     "DEMO / SIMULATED — Deterministic HTTPX Mock Transport (Not Live Vultr Output)"
 )
+SYNTHETIC_VERIFICATION_LABEL = (
+    "DEMO / SYNTHETIC EXPECTED RESULT PREVIEW — Independent Stdlib Reference Computation "
+    "on Server-Owned Synthetic Fixture (Candidate Code Not Executed; Candidate Output Not Verified; Publication Unauthorized)"
+)
 SIMULATED_MODEL_ID = "simulated-planner-v1"
 _SIMULATED_API_KEY = SecretStr("simulated_offline_key_not_a_real_secret")
+
+SYNTHETIC_FIXTURE_RECORDS: tuple[dict[str, str | int | float | bool | None], ...] = (
+    {
+        "col_001": "2025-03-31",
+        "col_002": "Enterprise",
+        "col_003": "North America",
+        "col_004": 425000.50,
+        "col_005": 42,
+    },
+    {
+        "col_001": "2025-03-31",
+        "col_002": "MidMarket",
+        "col_003": "Europe",
+        "col_004": 198500.00,
+        "col_005": 24,
+    },
+    {
+        "col_001": "2025-06-30",
+        "col_002": "Enterprise",
+        "col_003": "North America",
+        "col_004": 462100.75,
+        "col_005": 45,
+    },
+    {
+        "col_001": "2025-06-30",
+        "col_002": "Commercial",
+        "col_003": "Asia Pacific",
+        "col_004": 154200.25,
+        "col_005": 19,
+    },
+    {
+        "col_001": "2025-09-30",
+        "col_002": "MidMarket",
+        "col_003": "Europe",
+        "col_004": 215800.00,
+        "col_005": 26,
+    },
+)
 
 # Server-owned synthetic CSV bytes sealed into the session's PrivateStorage namespace
 # so PrivateStorage.remove_and_verify() can verify and clean up the object normally.
@@ -234,6 +286,74 @@ class SyntheticDatasetSnapshot(StrictPlanningContract):
     dataset_schema: ValidatedDatasetSchema
 
 
+class ASTValidationReceiptPreview(StrictPlanningContract):
+    """Static AST admission receipt for the deterministic candidate preview."""
+
+    version: Literal[1] = 1
+    valid: Literal[True] = True
+    code_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    plan_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    schema_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    declared_imports: tuple[str, ...]
+    node_count: int = Field(ge=1)
+    max_depth: int = Field(ge=1)
+    execution_authorized: Literal[False] = False
+    sandbox_isolation_required: Literal[True] = True
+    security_notice: str = Field(min_length=10, max_length=240)
+
+
+class CodeGenerationPreview(StrictPlanningContract):
+    """Deterministic code preview compiled from the validated AIAnalysisPlan."""
+
+    version: Literal[1] = 1
+    code_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    plan_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    schema_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    declared_imports: tuple[str, ...]
+    referenced_columns: tuple[str, ...]
+    output_columns: tuple[str, ...]
+    expected_result_type: str = Field(min_length=1, max_length=64)
+    python_source: str = Field(min_length=10, max_length=16384)
+    execution_authorized: Literal[False] = False
+    ast_receipt: ASTValidationReceiptPreview
+
+
+class ChartPointPreview(StrictPlanningContract):
+    """Single chart point in the demonstration-only synthetic verification preview."""
+
+    x: str | int | float | bool
+    y: float
+
+
+class SyntheticVerificationPreview(StrictPlanningContract):
+    """Demonstration-only reference expected-result preview over the synthetic fixture.
+
+    Never executes generated Python code or verifies a candidate-produced artifact.
+    """
+
+    version: Literal[1] = 1
+    demonstration_only: Literal[True] = True
+    verification_label: str = SYNTHETIC_VERIFICATION_LABEL
+    validation_status: Literal["SYNTHETIC_EXPECTED_RESULT_COMPUTED"] = (
+        "SYNTHETIC_EXPECTED_RESULT_COMPUTED"
+    )
+    candidate_output_verified: Literal[False] = False
+    publication_authorized: Literal[False] = False
+    sandbox_execution_verified: Literal[False] = False
+    schema_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    plan_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    code_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    verified_output_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    result_type: str = Field(min_length=1, max_length=64)
+    columns: tuple[str, ...]
+    row_count: int = Field(ge=1, le=200)
+    rows: tuple[dict[str, str | int | float | bool | None], ...]
+    scalar_value: float | int | None = None
+    chart_series: tuple[ChartPointPreview, ...] = ()
+    zero_division_count: int = Field(default=0, ge=0)
+    max_abs_error: float = Field(default=0.0, ge=0.0)
+
+
 class PlanningPreviewOutcome(StrictPlanningContract):
     """Validated, persisted planning preview response returned by FastAPI."""
 
@@ -252,6 +372,8 @@ class PlanningPreviewOutcome(StrictPlanningContract):
     dataset_schema: ValidatedDatasetSchema
     envelope: AIPlanningEnvelope
     plan_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    code_preview: CodeGenerationPreview | None = None
+    synthetic_verification_preview: SyntheticVerificationPreview | None = None
 
 
 class PersistedRunSummary(StrictPlanningContract):
@@ -267,6 +389,7 @@ class PersistedRunSummary(StrictPlanningContract):
     simulated_response: Literal[True] = True
     execution_enabled: Literal[False] = False
     plan_sha256: str | None = None
+    code_sha256: str | None = None
     expected_result_type: str | None = None
     intent_summary: str | None = None
     clarification_reason: str | None = None
@@ -321,6 +444,37 @@ def build_deterministic_mock_transport() -> httpx.MockTransport:
                         "or headcount (col_005), and how records should be grouped."
                     ),
                     "candidate_columns": candidate_ids,
+                },
+            }
+        elif "filter_rows" in question_text or "filter rows" in question_text:
+            rev_col = col_by_name.get("revenue_usd") or col_by_id.get("col_004") or columns[0]
+            envelope_dict = {
+                "version": 1,
+                "status": "PLAN_READY",
+                "plan": {
+                    "version": 1,
+                    "schema_sha256": schema_sha256,
+                    "intent_summary": (
+                        "Attempt to filter rows on revenue_usd using ProposedOperation v1 "
+                        "(unsupported operation without typed predicate)."
+                    ),
+                    "required_columns": [
+                        {
+                            "column_id": rev_col["column_id"],
+                            "name": rev_col["name"],
+                            "expected_type": rev_col["inferred_type"],
+                        }
+                    ],
+                    "operations": [
+                        {
+                            "step_number": 1,
+                            "operation": "FILTER_ROWS",
+                            "target_columns": [rev_col["column_id"]],
+                            "group_by_columns": [],
+                            "rationale": "Filter rows where revenue_usd exceeds threshold.",
+                        }
+                    ],
+                    "expected_result_type": "SUMMARY_TABLE",
                 },
             }
         elif "ratio" in question_text or "per headcount" in question_text or "per employee" in question_text:
@@ -552,6 +706,105 @@ def _map_inference_error(error: InferenceError) -> tuple[PlanningCode, str]:
         InferenceCode.TOKEN_BUDGET_EXCEEDED: (PlanningCode.PROVIDER_UNAVAILABLE, "PROVIDER_UNAVAILABLE"),
     }
     return mapping.get(error.code, (PlanningCode.PROVIDER_UNAVAILABLE, "PROVIDER_UNAVAILABLE"))
+
+
+def _map_codegen_error(error: CodeGenError | VerificationError) -> tuple[PlanningCode, str]:
+    """Map Step 10A CodeGenError or VerificationError to (PlanningCode, terminal_run_state)."""
+    if isinstance(error, CodeGenError):
+        if error.code is CodeGenCode.UNKNOWN_COLUMN:
+            return (PlanningCode.UNKNOWN_COLUMN_REFERENCE, "BLOCKED_POLICY")
+        if error.code in {CodeGenCode.SCHEMA_MISMATCH, CodeGenCode.INVALID_CONTRACT}:
+            return (PlanningCode.INVALID_PLAN_CONTRACT, "BLOCKED_POLICY")
+    return (PlanningCode.UNSAFE_OPERATION_REJECTED, "BLOCKED_POLICY")
+
+
+def _build_code_and_verification_previews(
+    plan: AIAnalysisPlan,
+    validated_schema: ValidatedDatasetSchema,
+    *,
+    is_synthetic_dataset: bool,
+) -> tuple[CodeGenerationPreview, SyntheticVerificationPreview | None]:
+    """Compile deterministic candidate preview and optional synthetic verification preview.
+
+    Never executes generated Python code or authorizes publication.
+    """
+    compiled = generate_analysis_code(plan, validated_schema)
+    ast_preview = ASTValidationReceiptPreview(
+        valid=True,
+        code_sha256=compiled.ast_receipt.code_sha256,
+        plan_sha256=compiled.ast_receipt.plan_sha256,
+        schema_sha256=compiled.ast_receipt.schema_sha256,
+        declared_imports=compiled.ast_receipt.declared_imports,
+        node_count=compiled.ast_receipt.node_count,
+        max_depth=compiled.ast_receipt.max_depth,
+        execution_authorized=False,
+        sandbox_isolation_required=True,
+        security_notice=compiled.ast_receipt.security_notice,
+    )
+    code_preview = CodeGenerationPreview(
+        code_sha256=compiled.code_sha256,
+        plan_sha256=compiled.plan_sha256,
+        schema_sha256=compiled.schema_sha256,
+        declared_imports=compiled.candidate.declared_imports,
+        referenced_columns=compiled.candidate.referenced_columns,
+        output_columns=compiled.output_columns,
+        expected_result_type=compiled.expected_result_type,
+        python_source=compiled.candidate.python_source,
+        execution_authorized=False,
+        ast_receipt=ast_preview,
+    )
+
+    synthetic_fixture_schema = build_validated_dataset_schema(SYNTHETIC_FIXTURE_PROFILE)
+    if not is_synthetic_dataset or validated_schema.schema_sha256 != synthetic_fixture_schema.schema_sha256:
+        return code_preview, None
+
+    fixture = SyntheticTableFixture.from_records(validated_schema, SYNTHETIC_FIXTURE_RECORDS)
+    expected = compute_expected_analysis_result(plan, validated_schema, fixture)
+    canonical_expected: dict[str, object] = {
+        "schema_sha256": expected.schema_sha256,
+        "plan_sha256": expected.plan_sha256,
+        "result_type": expected.result_type,
+        "columns": list(expected.columns),
+        "rows": [dict(r) for r in expected.rows],
+        "row_count": expected.row_count,
+        "zero_division_count": expected.zero_division_count,
+    }
+    if expected.scalar_value is not None:
+        canonical_expected["scalar_value"] = expected.scalar_value
+    if expected.chart_series:
+        canonical_expected["chart_series"] = [
+            {"x": pt.x, "y": pt.y} for pt in expected.chart_series
+        ]
+
+    expected_output_sha256 = hashlib.sha256(
+        json.dumps(
+            canonical_expected,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    verification_preview = SyntheticVerificationPreview(
+        demonstration_only=True,
+        verification_label=SYNTHETIC_VERIFICATION_LABEL,
+        validation_status="SYNTHETIC_EXPECTED_RESULT_COMPUTED",
+        candidate_output_verified=False,
+        publication_authorized=False,
+        sandbox_execution_verified=False,
+        schema_sha256=expected.schema_sha256,
+        plan_sha256=expected.plan_sha256,
+        code_sha256=compiled.code_sha256,
+        verified_output_sha256=expected_output_sha256,
+        result_type=expected.result_type,
+        columns=expected.columns,
+        row_count=expected.row_count,
+        rows=expected.rows,
+        scalar_value=expected.scalar_value,
+        chart_series=tuple(ChartPointPreview(x=pt.x, y=pt.y) for pt in expected.chart_series),
+        zero_division_count=expected.zero_division_count,
+        max_abs_error=0.0,
+    )
+    return code_preview, verification_preview
 
 
 class PlanningService:
@@ -935,49 +1188,92 @@ class PlanningService:
                         },
                     )
 
+                    code_preview: CodeGenerationPreview | None = None
+                    verification_preview: SyntheticVerificationPreview | None = None
                     if envelope.status == "PLAN_READY":
                         assert envelope.plan is not None
                         plan: AIAnalysisPlan = envelope.plan
                         plan_sha = plan.plan_sha256()
-                        target_state: Literal["AWAIT_CONFIRMATION", "NEEDS_CLARIFICATION"] = "AWAIT_CONFIRMATION"
-                        confirm_expires = min(principal.expires_at, updated_ts + 900)
-                        interpretation_payload = {
-                            "version": 1,
-                            "status": "PLAN_READY",
-                            "provider_mode": "SIMULATED_MOCK",
-                            "simulated_response": True,
-                            "model": planning_result.model,
-                            "schema_sha256": planning_result.schema_sha256,
-                            "plan_sha256": plan_sha,
-                            "intent_summary": plan.intent_summary,
-                            "expected_result_type": plan.expected_result_type,
-                        }
-                        connection.execute(
-                            """UPDATE runs SET state=?, state_version=state_version+1,
-                                interpretation_json=?, plan_json=?, confirmation_expires_at=?,
-                                updated_at=? WHERE run_id=?""",
-                            (
-                                target_state,
-                                json.dumps(interpretation_payload, separators=(",", ":"), allow_nan=False),
-                                plan.model_dump_json(),
-                                confirm_expires,
-                                updated_ts,
-                                run_id,
-                            ),
-                        )
-                        self.database.append_audit_event(
-                            connection,
-                            session_pseudonym=principal.audit_pseudonym,
-                            event_type="RUN_STATE_CHANGED",
-                            build_version="0.1.0",
-                            run_id=run_id,
-                            state=target_state,
-                            timestamp=updated_ts,
-                            details={
+                        try:
+                            code_preview, verification_preview = _build_code_and_verification_previews(
+                                plan,
+                                validated_schema,
+                                is_synthetic_dataset=is_synthetic_dataset,
+                            )
+                        except (CodeGenError, VerificationError) as exc:
+                            plan_code, failure_state = _map_codegen_error(exc)
+                            connection.execute(
+                                """UPDATE runs SET state=?, state_version=state_version+1,
+                                    interpretation_json='{}', plan_json='{}', updated_at=? WHERE run_id=?""",
+                                (failure_state, updated_ts, run_id),
+                            )
+                            self.database.append_audit_event(
+                                connection,
+                                session_pseudonym=principal.audit_pseudonym,
+                                event_type="POLICY_DECISION",
+                                build_version="0.1.0",
+                                run_id=run_id,
+                                state=failure_state,
+                                timestamp=updated_ts,
+                                details={
+                                    "check_passed": False,
+                                    "schema_sha256": validated_schema.schema_sha256,
+                                    "plan_sha256": plan_sha,
+                                },
+                            )
+                            self.database.append_audit_event(
+                                connection,
+                                session_pseudonym=principal.audit_pseudonym,
+                                event_type="RUN_STATE_CHANGED",
+                                build_version="0.1.0",
+                                run_id=run_id,
+                                state=failure_state,
+                                timestamp=updated_ts,
+                                details={"duration_ms": duration_ms},
+                            )
+                            deferred_error = PlanningError(plan_code)
+                        else:
+                            target_state: Literal["AWAIT_CONFIRMATION", "NEEDS_CLARIFICATION"] = "AWAIT_CONFIRMATION"
+                            confirm_expires = min(principal.expires_at, updated_ts + 900)
+                            interpretation_payload = {
+                                "version": 1,
+                                "status": "PLAN_READY",
+                                "provider_mode": "SIMULATED_MOCK",
+                                "simulated_response": True,
+                                "model": planning_result.model,
                                 "schema_sha256": planning_result.schema_sha256,
                                 "plan_sha256": plan_sha,
-                            },
-                        )
+                                "code_sha256": code_preview.code_sha256,
+                                "intent_summary": plan.intent_summary,
+                                "expected_result_type": plan.expected_result_type,
+                            }
+                            connection.execute(
+                                """UPDATE runs SET state=?, state_version=state_version+1,
+                                    interpretation_json=?, plan_json=?, confirmation_expires_at=?,
+                                    updated_at=? WHERE run_id=?""",
+                                (
+                                    target_state,
+                                    json.dumps(interpretation_payload, separators=(",", ":"), allow_nan=False),
+                                    plan.model_dump_json(),
+                                    confirm_expires,
+                                    updated_ts,
+                                    run_id,
+                                ),
+                            )
+                            self.database.append_audit_event(
+                                connection,
+                                session_pseudonym=principal.audit_pseudonym,
+                                event_type="RUN_STATE_CHANGED",
+                                build_version="0.1.0",
+                                run_id=run_id,
+                                state=target_state,
+                                timestamp=updated_ts,
+                                details={
+                                    "schema_sha256": planning_result.schema_sha256,
+                                    "plan_sha256": plan_sha,
+                                    "code_sha256": code_preview.code_sha256,
+                                },
+                            )
                     else:
                         assert envelope.clarification is not None
                         clarification: AIClarificationNeeded = envelope.clarification
@@ -1015,19 +1311,22 @@ class PlanningService:
                             details={"schema_sha256": planning_result.schema_sha256},
                         )
 
-                    outcome = PlanningPreviewOutcome(
-                        run_id=run_id,
-                        session_id=principal.session_id,
-                        dataset_id=target_dataset_id,
-                        dataset_version=1,
-                        run_state=target_state,
-                        is_synthetic_dataset=is_synthetic_dataset,
-                        model=planning_result.model,
-                        question=validated_question.question,
-                        dataset_schema=validated_schema,
-                        envelope=envelope,
-                        plan_sha256=plan_sha,
-                    )
+                    if deferred_error is None:
+                        outcome = PlanningPreviewOutcome(
+                            run_id=run_id,
+                            session_id=principal.session_id,
+                            dataset_id=target_dataset_id,
+                            dataset_version=1,
+                            run_state=target_state,
+                            is_synthetic_dataset=is_synthetic_dataset,
+                            model=planning_result.model,
+                            question=validated_question.question,
+                            dataset_schema=validated_schema,
+                            envelope=envelope,
+                            plan_sha256=plan_sha,
+                            code_preview=code_preview,
+                            synthetic_verification_preview=verification_preview,
+                        )
         except (SessionError, PlanningError):
             raise
         except (sqlite3.Error, OSError, DatabaseVersionError):
@@ -1061,6 +1360,7 @@ class PlanningService:
                             state=row["state"],
                             question=row["question"],
                             plan_sha256=interp.get("plan_sha256"),
+                            code_sha256=interp.get("code_sha256"),
                             expected_result_type=interp.get("expected_result_type"),
                             intent_summary=interp.get("intent_summary"),
                             clarification_reason=interp.get("reason_code"),

@@ -37,7 +37,7 @@ PAGES: tuple[str, ...] = (
 
 SUPPORTED_OPERATIONS: tuple[tuple[str, str], ...] = (
     ("SELECT_COLUMNS", "Project an explicit subset of validated columns (col_001..col_100)"),
-    ("FILTER_ROWS", "Declarative row predicate filtering without arbitrary code eval"),
+    ("FILTER_ROWS", "Rejected in ProposedOperation.v1 compiler (UNSUPPORTED_OPERATION — typed filter predicates not defined in v1)"),
     ("DROP_MISSING", "Remove records containing missing values on required columns"),
     ("GROUP_AGGREGATE", "Group by categorical/date columns with count/sum/mean/median/min/max/std"),
     ("SUMMARY_STATS", "Compute bounded descriptive statistics over numeric columns"),
@@ -699,8 +699,10 @@ def _render_analysis_page(session: ActiveSessionView | None) -> None:
         st.error(f"Planning Request Rejected — {planning_error}")
 
     st.divider()
-    tab_plan, tab_ops, tab_validation = st.tabs([
+    tab_plan, tab_code, tab_verif, tab_ops, tab_validation = st.tabs([
         "Simulated AI Plan & Clarification Output",
+        "Deterministic Code Preview & AST Receipt",
+        "Synthetic Verification Preview (DEMO)",
         "Allowlisted Declarative Operations",
         "Sandbox & Independent Validation Gates",
     ])
@@ -735,12 +737,19 @@ def _render_analysis_page(session: ActiveSessionView | None) -> None:
                     ),
                 )
 
+            code_sha_display = (
+                latest_preview.code_preview.code_sha256
+                if latest_preview.code_preview is not None
+                else "N/A (Clarification Required)"
+            )
             st.markdown(
                 f"- **Run ID**: `{latest_preview.run_id}`  \n"
                 f"- **Dataset ID**: `{latest_preview.dataset_id}` (`is_synthetic_dataset={latest_preview.is_synthetic_dataset}`)  \n"
                 f"- **Simulated Model ID**: `{latest_preview.model}`  \n"
                 f"- **Validated Question**: `{latest_preview.question}`  \n"
-                f"- **Plan SHA-256**: `{latest_preview.plan_sha256 or 'N/A (Clarification Required)'}`"
+                f"- **Schema SHA-256**: `{latest_preview.dataset_schema.schema_sha256}`  \n"
+                f"- **Plan SHA-256**: `{latest_preview.plan_sha256 or 'N/A (Clarification Required)'}`  \n"
+                f"- **Code SHA-256**: `{code_sha_display}`"
             )
 
             if latest_preview.envelope.status == "PLAN_READY" and latest_preview.envelope.plan is not None:
@@ -785,6 +794,93 @@ def _render_analysis_page(session: ActiveSessionView | None) -> None:
                 if clar.candidate_columns:
                     st.caption(f"Candidate Columns: `{', '.join(clar.candidate_columns)}`")
 
+    with tab_code:
+        if latest_preview is None or latest_preview.code_preview is None:
+            st.info(
+                "No compiled `GeneratedCodeCandidate` preview in this view. Submit a non-ambiguous question "
+                "to compile deterministic Python source code and inspect its static `ASTValidationReceipt`."
+            )
+        else:
+            cp = latest_preview.code_preview
+            ast_rec = cp.ast_receipt
+            st.warning(
+                f"**NON-EXECUTING CODE PREVIEW (`GeneratedCodeCandidate.v1`)** &bull; "
+                f"`execution_authorized={cp.execution_authorized}` &bull; "
+                f"`sandbox_isolation_required={ast_rec.sandbox_isolation_required}` &bull; "
+                f"{ast_rec.security_notice}"
+            )
+            cm1, cm2, cm3, cm4 = st.columns(4)
+            with cm1:
+                st.metric("AST Admission", "VALID (Static)" if ast_rec.valid else "REJECTED")
+            with cm2:
+                st.metric("AST Nodes / Max Depth", f"{ast_rec.node_count} / {ast_rec.max_depth}")
+            with cm3:
+                st.metric("Execution Authorized", str(cp.execution_authorized))
+            with cm4:
+                st.metric("Declared Imports", ", ".join(cp.declared_imports))
+
+            st.markdown(
+                f"- **Bound Schema SHA-256**: `{cp.schema_sha256}`  \n"
+                f"- **Bound Plan SHA-256**: `{cp.plan_sha256}`  \n"
+                f"- **Compiled Code SHA-256**: `{cp.code_sha256}`  \n"
+                f"- **Referenced Columns**: `{', '.join(cp.referenced_columns)}`  \n"
+                f"- **Projected Output Columns**: `{', '.join(cp.output_columns)}`"
+            )
+            st.caption(
+                "SHA-256 digests verify internal payload consistency between schema, plan, and preview source only — "
+                "they are not proof of code safety or authenticated provenance."
+            )
+            st.markdown("##### Deterministic Analysis Candidate (`run_analysis(records)`)")
+            st.code(cp.python_source, language="python")
+
+    with tab_verif:
+        if latest_preview is None or latest_preview.synthetic_verification_preview is None:
+            st.info(
+                "No demonstration-only synthetic expected-result preview in this view. Submit a `PLAN_READY` "
+                "analysis question against the synthetic fixture to inspect the independent reference "
+                "expected output preview."
+            )
+        else:
+            vp = latest_preview.synthetic_verification_preview
+            st.warning(
+                f"**{vp.verification_label}** &bull; "
+                f"`demonstration_only={vp.demonstration_only}` &bull; "
+                f"`candidate_output_verified={vp.candidate_output_verified}` &bull; "
+                f"`publication_authorized={vp.publication_authorized}` &bull; "
+                f"`sandbox_execution_verified={vp.sandbox_execution_verified}`"
+            )
+            vm1, vm2, vm3, vm4 = st.columns(4)
+            with vm1:
+                st.metric("Preview Status", vp.validation_status)
+            with vm2:
+                st.metric("Candidate Output Verified", str(vp.candidate_output_verified))
+            with vm3:
+                st.metric("Publication Authorized", str(vp.publication_authorized))
+            with vm4:
+                st.metric("Expected Output Rows", str(vp.row_count))
+
+            st.markdown(
+                f"- **Expected Output SHA-256 (Consistency Digest)**: `{vp.verified_output_sha256}`  \n"
+                f"- **Bound Code SHA-256**: `{vp.code_sha256}`  \n"
+                f"- **Bound Plan SHA-256**: `{vp.plan_sha256}`  \n"
+                f"- **Bound Schema SHA-256**: `{vp.schema_sha256}`  \n"
+                f"- **Zero-Division Count**: `{vp.zero_division_count}`"
+            )
+            st.caption(
+                "Note: This table is a reference expected result computed by the pure-stdlib verifier over the "
+                "synthetic fixture. Generated candidate code was NOT executed and no candidate artifact was verified."
+            )
+            if vp.scalar_value is not None:
+                st.metric("Independent Expected Scalar Metric (DEMO ONLY)", str(vp.scalar_value))
+
+            st.markdown("##### Reference Expected Result Table (DEMO / SYNTHETIC PREVIEW)")
+            st.dataframe(list(vp.rows), width="stretch", hide_index=True)
+
+            if vp.chart_series:
+                st.markdown("##### Reference Chart Series Points (DEMO / SYNTHETIC PREVIEW)")
+                chart_rows = [{"X": pt.x, "Y": pt.y} for pt in vp.chart_series]
+                st.dataframe(chart_rows, width="stretch", hide_index=True)
+
     with tab_ops:
         ops_table = [
             {"Operation": op_code, "Permitted Semantics": desc}
@@ -796,9 +892,9 @@ def _render_analysis_page(session: ActiveSessionView | None) -> None:
         st.markdown(
             """
             1. **Plan & Column Binding**: Every `RequiredColumnRef` in `AIAnalysisPlan` must match an existing `col_XXX`, exact column name, and compatible `inferred_type`.
-            2. **Candidate Code Policy (`GeneratedCodeCandidate.v1`)**: `execution_authorized` defaults to `False`. Only allowlisted analytical imports (`pandas`, `numpy`, `matplotlib`, `math`, `statistics`, `decimal`, `datetime`, `json`, `csv`) are permitted; `os`, `sys`, `subprocess`, `socket`, `open()`, `eval()`, and `docker.sock` are rejected.
+            2. **Candidate Code Policy (`GeneratedCodeCandidate.v1`)**: `execution_authorized` defaults to `False`. Static AST validation is defense-in-depth (`sandbox_isolation_required = True`), never a replacement for container isolation.
             3. **Isolated Execution & Self-Healing**: Capped at $\\le 3$ attempts within a 180s total run budget (20s wall / 10s CPU per candidate attempt, 1 GiB RAM, 32 PIDs).
-            4. **Independent Validator**: Quarantined artifacts (`<= 10` files, `<= 10 MiB` each, `<= 20 MiB` total) must pass a fresh validator container check and verified runtime teardown before atomic publication.
+            4. **Independent Validator**: Quarantined artifacts (`<= 10` files, `<= 10 MiB` each, `<= 20 MiB` total) must pass a fresh validator container check and verified runtime teardown before atomic publication (`publication_authorized` remains `False` until sandbox evidence is verified).
             """
         )
 
@@ -833,6 +929,7 @@ def _render_history_page(session: ActiveSessionView | None) -> None:
                     "State": r.state,
                     "Provider Mode": r.provider_mode,
                     "Result / Clarification": r.expected_result_type or r.clarification_reason or "—",
+                    "Code SHA-256": (r.code_sha256[:12] + "...") if r.code_sha256 else "—",
                     "Question": r.question,
                     "Summary": r.intent_summary or "—",
                     "Updated (UTC)": _format_utc(r.updated_at),
