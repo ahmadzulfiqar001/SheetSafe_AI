@@ -116,8 +116,9 @@ def test_unsafe_archive_paths_are_rejected_without_extraction(name, tmp_path):
         # ZipInfo normalizes Windows separators while writing. Put the unsafe
         # bytes into BOTH actual ZIP headers so the fixture tests the reader.
         normalized = name.replace("\\", "/").encode()
-        assert data.count(normalized) == 2
-        data = data.replace(normalized, name.encode())
+        if data.count(normalized) == 2:
+            data = data.replace(normalized, name.encode())
+        assert data.count(name.encode()) == 2
     fails(Code.UNSAFE_ARCHIVE, data)
     assert canary.read_text() == "unchanged" and len(list(tmp_path.iterdir())) == 1
 

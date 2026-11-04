@@ -106,11 +106,15 @@ def parse_engine(version: object, info: object) -> EngineFacts:
     options = info.get("SecurityOptions")
     require(type(options) is list and len(options) <= 10 and all(type(v) is str for v in options))
     require(len(options) == len(set(options)))
-    allowed = {"name=seccomp,profile=builtin", "name=apparmor", "name=selinux", "name=cgroupns", "name=rootless", "name=userns"}
+    allowed = {"name=seccomp,profile=builtin", "name=apparmor", "name=apparmor,profile=default", "name=selinux", "name=cgroupns", "name=rootless", "name=userns"}
     if set(options) - allowed:
         issues.append("SECURITY_OPTIONS_UNSUPPORTED")
     builtin = "name=seccomp,profile=builtin" in options
-    apparmor, selinux = "name=apparmor" in options, "name=selinux" in options
+    apparmor_variants = ("name=apparmor", "name=apparmor,profile=default")
+    apparmor = any(option in options for option in apparmor_variants)
+    if sum(option in options for option in apparmor_variants) > 1:
+        issues.append("SECURITY_OPTIONS_UNSUPPORTED")
+    selinux = "name=selinux" in options
     if not builtin:
         issues.append("BUILTIN_SECCOMP_REQUIRED")
     if "name=cgroupns" not in options:
