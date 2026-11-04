@@ -7,6 +7,7 @@ network sockets.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from copy import deepcopy
 import io
 import json
@@ -37,19 +38,31 @@ from runner.engine_metadata import (
 from runner.policy import FixtureRequest, SandboxPolicy
 from runner.preflight import ImageTagMismatch
 from runner.smoke_adapter import (
+    ALL_SERVICE_ACCOUNTS,
+    CONTAINER_GUEST_GID,
+    CONTAINER_GUEST_UID,
+    DEFAULT_LOCK_FILE_NAME,
+    DEFAULT_STATE_FILE_PATH,
     DEFAULT_WALL_DEADLINE_SECONDS,
     FIXED_SMOKE_FIXTURE_ID,
+    FORBIDDEN_SERVICE_ACCOUNTS,
     MAX_LOG_BYTES_PER_STREAM,
+    OPERATOR_SERVICE_ACCOUNT,
+    PROTECTED_STATE_DIR,
     DryRunSmokeTransport,
+    LocalOperatorEnvironmentReader,
     NativeCliSmokeTransport,
     SmokeAdapter,
     SmokeAdmissionError,
     SmokeFailureCode,
     SmokeLifecycleState,
     SmokeOutcome,
+    StatFacts,
+    _DurableSmokeLedger,
     main,
     normalize_created_inspect,
     validate_runtime_inspect,
+    verify_operator_identity,
 )
 
 
@@ -71,6 +84,174 @@ def no_external_io(monkeypatch):
     assert not attempts, (
         "External I/O was attempted, even if its exception was caught"
     )
+
+
+@pytest.fixture
+def tmp_path(tmp_path: Path, monkeypatch) -> Path:
+    """Ensure pytest temp directory hierarchy has strict 0o700 permissions for ledger tests."""
+    if os.name != "nt":
+        euid = os.geteuid()
+        for candidate in (tmp_path.parent.parent, tmp_path.parent, tmp_path):
+            try:
+                if (
+                    candidate.exists()
+                    and not candidate.is_symlink()
+                    and candidate.stat().st_uid == euid
+                ):
+                    candidate.chmod(0o700)
+            except OSError:
+                pass
+        # If pytest was invoked with --basetemp inside the git repo, scope default
+        # trusted_ancestor_root to tmp_path unless explicitly overridden by the test.
+        if any((p / ".git").exists() for p in tmp_path.parents):
+            orig_init = _DurableSmokeLedger.__init__
+
+            def _patched_init(self, path, **kwargs):
+                if (
+                    kwargs.get("trusted_ancestor_root") is None
+                    and path is not None
+                    and tmp_path in Path(os.path.abspath(path)).parents
+                ):
+                    kwargs["trusted_ancestor_root"] = tmp_path
+                orig_init(self, path, **kwargs)
+
+            monkeypatch.setattr(_DurableSmokeLedger, "__init__", _patched_init)
+    else:
+        import stat as stat_mod
+
+        recorded_modes: dict[Path, int] = {}
+        recorded_symlinks: set[Path] = set()
+        recorded_hardlinks: set[Path] = set()
+        orig_os_chmod = os.chmod
+        orig_path_chmod = Path.chmod
+
+        def _win_os_chmod(p, mode, *args, **kwargs):
+            if not isinstance(p, int):
+                recorded_modes[Path(os.path.abspath(p))] = mode & 0o7777
+            return orig_os_chmod(p, mode, *args, **kwargs)
+
+        def _win_path_chmod(self_path: Path, mode: int, **kwargs):
+            recorded_modes[Path(os.path.abspath(self_path))] = mode & 0o7777
+            return orig_path_chmod(self_path, mode, **kwargs)
+
+        monkeypatch.setattr(os, "chmod", _win_os_chmod)
+        monkeypatch.setattr(Path, "chmod", _win_path_chmod)
+
+        orig_path_unlink = Path.unlink
+
+        def _win_path_unlink(self_path: Path, *args, **kwargs):
+            abs_p = Path(os.path.abspath(self_path))
+            recorded_symlinks.discard(abs_p)
+            recorded_hardlinks.discard(abs_p)
+            return orig_path_unlink(self_path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", _win_path_unlink)
+
+        abs_tmp = Path(os.path.abspath(tmp_path))
+
+        def _win_transform_stat(
+            self_reader, path: Path, raw: StatFacts
+        ) -> StatFacts:
+            abs_p = Path(os.path.abspath(path))
+            nlink = 2 if abs_p in recorded_hardlinks else raw.st_nlink
+            if abs_p in recorded_symlinks or stat_mod.S_ISLNK(raw.st_mode):
+                return StatFacts(
+                    st_mode=stat_mod.S_IFLNK | 0o777,
+                    st_uid=1000,
+                    st_gid=1000,
+                    st_nlink=nlink,
+                    st_dev=raw.st_dev,
+                    st_ino=raw.st_ino,
+                    st_file_attributes=raw.st_file_attributes | 0x400,
+                )
+            if abs_p in recorded_modes:
+                fmt = stat_mod.S_IFMT(raw.st_mode)
+                return StatFacts(
+                    st_mode=fmt | recorded_modes[abs_p],
+                    st_uid=1000,
+                    st_gid=1000,
+                    st_nlink=nlink,
+                    st_dev=raw.st_dev,
+                    st_ino=raw.st_ino,
+                    st_file_attributes=raw.st_file_attributes,
+                )
+            fmt = stat_mod.S_IFMT(raw.st_mode)
+            if stat_mod.S_ISDIR(raw.st_mode):
+                default_mode = (
+                    0o755 if abs_p in abs_tmp.parents else 0o700
+                )
+                return StatFacts(
+                    st_mode=fmt | default_mode,
+                    st_uid=1000,
+                    st_gid=1000,
+                    st_nlink=nlink,
+                    st_dev=raw.st_dev,
+                    st_ino=raw.st_ino,
+                    st_file_attributes=raw.st_file_attributes,
+                )
+            return StatFacts(
+                st_mode=fmt | 0o600,
+                st_uid=1000,
+                st_gid=1000,
+                st_nlink=nlink,
+                st_dev=raw.st_dev,
+                st_ino=raw.st_ino,
+                st_file_attributes=raw.st_file_attributes,
+            )
+
+        monkeypatch.setattr(
+            LocalOperatorEnvironmentReader,
+            "transform_stat",
+            _win_transform_stat,
+        )
+        monkeypatch.setattr(
+            LocalOperatorEnvironmentReader,
+            "_win_recorded_symlinks",
+            recorded_symlinks,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            LocalOperatorEnvironmentReader,
+            "_win_recorded_hardlinks",
+            recorded_hardlinks,
+            raising=False,
+        )
+
+        orig_init = _DurableSmokeLedger.__init__
+
+        def _patched_win_init(self, path, **kwargs):
+            if (
+                kwargs.get("trusted_ancestor_root") is None
+                and path is not None
+                and abs_tmp in Path(os.path.abspath(path)).parents
+            ):
+                kwargs["trusted_ancestor_root"] = abs_tmp
+            orig_init(self, path, **kwargs)
+
+        monkeypatch.setattr(_DurableSmokeLedger, "__init__", _patched_win_init)
+
+    return tmp_path
+
+
+def _create_symlink_for_test(
+    target: Path, link_path: Path, *, target_is_directory: bool = False
+) -> None:
+    """Create a real OS symlink on Linux (and Windows when permitted), or record symlink on Windows."""
+    if os.name != "nt":
+        os.symlink(target, link_path, target_is_directory=target_is_directory)
+        return
+    try:
+        os.symlink(target, link_path, target_is_directory=target_is_directory)
+    except OSError:
+        if target_is_directory:
+            link_path.mkdir(exist_ok=True)
+        else:
+            link_path.write_bytes(b"symlink-placeholder")
+        symlinks = getattr(
+            LocalOperatorEnvironmentReader, "_win_recorded_symlinks", None
+        )
+        if symlinks is not None:
+            symlinks.add(Path(os.path.abspath(link_path)))
 
 
 def build_native_inspect_response(
@@ -976,6 +1157,7 @@ def test_smoke_adapter_process_restart_persists_blocked_state_and_in_flight_cras
         ),
         encoding="utf-8",
     )
+    crash_state_file.chmod(0o600)
     adapter_after_crash = SmokeAdapter(docker3, state_path=crash_state_file)
     assert adapter_after_crash.admissions_blocked is True
     with pytest.raises(SmokeAdmissionError) as exc_info2:
@@ -985,6 +1167,7 @@ def test_smoke_adapter_process_restart_persists_blocked_state_and_in_flight_cras
     # 4. Corrupt state file on disk fails closed
     corrupt_state_file = tmp_path / "corrupt_state.json"
     corrupt_state_file.write_text("{corrupt-json", encoding="utf-8")
+    corrupt_state_file.chmod(0o600)
     adapter_corrupt = SmokeAdapter(docker3, state_path=corrupt_state_file)
     assert adapter_corrupt.admissions_blocked is True
 
@@ -1157,3 +1340,585 @@ def test_smoke_adapter_cli_rejects_native_execution_on_windows(
     captured = capsys.readouterr()
     assert "native Linux host" in captured.err
     assert "LSM_NOT_ADVERTISED" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Operator-Deployment Security Boundary Tests (Identity, Protected Ledger,
+# Permissions, Symlinks/Hardlinks, Process Locking, Atomic Writes & Recovery)
+# ---------------------------------------------------------------------------
+
+
+class FakeOperatorEnvReader:
+    """Configurable environment and filesystem metadata reader for operator deployment tests."""
+
+    def __init__(self) -> None:
+        self._uid = 993
+        self._euid = 993
+        self._gid = 993
+        self._egid = 993
+        self._supp_gids = {993, 998}  # 998 = docker
+        self.passwd_lines = [
+            "root:x:0:0:root:/root:/bin/bash",
+            "sheetsafe-api:x:991:991:SheetSafe API:/nonexistent:/usr/sbin/nologin",
+            "sheetsafe-ui:x:992:992:SheetSafe UI:/nonexistent:/usr/sbin/nologin",
+            "sheetsafe-runner:x:993:993:SheetSafe Runner:/nonexistent:/usr/sbin/nologin",
+            "sheetsafe-validator:x:994:994:SheetSafe Validator:/nonexistent:/usr/sbin/nologin",
+        ]
+        self.group_lines = [
+            "root:x:0:",
+            "sudo:x:27:linuxuser",
+            "wheel:x:28:",
+            "docker:x:998:sheetsafe-runner",
+            "sheetsafe-api:x:991:",
+            "sheetsafe-ui:x:992:",
+            "sheetsafe-runner:x:993:",
+            "sheetsafe-validator:x:994:",
+        ]
+        # S_IFSOCK (0o140000) | 0o660 owned by root:docker (0:998)
+        self.socket_facts = StatFacts(
+            st_mode=0o140660,
+            st_uid=0,
+            st_gid=998,
+            st_nlink=1,
+            st_dev=1,
+            st_ino=100,
+        )
+        self.path_overrides: dict[Path, Callable[[StatFacts], StatFacts]] = {}
+
+    def uid(self) -> int:
+        return self._uid
+
+    def euid(self) -> int:
+        return self._euid
+
+    def gid(self) -> int:
+        return self._gid
+
+    def egid(self) -> int:
+        return self._egid
+
+    def supplementary_gids(self) -> set[int]:
+        return set(self._supp_gids)
+
+    def passwd_text(self) -> str:
+        return "\n".join(self.passwd_lines) + "\n"
+
+    def group_text(self) -> str:
+        return "\n".join(self.group_lines) + "\n"
+
+    def socket_stat(self) -> StatFacts:
+        return self.socket_facts
+
+    def transform_stat(self, path: Path, raw: StatFacts) -> StatFacts:
+        base_reader = LocalOperatorEnvironmentReader()
+        transformed = base_reader.transform_stat(path, raw)
+        abs_p = Path(os.path.abspath(path))
+        if abs_p in self.path_overrides:
+            return self.path_overrides[abs_p](transformed)
+        return transformed
+
+
+def test_operator_identity_verification_and_service_isolation():
+    """Dedicated operator identity (`sheetsafe-runner`) and Docker socket DAC are strictly enforced."""
+    # 1. Valid dedicated operator setup succeeds
+    env = FakeOperatorEnvReader()
+    verify_operator_identity(env)
+
+    # 2. Rejects running as root (UID 0 or GID 0 or supplementary GID 0)
+    root_env = deepcopy(env)
+    root_env._uid = root_env._euid = 0
+    with pytest.raises(SmokeAdmissionError) as exc_info:
+        verify_operator_identity(root_env)
+    assert exc_info.value.code is SmokeFailureCode.OPERATOR_IDENTITY_INVALID
+
+    # 3. Rejects running as container guest identity (10001:10001)
+    guest_env = deepcopy(env)
+    guest_env._uid = guest_env._euid = CONTAINER_GUEST_UID
+    with pytest.raises(SmokeAdmissionError) as exc_info:
+        verify_operator_identity(guest_env)
+    assert exc_info.value.code is SmokeFailureCode.OPERATOR_IDENTITY_INVALID
+
+    # 4. Rejects real vs effective UID/GID mismatch
+    setuid_env = deepcopy(env)
+    setuid_env._uid = 1000
+    with pytest.raises(SmokeAdmissionError) as exc_info:
+        verify_operator_identity(setuid_env)
+    assert exc_info.value.code is SmokeFailureCode.OPERATOR_IDENTITY_INVALID
+
+    # 5. Rejects missing dedicated service accounts (e.g. validator missing)
+    missing_acct_env = deepcopy(env)
+    missing_acct_env.passwd_lines = [
+        line
+        for line in env.passwd_lines
+        if not line.startswith("sheetsafe-validator:")
+    ]
+    with pytest.raises(SmokeAdmissionError) as exc_info:
+        verify_operator_identity(missing_acct_env)
+    assert exc_info.value.code is SmokeFailureCode.OPERATOR_IDENTITY_INVALID
+
+    # 6. Rejects colliding UIDs among the 4 services or any service using UID 10001
+    colliding_env = deepcopy(env)
+    colliding_env.passwd_lines[1] = (
+        "sheetsafe-api:x:993:991:SheetSafe API:/nonexistent:/usr/sbin/nologin"
+    )
+    with pytest.raises(SmokeAdmissionError) as exc_info:
+        verify_operator_identity(colliding_env)
+    assert exc_info.value.code is SmokeFailureCode.OPERATOR_IDENTITY_INVALID
+
+    # 7. Rejects running as sheetsafe-api / sheetsafe-ui / sheetsafe-validator instead of sheetsafe-runner
+    api_env = deepcopy(env)
+    api_env._uid = api_env._euid = 991
+    api_env._gid = api_env._egid = 991
+    with pytest.raises(SmokeAdmissionError) as exc_info:
+        verify_operator_identity(api_env)
+    assert exc_info.value.code is SmokeFailureCode.OPERATOR_IDENTITY_INVALID
+
+    # 8. Rejects sheetsafe-api / sheetsafe-ui / sheetsafe-validator in docker or sudo group
+    for forbidden_svc in FORBIDDEN_SERVICE_ACCOUNTS:
+        leaked_docker_env = deepcopy(env)
+        leaked_docker_env.group_lines = [
+            f"docker:x:998:sheetsafe-runner,{forbidden_svc}"
+            if line.startswith("docker:")
+            else line
+            for line in env.group_lines
+        ]
+        with pytest.raises(SmokeAdmissionError) as exc_info:
+            verify_operator_identity(leaked_docker_env)
+        assert exc_info.value.code is SmokeFailureCode.OPERATOR_IDENTITY_INVALID
+
+    # 9. Rejects sheetsafe-runner in sudo/root/wheel group
+    sudo_runner_env = deepcopy(env)
+    sudo_runner_env.group_lines = [
+        "sudo:x:27:linuxuser,sheetsafe-runner"
+        if line.startswith("sudo:")
+        else line
+        for line in env.group_lines
+    ]
+    with pytest.raises(SmokeAdmissionError) as exc_info:
+        verify_operator_identity(sudo_runner_env)
+    assert exc_info.value.code is SmokeFailureCode.OPERATOR_IDENTITY_INVALID
+
+    # 10. Rejects world-accessible, non-root, symlinked, or non-writable Docker socket
+    for bad_sock in (
+        StatFacts(0o140666, 0, 998, 1, 1, 100),  # world read/write
+        StatFacts(0o140660, 993, 998, 1, 1, 100),  # not owned by root
+        StatFacts(0o120777, 0, 998, 1, 1, 100),  # symlink
+        StatFacts(0o100660, 0, 998, 1, 1, 100),  # regular file, not socket
+        StatFacts(0o140600, 0, 998, 1, 1, 100),  # runner cannot write socket
+    ):
+        bad_sock_env = deepcopy(env)
+        bad_sock_env.socket_facts = bad_sock
+        with pytest.raises(SmokeAdmissionError) as exc_info:
+            verify_operator_identity(bad_sock_env)
+        assert exc_info.value.code is SmokeFailureCode.OPERATOR_IDENTITY_INVALID
+
+
+def test_smoke_adapter_default_state_path_and_git_checkout_rejection(
+    tmp_path: Path,
+):
+    """Default state ledger is /var/lib/sheetsafe/runner/smoke_state.json and Git checkouts are rejected."""
+    assert PROTECTED_STATE_DIR == Path("/var/lib/sheetsafe/runner")
+    assert DEFAULT_STATE_FILE_PATH == Path(
+        "/var/lib/sheetsafe/runner/smoke_state.json"
+    )
+    assert DEFAULT_LOCK_FILE_NAME == "smoke_state.lock"
+
+    # 1. State path inside a simulated Git checkout (ancestor contains .git) is rejected fail-closed
+    fake_repo = tmp_path / "user_checkout"
+    fake_repo.mkdir(mode=0o700)
+    fake_repo.chmod(0o700)
+    (fake_repo / ".git").mkdir(mode=0o700)
+    checkout_state_dir = fake_repo / "runner_state"
+    checkout_state_dir.mkdir(mode=0o700)
+    checkout_state_dir.chmod(0o700)
+
+    fake_docker = FakeSmokeDocker()
+    adapter = SmokeAdapter(
+        fake_docker,
+        state_path=checkout_state_dir / "smoke_state.json",
+        trusted_ancestor_root=fake_repo,
+    )
+    assert adapter.admissions_blocked is True
+    with pytest.raises(SmokeAdmissionError) as exc_info:
+        adapter.run_smoke("smoke-v1", dry_run=False)
+    assert exc_info.value.code is SmokeFailureCode.STATE_STORAGE_UNSAFE
+    assert "Git checkout" in str(exc_info.value)
+    assert len(fake_docker.calls) == 0
+
+    # 2. Requiring protected root rejects any directory other than /var/lib/sheetsafe/runner
+    valid_test_dir = tmp_path / "valid_runner"
+    valid_test_dir.mkdir(mode=0o700)
+    valid_test_dir.chmod(0o700)
+    adapter_protected = SmokeAdapter(
+        fake_docker,
+        state_path=valid_test_dir / "smoke_state.json",
+        require_protected_root=True,
+    )
+    assert adapter_protected.admissions_blocked is True
+    with pytest.raises(SmokeAdmissionError) as exc_info2:
+        adapter_protected.run_smoke("smoke-v1", dry_run=False)
+    assert exc_info2.value.code is SmokeFailureCode.STATE_STORAGE_UNSAFE
+
+
+def test_smoke_adapter_rejects_weak_permissions_and_wrong_ownership(
+    tmp_path: Path,
+):
+    """Directory and file permissions and ownership are strictly validated before any admission."""
+    fake_docker = FakeSmokeDocker()
+
+    # 1. Missing state directory fails closed (never auto-created with mkdir(parents=True))
+    missing_dir = tmp_path / "does_not_exist"
+    adapter_missing = SmokeAdapter(
+        fake_docker, state_path=missing_dir / "smoke_state.json"
+    )
+    assert adapter_missing.admissions_blocked is True
+    with pytest.raises(SmokeAdmissionError) as exc_info:
+        adapter_missing.run_smoke("smoke-v1", dry_run=False)
+    assert exc_info.value.code is SmokeFailureCode.STATE_STORAGE_UNSAFE
+
+    # 2. State directory with weak permissions (0o755, 0o770, 0o777) fails closed
+    for weak_dir_mode in (0o755, 0o770, 0o777):
+        weak_dir = tmp_path / f"dir_{oct(weak_dir_mode)}"
+        weak_dir.mkdir(mode=0o700)
+        weak_dir.chmod(weak_dir_mode)
+        adapter_weak_dir = SmokeAdapter(
+            fake_docker, state_path=weak_dir / "smoke_state.json"
+        )
+        assert adapter_weak_dir.admissions_blocked is True
+        with pytest.raises(SmokeAdmissionError) as exc_info:
+            adapter_weak_dir.run_smoke("smoke-v1", dry_run=False)
+        assert exc_info.value.code is SmokeFailureCode.STATE_STORAGE_UNSAFE
+        weak_dir.chmod(0o700)
+
+    # 3. State file or lock file with weak permissions (0o644, 0o660, 0o666) fails closed
+    state_dir = tmp_path / "strict_dir"
+    state_dir.mkdir(mode=0o700)
+    state_dir.chmod(0o700)
+    state_file = state_dir / "smoke_state.json"
+    adapter_init = SmokeAdapter(fake_docker, state_path=state_file)
+    adapter_init.initialize_ledger()
+    assert state_file.exists()
+
+    for weak_file_mode in (0o644, 0o660, 0o666):
+        state_file.chmod(weak_file_mode)
+        adapter_weak_file = SmokeAdapter(fake_docker, state_path=state_file)
+        assert adapter_weak_file.admissions_blocked is True
+        with pytest.raises(SmokeAdmissionError) as exc_info:
+            adapter_weak_file.run_smoke("smoke-v1", dry_run=False)
+        assert exc_info.value.code is SmokeFailureCode.STATE_STORAGE_UNSAFE
+    state_file.chmod(0o600)
+
+    lock_file = state_dir / DEFAULT_LOCK_FILE_NAME
+    assert lock_file.exists()
+    lock_file.chmod(0o644)
+    adapter_weak_lock = SmokeAdapter(fake_docker, state_path=state_file)
+    assert adapter_weak_lock.admissions_blocked is True
+    with pytest.raises(SmokeAdmissionError) as exc_info:
+        adapter_weak_lock.run_smoke("smoke-v1", dry_run=False)
+    assert exc_info.value.code is SmokeFailureCode.STATE_STORAGE_UNSAFE
+    lock_file.chmod(0o600)
+
+    # 4. Group-writable or world-writable ancestor directory fails closed
+    bad_ancestor = tmp_path / "writable_ancestor"
+    bad_ancestor.mkdir(mode=0o700)
+    nested_runner = bad_ancestor / "runner"
+    nested_runner.mkdir(mode=0o700)
+    nested_runner.chmod(0o700)
+    for bad_anc_mode in (0o775, 0o777, 0o1777):
+        bad_ancestor.chmod(bad_anc_mode)
+        adapter_bad_anc = SmokeAdapter(
+            fake_docker,
+            state_path=nested_runner / "smoke_state.json",
+            trusted_ancestor_root=tmp_path,
+        )
+        assert adapter_bad_anc.admissions_blocked is True
+        with pytest.raises(SmokeAdmissionError) as exc_info:
+            adapter_bad_anc.run_smoke("smoke-v1", dry_run=False)
+        assert exc_info.value.code is SmokeFailureCode.STATE_STORAGE_UNSAFE
+    bad_ancestor.chmod(0o700)
+
+    # 5. Wrong owner UID/GID on state_dir or state_file or guest UID 10001 fails closed
+    env_wrong_owner = FakeOperatorEnvReader()
+    current_euid = LocalOperatorEnvironmentReader().euid()
+    current_egid = LocalOperatorEnvironmentReader().egid()
+    env_wrong_owner._uid = env_wrong_owner._euid = current_euid
+    env_wrong_owner._gid = env_wrong_owner._egid = current_egid
+    env_wrong_owner.path_overrides[Path(os.path.abspath(state_dir))] = (
+        lambda f: StatFacts(
+            f.st_mode, 99999, f.st_gid, f.st_nlink, f.st_dev, f.st_ino
+        )
+    )
+    adapter_wrong_owner = SmokeAdapter(
+        fake_docker, state_path=state_file, env_reader=env_wrong_owner
+    )
+    assert adapter_wrong_owner.admissions_blocked is True
+    with pytest.raises(SmokeAdmissionError) as exc_info:
+        adapter_wrong_owner.run_smoke("smoke-v1", dry_run=False)
+    assert exc_info.value.code is SmokeFailureCode.STATE_STORAGE_UNSAFE
+
+    env_guest = FakeOperatorEnvReader()
+    env_guest._uid = env_guest._euid = CONTAINER_GUEST_UID
+    env_guest._gid = env_guest._egid = CONTAINER_GUEST_GID
+    adapter_guest = SmokeAdapter(
+        fake_docker, state_path=state_file, env_reader=env_guest
+    )
+    assert adapter_guest.admissions_blocked is True
+    with pytest.raises(SmokeAdmissionError) as exc_info:
+        adapter_guest.run_smoke("smoke-v1", dry_run=False)
+    assert exc_info.value.code is SmokeFailureCode.OPERATOR_IDENTITY_INVALID
+    assert len(fake_docker.calls) == 0
+
+
+def test_smoke_adapter_rejects_symlinks_and_hardlinks(tmp_path: Path):
+    """Symlinked state file, lock file, state directory, ancestor directory, and hardlinks fail closed."""
+    fake_docker = FakeSmokeDocker()
+
+    real_dir = tmp_path / "real_runner"
+    real_dir.mkdir(mode=0o700)
+    real_dir.chmod(0o700)
+    outside_target = tmp_path / "outside_target.json"
+    outside_target.write_text("{}", encoding="utf-8")
+    outside_target.chmod(0o600)
+
+    # 1. Symlinked state file is rejected
+    sym_state = real_dir / "smoke_state.json"
+    _create_symlink_for_test(outside_target, sym_state)
+    adapter1 = SmokeAdapter(fake_docker, state_path=sym_state)
+    assert adapter1.admissions_blocked is True
+    with pytest.raises(SmokeAdmissionError) as exc_info:
+        adapter1.run_smoke("smoke-v1", dry_run=False)
+    assert exc_info.value.code is SmokeFailureCode.STATE_STORAGE_UNSAFE
+    sym_state.unlink()
+
+    # 2. Symlinked lock file is rejected
+    sym_lock = real_dir / DEFAULT_LOCK_FILE_NAME
+    _create_symlink_for_test(outside_target, sym_lock)
+    adapter2 = SmokeAdapter(
+        fake_docker, state_path=real_dir / "smoke_state.json"
+    )
+    assert adapter2.admissions_blocked is True
+    with pytest.raises(SmokeAdmissionError) as exc_info:
+        adapter2.run_smoke("smoke-v1", dry_run=False)
+    assert exc_info.value.code is SmokeFailureCode.STATE_STORAGE_UNSAFE
+    sym_lock.unlink()
+
+    # 3. Symlinked state directory is rejected
+    sym_dir = tmp_path / "symlinked_runner_dir"
+    _create_symlink_for_test(real_dir, sym_dir, target_is_directory=True)
+    adapter3 = SmokeAdapter(
+        fake_docker, state_path=sym_dir / "smoke_state.json"
+    )
+    assert adapter3.admissions_blocked is True
+    with pytest.raises(SmokeAdmissionError) as exc_info:
+        adapter3.run_smoke("smoke-v1", dry_run=False)
+    assert exc_info.value.code is SmokeFailureCode.STATE_STORAGE_UNSAFE
+
+    # 4. Symlinked ancestor directory is rejected
+    real_parent = tmp_path / "real_parent"
+    real_parent.mkdir(mode=0o700)
+    real_parent.chmod(0o700)
+    nested_dir = real_parent / "runner"
+    nested_dir.mkdir(mode=0o700)
+    nested_dir.chmod(0o700)
+    sym_parent = tmp_path / "sym_parent"
+    _create_symlink_for_test(real_parent, sym_parent, target_is_directory=True)
+    adapter4 = SmokeAdapter(
+        fake_docker,
+        state_path=sym_parent / "runner" / "smoke_state.json",
+        trusted_ancestor_root=tmp_path,
+    )
+    assert adapter4.admissions_blocked is True
+    with pytest.raises(SmokeAdmissionError) as exc_info:
+        adapter4.run_smoke("smoke-v1", dry_run=False)
+    assert exc_info.value.code is SmokeFailureCode.STATE_STORAGE_UNSAFE
+
+    # 5. Hardlinked state file (st_nlink > 1) is rejected
+    valid_state = real_dir / "smoke_state.json"
+    adapter_ok = SmokeAdapter(fake_docker, state_path=valid_state)
+    adapter_ok.initialize_ledger()
+    hardlink_path = tmp_path / "hardlinked_state.json"
+    win_hardlinks = getattr(
+        LocalOperatorEnvironmentReader, "_win_recorded_hardlinks", None
+    )
+    if os.name != "nt":
+        os.link(valid_state, hardlink_path)
+    else:
+        try:
+            os.link(valid_state, hardlink_path)
+        except OSError:
+            hardlink_path.write_bytes(valid_state.read_bytes())
+            if win_hardlinks is not None:
+                win_hardlinks.add(Path(os.path.abspath(valid_state)))
+    try:
+        adapter5 = SmokeAdapter(fake_docker, state_path=valid_state)
+        assert adapter5.admissions_blocked is True
+        with pytest.raises(SmokeAdmissionError) as exc_info:
+            adapter5.run_smoke("smoke-v1", dry_run=False)
+        assert exc_info.value.code is SmokeFailureCode.STATE_STORAGE_UNSAFE
+    finally:
+        if win_hardlinks is not None:
+            win_hardlinks.discard(Path(os.path.abspath(valid_state)))
+        hardlink_path.unlink()
+
+    assert len(fake_docker.calls) == 0
+
+
+def test_smoke_adapter_process_lock_prevents_concurrent_admissions(
+    tmp_path: Path,
+):
+    """Process-level lock on smoke_state.lock prevents two operator instances from admitting simultaneous jobs."""
+    state_dir = tmp_path / "lock_runner"
+    state_dir.mkdir(mode=0o700)
+    state_dir.chmod(0o700)
+    state_file = state_dir / "smoke_state.json"
+
+    docker1 = FakeSmokeDocker()
+    docker1.container_running = False
+    docker2 = FakeSmokeDocker()
+    docker2.container_running = False
+
+    adapter1 = SmokeAdapter(docker1, state_path=state_file)
+    adapter1.initialize_ledger()
+    adapter2 = SmokeAdapter(docker2, state_path=state_file)
+
+    competing_outcomes: list[SmokeFailureCode] = []
+
+    def try_concurrent_admission_during_start(self, cid):
+        # While adapter1 is mid-execution holding smoke_state.lock, adapter2 attempts admission
+        with pytest.raises(SmokeAdmissionError) as exc_info:
+            adapter2.run_smoke("smoke-v1", dry_run=False)
+        competing_outcomes.append(exc_info.value.code)
+
+    docker1.start_hook = try_concurrent_admission_during_start
+
+    r1 = adapter1.run_smoke("smoke-v1", dry_run=False)
+    assert r1.outcome is SmokeOutcome.COMPLETED
+    assert competing_outcomes == [SmokeFailureCode.JOB_ACTIVE]
+    assert len(docker2.calls) == 0
+
+    # Once adapter1 completes and releases smoke_state.lock, adapter2 can acquire it cleanly
+    docker2.counter = 10  # distinct container ID
+    r2 = adapter2.run_smoke("smoke-v1", dry_run=False)
+    assert r2.outcome is SmokeOutcome.COMPLETED
+
+
+def test_smoke_adapter_atomic_write_dir_fsync_init_and_missing_expected_state(
+    tmp_path: Path, monkeypatch
+):
+    """Atomic ledger write fsyncs file and parent directory, and missing expected state fails closed."""
+    state_dir = tmp_path / "atomic_runner"
+    state_dir.mkdir(mode=0o700)
+    state_dir.chmod(0o700)
+    state_file = state_dir / "smoke_state.json"
+
+    fsynced_fds: list[int] = []
+    orig_fsync = os.fsync
+
+    def tracking_fsync(fd: int) -> None:
+        fsynced_fds.append(fd)
+        orig_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", tracking_fsync)
+
+    # 1. require_initialized_ledger=True fails closed when smoke_state.json does not exist yet
+    docker = FakeSmokeDocker()
+    docker.container_running = False
+    uninit_adapter = SmokeAdapter(
+        docker, state_path=state_file, require_initialized_ledger=True
+    )
+    assert uninit_adapter.admissions_blocked is True
+    with pytest.raises(SmokeAdmissionError) as exc_info:
+        uninit_adapter.run_smoke("smoke-v1", dry_run=False)
+    assert exc_info.value.code is SmokeFailureCode.ADMISSIONS_BLOCKED
+    assert len(docker.calls) == 0
+
+    # 2. initialize_ledger() atomically writes IDLE state and fsyncs (file + dir on POSIX)
+    init_receipt = uninit_adapter.initialize_ledger()
+    assert init_receipt["initialized"] is True
+    assert init_receipt["status"] == "IDLE"
+    assert state_file.exists()
+    assert len(fsynced_fds) >= (2 if os.name != "nt" else 1)
+
+    # Second call to initialize_ledger() is idempotent
+    init_receipt2 = uninit_adapter.initialize_ledger()
+    assert init_receipt2["initialized"] is False
+    assert init_receipt2["status"] == "IDLE"
+
+    # Now run_smoke succeeds with require_initialized_ledger=True
+    r1 = uninit_adapter.run_smoke("smoke-v1", dry_run=False)
+    assert r1.outcome is SmokeOutcome.COMPLETED
+
+    # 3. Deleting an expected state file mid-deployment causes immediate fail-closed ADMISSIONS_BLOCKED
+    state_file.unlink()
+    assert uninit_adapter.admissions_blocked is True
+    with pytest.raises(SmokeAdmissionError) as exc_info2:
+        uninit_adapter.run_smoke("smoke-v1", dry_run=False)
+    assert exc_info2.value.code is SmokeFailureCode.ADMISSIONS_BLOCKED
+
+    # 4. initialize_ledger() refuses to overwrite a blocked/unresolved or corrupted ledger
+    state_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "status": "UNRESOLVED",
+                "blocked": True,
+                "active_job_id": "a" * 32,
+                "active_container_name": "sheetsafe-smoke-" + ("a" * 32),
+                "active_container_id": "1" * 64,
+                "failure_reason": "CLEANUP_UNRESOLVED",
+                "seen_container_ids": ["1" * 64],
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_file.chmod(0o600)
+    blocked_adapter = SmokeAdapter(docker, state_path=state_file)
+    with pytest.raises(SmokeAdmissionError) as exc_info3:
+        blocked_adapter.initialize_ledger()
+    assert exc_info3.value.code is SmokeFailureCode.ADMISSIONS_BLOCKED
+
+
+def test_operator_launcher_script_and_cli_deployment_modes(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """Verify the reviewed operator launcher script and CLI --init-state-ledger / --verify-operator-deployment flags."""
+    launcher = (
+        Path(__file__).resolve().parent.parent
+        / "scripts"
+        / "run_operator_smoke.sh"
+    )
+    assert launcher.exists()
+    raw_script = launcher.read_bytes()
+    assert b"\r\n" not in raw_script, "Launcher script must use LF line endings"
+    script_text = raw_script.decode("utf-8")
+    assert "set -euo pipefail" in script_text
+    assert "umask 0077" in script_text
+    assert 'EXPECTED_ACCOUNT="sheetsafe-runner"' in script_text
+    assert 'PROTECTED_DIR="/var/lib/sheetsafe/runner"' in script_text
+    assert (
+        'STATE_FILE="/var/lib/sheetsafe/runner/smoke_state.json"'
+        in script_text
+    )
+    assert "--verify-operator-deployment" in script_text
+    assert "--init-state-ledger" in script_text
+
+    # Test CLI --init-state-ledger on Linux with custom state file
+    monkeypatch.setattr("sys.platform", "linux")
+    state_dir = tmp_path / "cli_init_runner"
+    state_dir.mkdir(mode=0o700)
+    state_dir.chmod(0o700)
+    state_file = state_dir / "smoke_state.json"
+
+    rc = main(["--init-state-ledger", "--state-file", str(state_file)])
+    assert rc == 0
+    out_data = json.loads(capsys.readouterr().out)
+    assert out_data["initialized"] is True
+    assert out_data["status"] == "IDLE"
+    assert state_file.exists()
+
+    # Second CLI --init-state-ledger is idempotent
+    rc2 = main(["--init-state-ledger", "--state-file", str(state_file)])
+    assert rc2 == 0
+    out_data2 = json.loads(capsys.readouterr().out)
+    assert out_data2["initialized"] is False
+    assert out_data2["status"] == "IDLE"
