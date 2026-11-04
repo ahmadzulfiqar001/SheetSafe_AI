@@ -135,6 +135,43 @@ def test_unsupported_resource_capability(field):
         parse_engine(version_response(), info)
 
 
+
+@pytest.mark.parametrize("variant", [
+    "name=apparmor",
+    "name=apparmor,profile=default",
+])
+def test_supported_apparmor_metadata_formats(variant):
+    info = info_response()
+    info["SecurityOptions"] = [
+        "name=seccomp,profile=builtin", "name=cgroupns", variant,
+    ]
+    facts = parse_engine(version_response(), info)
+    assert facts.apparmor_advertised
+    assert facts.issues == ()
+
+
+@pytest.mark.parametrize("variant", [
+    "name=apparmor,profile=unconfined",
+    "name=apparmor,profile=unknown",
+    "name=apparmor,profile=",
+])
+def test_unsafe_apparmor_metadata_formats_rejected(variant):
+    info = info_response()
+    info["SecurityOptions"] = [
+        "name=seccomp,profile=builtin", "name=cgroupns", variant,
+    ]
+    facts = parse_engine(version_response(), info)
+    assert "SECURITY_OPTIONS_UNSUPPORTED" in facts.issues
+    assert not facts.apparmor_advertised
+
+
+def test_conflicting_apparmor_formats_rejected():
+    info = info_response()
+    info["SecurityOptions"].append("name=apparmor,profile=default")
+    facts = parse_engine(version_response(), info)
+    assert "SECURITY_OPTIONS_UNSUPPORTED" in facts.issues
+
+
 @pytest.mark.parametrize("options,issue", [
     (["name=cgroupns", "name=apparmor"], "BUILTIN_SECCOMP_REQUIRED"),
     (["name=seccomp,profile=unconfined", "name=apparmor"], "SECURITY_OPTIONS_UNSUPPORTED"),
