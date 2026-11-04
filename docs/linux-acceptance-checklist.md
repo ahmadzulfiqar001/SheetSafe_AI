@@ -71,7 +71,7 @@ python3 -m runner.smoke_adapter --dry-run
 # Pass condition: exits 0, reports DRY_RUN_PASSED, no containers created.
 
 # 2. Operator-authorized native container smoke test (on verified Linux host ONLY):
-python3 -m runner.smoke_adapter --execute-native-smoke-unverified --i-am-an-operator-and-i-approve-native-smoke
+python3 -m runner.smoke_adapter --execute-approved-native-smoke
 # Pass condition: exits 0, reports COMPLETED, exit_code=0, cleanup_confirmed=true.
 ```
 *Important note:* The smoke adapter strictly executes the reviewed `smoke-v1` diagnostic fixture. It does NOT enable arbitrary Python execution, user uploads, or production authorization (`execution_enabled=False`, `production_authorized=False`).
