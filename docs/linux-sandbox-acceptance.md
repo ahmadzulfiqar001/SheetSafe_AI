@@ -140,15 +140,37 @@ reason to substitute a config digest or invent a RepoDigest. Any representation
 adaptation needs explicit code review/tests. Current final image policy remains
 execution-unapproved even if static identity matches.
 
-## 4. Phase C — separately approved fixed-fixture containment
+## 4. Phase C — operator-only fixed-fixture smoke adapter implementation
 
-No runnable native execution CLI exists yet; do not invent a command or bypass
-require_execution_ready(). After host evidence is reviewed, implement one small
-operator-only fixed smoke adapter under explicit approval. It must persist its
-resource identity, enforce policy, use a watchdog and verify teardown. First
-experiment has no dynamic inputs, generated code, private uploads or artifact
-publication. Its untrusted log line is not containment evidence. This makes
-real progress without requiring the production stdin/collector amendment first.
+An operator-only, single-fixture isolated smoke adapter has been implemented in
+`runner/smoke_adapter.py` with comprehensive fake-transport unit tests in
+`tests/test_smoke_adapter.py`.
+
+**CRITICAL STATUS DISTINCTION**:
+- **Code implementation**: COMPLETED for operator-controlled fixed smoke testing.
+- **Native runtime evidence**: PENDING. No native Linux container execution has been run.
+- **SEC01–SEC10 controls**: All 10 controls remain UNVERIFIED until physical runtime evidence is captured on a verified Linux host with AppArmor enforcing.
+- `execution_enabled=False` and `production_authorized=False` remain strictly enforced.
+- No arbitrary Python, uploads, or API-triggered execution are permitted.
+- `require_execution_ready()` in `runner/policy.py` is preserved and not bypassed.
+
+Key design properties of `runner/smoke_adapter.py`:
+1. **Admissions gate**: Strictly accepts ONLY `smoke-v1`. Rejects any other fixture or arbitrary Python payload fail-closed.
+2. **Default safety**: Defaults to `--dry-run` (read-only); never contacts Docker or executes processes by default.
+3. **Execution gate**: Native execution requires running on a native Linux host (`sys.platform == 'linux'`) with two explicit operator approval flags: `--execute-native-smoke-unverified` AND `--i-am-an-operator-and-i-approve-native-smoke`. Any invocation on Windows or without both flags fails closed immediately.
+4. **Strict configuration verification**: Created containers are inspected and verified against `verify_configuration` in `runner/docker_backend.py` prior to start. Any policy deviation aborts with `POLICY_MISMATCH`.
+5. **Enforced sandbox constraints**: Preserves UID/GID 10001, `--network none`, `--read-only`, `--cap-drop ALL`, `no-new-privileges=true`, 1 vCPU, 1 GiB RAM (0 swap), 32 PIDs, `/work` (256 MiB tmpfs) and `/tmp` (64 MiB tmpfs).
+6. **Watchdog supervision**: Monotonic timer enforces 20s wall deadline and 10s cumulative CPU limit with cancellation support.
+7. **Scoped absence verification**: Teardown verifies absence against both container ID and container name. Any failure or ambiguity sets `admissions_blocked = True` permanently on the adapter instance.
+
+Operator CLI commands (for future native Linux host):
+```bash
+# Safe read-only admission check (dry run):
+python3 -m runner.smoke_adapter --dry-run
+
+# Operator-authorized native execution (only on verified Linux host):
+python3 -m runner.smoke_adapter --execute-native-smoke-unverified --i-am-an-operator-and-i-approve-native-smoke
+```
 
 Broader containment fixtures below are future reviewed fixed code, not arbitrary
 caller Python or a permission to run stress probes now. Use a disposable host,
