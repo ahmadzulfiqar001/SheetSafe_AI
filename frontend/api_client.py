@@ -27,6 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 DEFAULT_API_BASE_URL = "http://127.0.0.1:8000"
 DEFAULT_CLIENT_ORIGIN = "http://localhost:8501"
 MAX_API_RESPONSE_BYTES = 32 * 1024
+MAX_CSV_UPLOAD_BYTES = 48 * 1024
 
 
 class FrontendClientCode(StrEnum):
@@ -403,6 +404,71 @@ class SessionRunsListView(StrictFrontendModel):
     runs: tuple[PersistedRunSummaryView, ...]
 
 
+class UploadedCsvColumnInfoView(StrictFrontendModel):
+    column_id: str = Field(pattern=r"^col_[0-9]{3}$")
+    name: str = Field(min_length=1, max_length=128)
+    inferred_type: Literal["empty", "text", "integer", "number", "boolean", "date", "mixed"]
+    pandas_dtype: str = Field(min_length=1, max_length=64)
+    missing_count: int = Field(ge=0)
+    present_count: int = Field(ge=0)
+    completeness_pct: float = Field(ge=0.0, le=100.0)
+
+
+class UploadedCsvNumericSummaryView(StrictFrontendModel):
+    column_id: str = Field(pattern=r"^col_[0-9]{3}$")
+    column_name: str = Field(min_length=1, max_length=128)
+    pandas_dtype: str = Field(min_length=1, max_length=64)
+    non_null_count: int = Field(ge=0)
+    null_count: int = Field(ge=0)
+    total_sum: float
+    mean_value: float
+    median_value: float
+    std_value: float = Field(ge=0.0)
+    min_value: float
+    max_value: float
+
+
+class UploadedCsvChartPointView(StrictFrontendModel):
+    x: str | int | float | bool
+    y: float
+
+
+class UploadedCsvChartSpecView(StrictFrontendModel):
+    chart_kind: Literal["BAR", "LINE"]
+    chart_title: str = Field(min_length=1, max_length=160)
+    x_label: str = Field(min_length=1, max_length=128)
+    y_label: str = Field(min_length=1, max_length=128)
+    aggregation: Literal["sum", "value", "count"]
+    series: tuple[UploadedCsvChartPointView, ...]
+
+
+class UploadedCsvAnalyticsView(StrictFrontendModel):
+    version: Literal[1] = 1
+    dataset_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    session_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    filename: str = Field(min_length=5, max_length=128)
+    byte_count: int = Field(ge=1, le=MAX_CSV_UPLOAD_BYTES)
+    source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    schema_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    delimiter: Literal[",", ";", "\t"]
+    row_count: int = Field(ge=1)
+    column_count: int = Field(ge=1, le=100)
+    nonempty_cells: int = Field(ge=1)
+    total_missing_cells: int = Field(ge=0)
+    dataset_completeness_pct: float = Field(ge=0.0, le=100.0)
+    is_synthetic_fixture: Literal[False] = False
+    execution_mode: Literal["DETERMINISTIC_PANDAS_HOST"] = "DETERMINISTIC_PANDAS_HOST"
+    ai_code_executed: Literal[False] = False
+    columns: tuple[UploadedCsvColumnInfoView, ...]
+    preview_headers: tuple[str, ...]
+    preview_rows: tuple[tuple[str, ...], ...]
+    numeric_summaries: tuple[UploadedCsvNumericSummaryView, ...]
+    chart: UploadedCsvChartSpecView
+    warnings: tuple[str, ...] = ()
+    request_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+
+
+
 @dataclass(slots=True)
 class _SealedSessionJar:
     """Opaque in-memory holder for the HttpOnly session cookie and CSRF token.
@@ -642,6 +708,7 @@ class SheetSafeApiClient:
             403: FrontendClientCode.FORBIDDEN,
             404: FrontendClientCode.NOT_FOUND,
             409: FrontendClientCode.CONFLICT,
+            413: FrontendClientCode.INVALID_REQUEST,
             422: FrontendClientCode.UNPROCESSABLE_REQUEST,
             429: FrontendClientCode.RATE_LIMITED,
             502: FrontendClientCode.UPSTREAM_CONTRACT_ERROR,
@@ -936,6 +1003,124 @@ class SheetSafeApiClient:
             raise FrontendClientError(
                 FrontendClientCode.MALFORMED_RESPONSE,
                 "Backend returned an invalid runs list schema.",
+            ) from None
+
+    def upload_csv_for_analytics(
+        self,
+        *,
+        filename: str,
+        content: bytes | str,
+        delimiter: str | None = None,
+    ) -> UploadedCsvAnalyticsView:
+        """Upload a CSV payload to POST /api/v1/planning/csv-analytics for deterministic pandas analytics."""
+        jar = self._require_sealed_session()
+        if type(filename) is not str or not filename.strip():
+            raise FrontendClientError(
+                FrontendClientCode.INVALID_REQUEST,
+                "Filename must be a non-empty .csv file name.",
+            )
+        cleaned_filename = filename.strip()
+        if (
+            len(cleaned_filename) < 5
+            or len(cleaned_filename) > 128
+            or not cleaned_filename.lower().endswith(".csv")
+            or "/" in cleaned_filename
+            or "\\" in cleaned_filename
+            or ".." in cleaned_filename
+            or ":" in cleaned_filename
+        ):
+            raise FrontendClientError(
+                FrontendClientCode.INVALID_REQUEST,
+                "Filename must be a valid .csv file name without path separators.",
+            )
+
+        if type(content) is bytes:
+            raw_bytes = content
+            if len(raw_bytes) == 0 or not raw_bytes.strip():
+                raise FrontendClientError(
+                    FrontendClientCode.INVALID_REQUEST,
+                    "Uploaded CSV file is empty.",
+                )
+            if len(raw_bytes) > MAX_CSV_UPLOAD_BYTES:
+                raise FrontendClientError(
+                    FrontendClientCode.INVALID_REQUEST,
+                    f"Uploaded CSV file exceeds maximum size ({MAX_CSV_UPLOAD_BYTES} bytes).",
+                )
+            if b"\x00" in raw_bytes:
+                raise FrontendClientError(
+                    FrontendClientCode.INVALID_REQUEST,
+                    "Uploaded CSV file must be valid UTF-8 text without binary NUL bytes.",
+                )
+            try:
+                csv_text = raw_bytes.decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                raise FrontendClientError(
+                    FrontendClientCode.INVALID_REQUEST,
+                    "Uploaded CSV file must be valid UTF-8 text.",
+                ) from None
+        elif type(content) is str:
+            if not content.strip():
+                raise FrontendClientError(
+                    FrontendClientCode.INVALID_REQUEST,
+                    "Uploaded CSV file is empty.",
+                )
+            try:
+                raw_bytes = content.encode("utf-8", errors="strict")
+            except UnicodeEncodeError:
+                raise FrontendClientError(
+                    FrontendClientCode.INVALID_REQUEST,
+                    "Uploaded CSV file must be valid UTF-8 text.",
+                ) from None
+            if len(raw_bytes) > MAX_CSV_UPLOAD_BYTES:
+                raise FrontendClientError(
+                    FrontendClientCode.INVALID_REQUEST,
+                    f"Uploaded CSV file exceeds maximum size ({MAX_CSV_UPLOAD_BYTES} bytes).",
+                )
+            csv_text = content
+        else:
+            raise FrontendClientError(
+                FrontendClientCode.INVALID_REQUEST,
+                "CSV content must be UTF-8 bytes or text.",
+            )
+
+        cookie_header = f"{jar.view.cookie_name}={jar._cookie_value.get_secret_value()}"
+        body: dict[str, object] = {
+            "filename": cleaned_filename,
+            "csv_text": csv_text,
+        }
+        if delimiter is not None:
+            body["delimiter"] = delimiter
+
+        status_code, headers, raw = self._request_raw(
+            "POST",
+            "/api/v1/planning/csv-analytics",
+            headers={
+                "Origin": self._client_origin,
+                "X-CSRF-Token": jar._csrf_token.get_secret_value(),
+                "Cookie": cookie_header,
+            },
+            json_body=body,
+        )
+        if status_code != 200:
+            if status_code == 401:
+                self._sealed_session = None
+            self._raise_api_error(status_code, headers, raw)
+
+        payload = _coerce_tuples(self._parse_json(raw))
+        if type(payload) is not dict:
+            raise FrontendClientError(
+                FrontendClientCode.MALFORMED_RESPONSE,
+                "Invalid CSV analytics payload.",
+            )
+        try:
+            return UploadedCsvAnalyticsView.model_validate({
+                **payload,
+                "request_id": headers.get("X-Request-ID"),
+            })
+        except Exception:
+            raise FrontendClientError(
+                FrontendClientCode.MALFORMED_RESPONSE,
+                "Backend returned an invalid CSV analytics schema.",
             ) from None
 
     def submit_dataset_upload(self, *_args: object, **_kwargs: object) -> None:

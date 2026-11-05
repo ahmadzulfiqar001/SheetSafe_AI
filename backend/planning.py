@@ -52,6 +52,16 @@ from backend.security.sessions import SessionError, SessionPrincipal, require_ac
 from backend.storage.database import Database, DatabaseVersionError
 from backend.storage.files import PrivateStorage
 from ingestion.contracts import ColumnProfile, DatasetProfile
+from validator.csv_analytics import (
+    CsvAnalyticsCode,
+    CsvAnalyticsError,
+    MAX_CSV_UPLOAD_BYTES,
+    UploadedCsvChartPoint,
+    UploadedCsvChartSpec,
+    UploadedCsvColumnInfo,
+    UploadedCsvNumericSummary,
+    compute_validated_csv_analytics,
+)
 from validator.numerical_verifier import (
     SyntheticTableFixture,
     VerificationError,
@@ -191,6 +201,13 @@ class PlanningCode(StrEnum):
     PROVIDER_TIMEOUT = "PROVIDER_TIMEOUT"
     RATE_LIMITED = "RATE_LIMITED"
     PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
+    EMPTY_CSV_UPLOAD = "EMPTY_CSV_UPLOAD"
+    CSV_PAYLOAD_TOO_LARGE = "CSV_PAYLOAD_TOO_LARGE"
+    INVALID_CSV_FILENAME = "INVALID_CSV_FILENAME"
+    INVALID_UTF8_ENCODING = "INVALID_UTF8_ENCODING"
+    MALFORMED_CSV_CONTENT = "MALFORMED_CSV_CONTENT"
+    AMBIGUOUS_CSV_DELIMITER = "AMBIGUOUS_CSV_DELIMITER"
+    CSV_SCHEMA_LIMIT_EXCEEDED = "CSV_SCHEMA_LIMIT_EXCEEDED"
 
 
 PLANNING_ERROR_TABLE: dict[PlanningCode, tuple[int, str, bool]] = {
@@ -258,6 +275,41 @@ PLANNING_ERROR_TABLE: dict[PlanningCode, tuple[int, str, bool]] = {
         503,
         "AI inference provider is currently unavailable.",
         True,
+    ),
+    PlanningCode.EMPTY_CSV_UPLOAD: (
+        400,
+        "Uploaded CSV file is empty or contains no data rows.",
+        False,
+    ),
+    PlanningCode.CSV_PAYLOAD_TOO_LARGE: (
+        413,
+        "Uploaded CSV file exceeds the maximum allowed size (48 KiB).",
+        False,
+    ),
+    PlanningCode.INVALID_CSV_FILENAME: (
+        400,
+        "Filename must be a valid .csv file name without path separators.",
+        False,
+    ),
+    PlanningCode.INVALID_UTF8_ENCODING: (
+        400,
+        "Uploaded CSV file must be valid UTF-8 text.",
+        False,
+    ),
+    PlanningCode.MALFORMED_CSV_CONTENT: (
+        422,
+        "Uploaded CSV file is malformed, has inconsistent columns, or invalid headers.",
+        False,
+    ),
+    PlanningCode.AMBIGUOUS_CSV_DELIMITER: (
+        422,
+        "Uploaded CSV delimiter is ambiguous; specify comma, semicolon, or tab.",
+        False,
+    ),
+    PlanningCode.CSV_SCHEMA_LIMIT_EXCEEDED: (
+        422,
+        "Uploaded CSV exceeds column, row, or cell length limits.",
+        False,
     ),
 }
 
@@ -451,6 +503,34 @@ class PersistedRunSummary(StrictPlanningContract):
     clarification_reason: str | None = None
     created_at: int = Field(gt=0)
     updated_at: int = Field(gt=0)
+
+
+class UploadedCsvAnalyticsOutcome(StrictPlanningContract):
+    """Validated, persisted deterministic pandas CSV analytics response."""
+
+    version: Literal[1] = 1
+    dataset_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    session_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    filename: str = Field(min_length=5, max_length=128)
+    byte_count: int = Field(ge=1, le=MAX_CSV_UPLOAD_BYTES)
+    source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    schema_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    delimiter: Literal[",", ";", "\t"]
+    row_count: int = Field(ge=1)
+    column_count: int = Field(ge=1, le=100)
+    nonempty_cells: int = Field(ge=1)
+    total_missing_cells: int = Field(ge=0)
+    dataset_completeness_pct: float = Field(ge=0.0, le=100.0)
+    is_synthetic_fixture: Literal[False] = False
+    execution_mode: Literal["DETERMINISTIC_PANDAS_HOST"] = "DETERMINISTIC_PANDAS_HOST"
+    ai_code_executed: Literal[False] = False
+    columns: tuple[UploadedCsvColumnInfo, ...]
+    preview_headers: tuple[str, ...]
+    preview_rows: tuple[tuple[str, ...], ...]
+    numeric_summaries: tuple[UploadedCsvNumericSummary, ...]
+    chart: UploadedCsvChartSpec
+    warnings: tuple[str, ...] = ()
+
 
 
 def build_deterministic_mock_transport() -> httpx.MockTransport:
@@ -1981,3 +2061,173 @@ class PlanningService:
             raise
         except (sqlite3.Error, OSError, DatabaseVersionError):
             raise SessionError(503) from None
+
+    def analyze_uploaded_csv(
+        self,
+        principal: SessionPrincipal,
+        *,
+        filename: str,
+        csv_bytes: bytes,
+        delimiter: str | None = None,
+    ) -> UploadedCsvAnalyticsOutcome:
+        """Validate an uploaded CSV file, compute deterministic pandas analytics, and persist metadata."""
+        try:
+            with self.database.connection() as connection:
+                require_active_session(connection, principal)
+                now = self.database.now()
+                window_start = now - 60
+                recent_datasets = connection.execute(
+                    "SELECT COUNT(*) FROM datasets WHERE session_id=? AND created_at>=?",
+                    (principal.session_id, window_start),
+                ).fetchone()[0]
+                if recent_datasets >= max(5, self.settings.planning_requests_per_session_per_minute * 2):
+                    raise PlanningError(PlanningCode.RATE_LIMITED, retry_after=60)
+                total_datasets = connection.execute(
+                    "SELECT COUNT(*) FROM datasets WHERE session_id=?",
+                    (principal.session_id,),
+                ).fetchone()[0]
+                if total_datasets >= max(10, self.settings.max_runs_per_session * 2):
+                    raise PlanningError(PlanningCode.RATE_LIMITED, retry_after=60)
+        except (SessionError, PlanningError):
+            raise
+        except (sqlite3.Error, OSError, DatabaseVersionError):
+            raise SessionError(503) from None
+
+        started_mono = time.monotonic()
+        try:
+            bundle = compute_validated_csv_analytics(
+                filename=filename,
+                raw_bytes=csv_bytes,
+                delimiter=delimiter,
+            )
+        except CsvAnalyticsError as exc:
+            raise PlanningError(_map_csv_analytics_error(exc.code)) from None
+
+        try:
+            validated_schema = build_validated_dataset_schema(bundle.profile)
+        except InferenceError as exc:
+            plan_code, _ = _map_inference_error(exc)
+            raise PlanningError(plan_code) from None
+
+        duration_ms = max(0, int((time.monotonic() - started_mono) * 1000))
+
+        # Store in session's PrivateStorage under 'snapshot' category so it is cleaned up
+        # on session revocation without conflicting with the synthetic 'original' slot.
+        stored = self.storage.store(
+            principal,
+            category="snapshot",
+            file_type="csv",
+            chunks=[csv_bytes],
+            byte_count=bundle.byte_count,
+        )
+
+        dataset_id = uuid4().hex
+        idempotency_key = f"uploaded-csv:{dataset_id}"
+        parsing_settings = json.dumps(
+            {
+                "filename_sha256": hashlib.sha256(
+                    bundle.filename.encode("utf-8")
+                ).hexdigest(),
+                "delimiter": bundle.delimiter,
+                "deterministic_pandas": True,
+            },
+            separators=(",", ":"),
+        )
+        profile_json = bundle.profile.model_dump_json()
+        fingerprint = hashlib.sha256(
+            f"{stored.object_id}:{parsing_settings}".encode("utf-8")
+        ).hexdigest()
+
+        try:
+            with self.database.transaction() as connection:
+                require_active_session(connection, principal)
+                now = self.database.now()
+                connection.execute(
+                    """INSERT INTO datasets(
+                        dataset_id, session_id, source_sha256, storage_ref,
+                        file_type, byte_count, idempotency_key, request_sha256, created_at
+                    ) VALUES (?, ?, ?, ?, 'csv', ?, ?, ?, ?)""",
+                    (
+                        dataset_id,
+                        principal.session_id,
+                        stored.sha256,
+                        stored.object_id,
+                        stored.byte_count,
+                        idempotency_key,
+                        fingerprint,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """INSERT INTO dataset_versions(
+                        dataset_id, version, session_id, parsing_settings_json,
+                        profile_json, state, created_at
+                    ) VALUES (?, 1, ?, ?, ?, 'READY', ?)""",
+                    (
+                        dataset_id,
+                        principal.session_id,
+                        parsing_settings,
+                        profile_json,
+                        now,
+                    ),
+                )
+                self.database.append_audit_event(
+                    connection,
+                    session_pseudonym=principal.audit_pseudonym,
+                    event_type="DATASET_CREATED",
+                    build_version="0.1.0",
+                    timestamp=now,
+                    details={
+                        "byte_count": stored.byte_count,
+                        "source_sha256": stored.sha256,
+                    },
+                )
+                self.database.append_audit_event(
+                    connection,
+                    session_pseudonym=principal.audit_pseudonym,
+                    event_type="DATASET_PROFILED",
+                    build_version="0.1.0",
+                    timestamp=now,
+                    details={
+                        "schema_sha256": validated_schema.schema_sha256,
+                        "duration_ms": duration_ms,
+                    },
+                )
+        except (SessionError, PlanningError):
+            raise
+        except (sqlite3.Error, OSError, DatabaseVersionError):
+            raise SessionError(503) from None
+
+        return UploadedCsvAnalyticsOutcome(
+            dataset_id=dataset_id,
+            session_id=principal.session_id,
+            filename=bundle.filename,
+            byte_count=bundle.byte_count,
+            source_sha256=bundle.source_sha256,
+            schema_sha256=validated_schema.schema_sha256,
+            delimiter=bundle.delimiter,
+            row_count=bundle.row_count,
+            column_count=bundle.column_count,
+            nonempty_cells=bundle.nonempty_cells,
+            total_missing_cells=bundle.total_missing_cells,
+            dataset_completeness_pct=bundle.dataset_completeness_pct,
+            columns=bundle.columns,
+            preview_headers=bundle.preview_headers,
+            preview_rows=bundle.preview_rows,
+            numeric_summaries=bundle.numeric_summaries,
+            chart=bundle.chart,
+            warnings=bundle.warnings,
+        )
+
+
+def _map_csv_analytics_error(code: CsvAnalyticsCode) -> PlanningCode:
+    mapping: dict[CsvAnalyticsCode, PlanningCode] = {
+        CsvAnalyticsCode.EMPTY_CSV_UPLOAD: PlanningCode.EMPTY_CSV_UPLOAD,
+        CsvAnalyticsCode.CSV_PAYLOAD_TOO_LARGE: PlanningCode.CSV_PAYLOAD_TOO_LARGE,
+        CsvAnalyticsCode.INVALID_CSV_FILENAME: PlanningCode.INVALID_CSV_FILENAME,
+        CsvAnalyticsCode.INVALID_UTF8_ENCODING: PlanningCode.INVALID_UTF8_ENCODING,
+        CsvAnalyticsCode.MALFORMED_CSV_CONTENT: PlanningCode.MALFORMED_CSV_CONTENT,
+        CsvAnalyticsCode.AMBIGUOUS_CSV_DELIMITER: PlanningCode.AMBIGUOUS_CSV_DELIMITER,
+        CsvAnalyticsCode.CSV_SCHEMA_LIMIT_EXCEEDED: PlanningCode.CSV_SCHEMA_LIMIT_EXCEEDED,
+    }
+    return mapping.get(code, PlanningCode.MALFORMED_CSV_CONTENT)

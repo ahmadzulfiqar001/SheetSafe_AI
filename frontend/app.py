@@ -13,6 +13,7 @@ are never exposed.
 """
 
 from datetime import datetime, timezone
+import hashlib
 import os
 import time
 
@@ -24,10 +25,12 @@ from frontend.api_client import (
     DEFAULT_API_BASE_URL,
     DEFAULT_CLIENT_ORIGIN,
     FrontendClientError,
+    MAX_CSV_UPLOAD_BYTES,
     PlanningPreviewView,
     SessionDeletionReceiptView,
     SheetSafeApiClient,
     SyntheticDatasetView,
+    UploadedCsvAnalyticsView,
 )
 
 
@@ -195,6 +198,12 @@ def _init_state() -> None:
         st.session_state["last_deletion_receipt"] = None
     if "synthetic_dataset" not in st.session_state:
         st.session_state["synthetic_dataset"] = None
+    if "uploaded_csv_analytics" not in st.session_state:
+        st.session_state["uploaded_csv_analytics"] = None
+    if "csv_analytics_error" not in st.session_state:
+        st.session_state["csv_analytics_error"] = None
+    if "last_auto_uploaded_csv_key" not in st.session_state:
+        st.session_state["last_auto_uploaded_csv_key"] = None
     if "latest_plan_preview" not in st.session_state:
         st.session_state["latest_plan_preview"] = None
     if "planning_error" not in st.session_state:
@@ -206,6 +215,9 @@ def _init_state() -> None:
 def _clear_ephemeral_session_views() -> None:
     """Clear session-scoped dataset and planning views upon revocation or expiry."""
     st.session_state["synthetic_dataset"] = None
+    st.session_state["uploaded_csv_analytics"] = None
+    st.session_state["csv_analytics_error"] = None
+    st.session_state["last_auto_uploaded_csv_key"] = None
     st.session_state["latest_plan_preview"] = None
     st.session_state["planning_error"] = None
 
@@ -228,7 +240,7 @@ def _enforce_session_view_binding(client: SheetSafeApiClient) -> ActiveSessionVi
         )
         return None
     active_id = session.session_id if session is not None else None
-    for key in ("latest_plan_preview", "synthetic_dataset"):
+    for key in ("latest_plan_preview", "synthetic_dataset", "uploaded_csv_analytics"):
         cached = st.session_state.get(key)
         if cached is not None and getattr(cached, "session_id", None) != active_id:
             _clear_ephemeral_session_views()
@@ -576,16 +588,133 @@ def _render_datasets_page(snapshot: BackendStatusSnapshot, session: ActiveSessio
         st.dataframe(limits_table, width="stretch", hide_index=True)
 
     st.divider()
-    st.markdown("#### Active Session Datasets & Synthetic Demonstration Fixture")
+    st.markdown("#### Upload CSV for Deterministic Pandas Analytics (Active MVP Workflow)")
+    st.caption(
+        f"Upload a real UTF-8 `.csv` dataset (up to {MAX_CSV_UPLOAD_BYTES // 1024} KiB) to FastAPI "
+        "`POST /api/v1/planning/csv-analytics`. Uses **deterministic, validated pandas operations only** "
+        "(`execution_mode=DETERMINISTIC_PANDAS_HOST`, `ai_code_executed=False`). "
+        "AI-generated Python execution remains disabled."
+    )
+
+    csv_controls_disabled = session is None or not snapshot.readiness_ok
+    col_csv_up, col_csv_delim = st.columns([3, 1])
+    with col_csv_up:
+        uploaded_csv_file = st.file_uploader(
+            "Upload CSV File for Deterministic Pandas Analytics (.csv)",
+            type=["csv"],
+            disabled=csv_controls_disabled,
+            key="csv_analytics_file_uploader",
+            help="Select a UTF-8 .csv file (max 48 KiB) to compute validated row/column counts, column types, first rows, missing-value counts, numeric summaries, and a chart.",
+        )
+    with col_csv_delim:
+        delim_label = st.selectbox(
+            "CSV Delimiter",
+            options=["Auto-detect (, ; or tab)", "Comma (,)", "Semicolon (;)", "Tab (\\t)"],
+            index=0,
+            disabled=csv_controls_disabled,
+            key="csv_analytics_delimiter_select",
+        )
+
+    delim_map: dict[str, str | None] = {
+        "Auto-detect (, ; or tab)": None,
+        "Comma (,)": ",",
+        "Semicolon (;)": ";",
+        "Tab (\\t)": "\t",
+    }
+    selected_delimiter = delim_map.get(delim_label)
+
+    with st.expander("Or Paste / Edit CSV Content Directly (.csv)", expanded=False):
+        manual_csv_filename = st.text_input(
+            "CSV Filename (.csv)",
+            value="uploaded_dataset.csv",
+            max_chars=128,
+            disabled=csv_controls_disabled,
+            key="csv_manual_filename_input",
+        )
+        manual_csv_content = st.text_area(
+            "CSV Content (UTF-8)",
+            value="",
+            height=120,
+            placeholder="date,region,revenue_usd,units\n2025-01-15,North,12500.50,40\n2025-02-15,South,9800.00,32\n",
+            disabled=csv_controls_disabled,
+            key="csv_manual_text_input",
+        )
+
+    run_csv_analytics_clicked = st.button(
+        "Upload & Analyze CSV (Deterministic Pandas)",
+        key="btn_upload_analyze_csv",
+        type="primary",
+        disabled=csv_controls_disabled,
+        width="stretch",
+    )
+
+    if session is not None and snapshot.readiness_ok:
+        client_csv: SheetSafeApiClient = st.session_state["api_client"]
+        should_execute_csv = False
+        target_filename = ""
+        target_content: bytes | str = b""
+
+        if uploaded_csv_file is not None:
+            raw_uploaded_bytes = uploaded_csv_file.getvalue()
+            target_filename = uploaded_csv_file.name
+            target_content = raw_uploaded_bytes
+            auto_upload_key = (
+                f"{session.session_id}:{target_filename}:"
+                f"{hashlib.sha256(raw_uploaded_bytes).hexdigest()}:{selected_delimiter}"
+            )
+            if (
+                run_csv_analytics_clicked
+                or st.session_state.get("last_auto_uploaded_csv_key") != auto_upload_key
+            ):
+                st.session_state["last_auto_uploaded_csv_key"] = auto_upload_key
+                should_execute_csv = True
+        elif run_csv_analytics_clicked:
+            target_filename = manual_csv_filename
+            target_content = manual_csv_content
+            should_execute_csv = True
+
+        if should_execute_csv:
+            try:
+                with st.spinner("Validating CSV and running deterministic pandas analytics via FastAPI..."):
+                    analytics_view = client_csv.upload_csv_for_analytics(
+                        filename=target_filename,
+                        content=target_content,
+                        delimiter=selected_delimiter,
+                    )
+                st.session_state["uploaded_csv_analytics"] = analytics_view
+                st.session_state["csv_analytics_error"] = None
+                _record_activity(
+                    "CSV_ANALYTICS_COMPLETED",
+                    f"File {analytics_view.filename} ({analytics_view.row_count}x{analytics_view.column_count}) dataset={analytics_view.dataset_id[:8]}...",
+                    analytics_view.request_id,
+                )
+                st.rerun()
+            except FrontendClientError as exc:
+                if exc.status_code == 401:
+                    _clear_ephemeral_session_views()
+                err_code = exc.backend_code or exc.code.value
+                st.session_state["csv_analytics_error"] = f"{err_code}: {exc.safe_message}"
+                st.session_state["ui_notice"] = ("error", f"{err_code}: {exc.safe_message}")
+                st.rerun()
+
+    csv_err: str | None = st.session_state.get("csv_analytics_error")
+    if csv_err:
+        st.error(f"**CSV Upload / Validation Rejected:** {csv_err}")
+
+    uploaded_csv_view: UploadedCsvAnalyticsView | None = st.session_state.get("uploaded_csv_analytics")
+    if uploaded_csv_view is not None:
+        _render_uploaded_csv_analytics_view(uploaded_csv_view)
+
+    st.divider()
+    st.markdown("#### Active Session Datasets & Synthetic Demonstration Fixture (DEMO Mode)")
     if session is None:
         st.info("No active session. Start a synthetic session to view session-scoped dataset state.")
     else:
         syn_ds: SyntheticDatasetView | None = st.session_state.get("synthetic_dataset")
         if syn_ds is None:
             st.info(
-                f"Session `{session.session_id[:12]}...` has **0 user datasets** (`private_uploads_enabled=False`). "
-                "You can provision the server-owned synthetic demonstration dataset in the **AI Analysis** tab "
-                "when `SHEETSAFE_SYNTHETIC_PLANNING_ENABLED=true`."
+                f"Session `{session.session_id[:12]}...` has **0 user datasets** in the isolated Docker parser queue (`private_uploads_enabled=False`). "
+                "You can upload a CSV above for deterministic host pandas analytics, or provision the server-owned synthetic demonstration dataset (**DEMO / SYNTHETIC** mode) below."
             )
             if st.button(
                 "Provision Synthetic Demo Dataset Schema",
@@ -625,6 +754,101 @@ def _render_datasets_page(snapshot: BackendStatusSnapshot, session: ActiveSessio
                 for col in syn_ds.dataset_schema.columns
             ]
             st.dataframe(cols_rows, width="stretch", hide_index=True)
+
+
+def _render_uploaded_csv_analytics_view(csv_view: UploadedCsvAnalyticsView) -> None:
+    """Render deterministic pandas analytics for an uploaded CSV dataset."""
+    st.success(
+        f"**Uploaded CSV Analytics Ready (`{csv_view.filename}`)** — "
+        f"`dataset_id={csv_view.dataset_id}`, `byte_count={csv_view.byte_count}`, "
+        f"`delimiter={csv_view.delimiter!r}`, `execution_mode={csv_view.execution_mode}`, "
+        f"`ai_code_executed={csv_view.ai_code_executed}`."
+    )
+
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("Uploaded Row Count", str(csv_view.row_count))
+    with m2:
+        st.metric("Uploaded Column Count", str(csv_view.column_count))
+    with m3:
+        st.metric("Total Missing Cells", str(csv_view.total_missing_cells))
+    with m4:
+        st.metric("Dataset Completeness", f"{csv_view.dataset_completeness_pct:.2f}%")
+
+    st.caption(
+        f"Source SHA-256: `{csv_view.source_sha256}` &bull; "
+        f"Schema SHA-256: `{csv_view.schema_sha256}` &bull; "
+        f"Non-empty cells (incl. header): `{csv_view.nonempty_cells}`"
+    )
+
+    if csv_view.warnings:
+        for warn_msg in csv_view.warnings:
+            st.warning(f"CSV Parser Notice: {warn_msg}")
+
+    st.markdown("##### 1. Column Names, Data Types & Missing-Value Counts")
+    col_schema_table = [
+        {
+            "Column ID": col.column_id,
+            "Column Name": col.name,
+            "Inferred Type": col.inferred_type,
+            "Pandas Dtype": col.pandas_dtype,
+            "Missing Count": col.missing_count,
+            "Present Count": col.present_count,
+            "Completeness (%)": f"{col.completeness_pct:.2f}%",
+        }
+        for col in csv_view.columns
+    ]
+    st.dataframe(col_schema_table, width="stretch", hide_index=True)
+
+    st.markdown(
+        f"##### 2. First Few Rows (Showing {len(csv_view.preview_rows)} of {csv_view.row_count} Rows)"
+    )
+    preview_dicts = [
+        {
+            f"{csv_view.preview_headers[idx]} ({csv_view.columns[idx].column_id})": (
+                row[idx] if idx < len(row) else ""
+            )
+            for idx in range(len(csv_view.preview_headers))
+        }
+        for row in csv_view.preview_rows
+    ]
+    st.dataframe(preview_dicts, width="stretch", hide_index=True)
+
+    st.markdown("##### 3. Numerical Summaries (Deterministic Pandas)")
+    if csv_view.numeric_summaries:
+        num_summary_table = [
+            {
+                "Column ID": ns.column_id,
+                "Column Name": ns.column_name,
+                "Pandas Dtype": ns.pandas_dtype,
+                "Non-Null Count": ns.non_null_count,
+                "Missing Count": ns.null_count,
+                "Sum": ns.total_sum,
+                "Mean": ns.mean_value,
+                "Median": ns.median_value,
+                "Std Dev": ns.std_value,
+                "Min": ns.min_value,
+                "Max": ns.max_value,
+            }
+            for ns in csv_view.numeric_summaries
+        ]
+        st.dataframe(num_summary_table, width="stretch", hide_index=True)
+    else:
+        st.info("No numeric (`integer` or `number`) columns detected in the uploaded CSV.")
+
+    chart = csv_view.chart
+    st.markdown(f"##### 4. Uploaded Dataset Chart — {chart.chart_title} ({chart.chart_kind})")
+    if chart.series:
+        chart_records = [
+            {chart.x_label: str(pt.x), chart.y_label: pt.y}
+            for pt in chart.series
+        ]
+        if chart.chart_kind == "LINE":
+            st.line_chart(chart_records, x=chart.x_label, y=chart.y_label)
+        else:
+            st.bar_chart(chart_records, x=chart.x_label, y=chart.y_label)
+        st.dataframe(chart_records, width="stretch", hide_index=True)
+
 
 
 def _render_analysis_page(snapshot: BackendStatusSnapshot, session: ActiveSessionView | None) -> None:
