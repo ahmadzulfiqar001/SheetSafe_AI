@@ -289,7 +289,7 @@ PLANNING_ERROR_TABLE: dict[PlanningCode, tuple[int, str, bool]] = {
     ),
     PlanningCode.CSV_PAYLOAD_TOO_LARGE: (
         413,
-        "Uploaded CSV file exceeds the maximum allowed size (48 KiB).",
+        "Uploaded CSV file exceeds the maximum allowed size (2 MiB).",
         False,
     ),
     PlanningCode.INVALID_CSV_FILENAME: (
@@ -1525,9 +1525,7 @@ class PlanningService:
     def _effective_inference_client(
         self,
         transport_override: httpx.BaseTransport | None = None,
-        *,
-        is_synthetic_dataset: bool = True,
-    ) -> tuple[VultrInferenceClient, Literal["SIMULATED_MOCK", "LIVE_VULTR_AI", "DETERMINISTIC_FALLBACK"], bool, str]:
+    ) -> VultrInferenceClient:
         has_vultr_creds = (
             self.settings.vultr_inference_api_key is not None
             and bool(self.settings.vultr_inference_model)
@@ -1535,47 +1533,15 @@ class PlanningService:
         if transport_override is not None:
             chosen_transport = transport_override
             allow_live = False
-            provider_mode: Literal["SIMULATED_MOCK", "LIVE_VULTR_AI", "DETERMINISTIC_FALLBACK"] = (
-                "LIVE_VULTR_AI" if has_vultr_creds else "SIMULATED_MOCK"
-            )
-            simulated = (provider_mode != "LIVE_VULTR_AI")
-            model_name = self.settings.vultr_inference_model or SIMULATED_MODEL_ID
-            provider_label = (
-                f"Vultr Serverless Inference ({model_name})"
-                if provider_mode == "LIVE_VULTR_AI"
-                else SIMULATED_PROVIDER_LABEL
-            )
         elif self._transport is not None:
             chosen_transport = self._transport
             allow_live = False
-            provider_mode = "LIVE_VULTR_AI" if has_vultr_creds else "SIMULATED_MOCK"
-            simulated = (provider_mode != "LIVE_VULTR_AI")
-            model_name = self.settings.vultr_inference_model or SIMULATED_MODEL_ID
-            provider_label = (
-                f"Vultr Serverless Inference ({model_name})"
-                if provider_mode == "LIVE_VULTR_AI"
-                else SIMULATED_PROVIDER_LABEL
-            )
         elif has_vultr_creds:
             chosen_transport = None
             allow_live = True
-            provider_mode = "LIVE_VULTR_AI"
-            simulated = False
-            model_name = self.settings.vultr_inference_model or SIMULATED_MODEL_ID
-            provider_label = f"Vultr Serverless Inference ({model_name})"
         else:
             chosen_transport = build_deterministic_mock_transport()
             allow_live = False
-            if is_synthetic_dataset:
-                provider_mode = "SIMULATED_MOCK"
-                simulated = True
-                model_name = SIMULATED_MODEL_ID
-                provider_label = SIMULATED_PROVIDER_LABEL
-            else:
-                provider_mode = "DETERMINISTIC_FALLBACK"
-                simulated = True
-                model_name = "deterministic-fallback-v1"
-                provider_label = "SheetSafe Deterministic Intent Parser (Offline Fallback)"
 
         effective_settings = self.settings.model_copy(
             update={
@@ -1588,12 +1554,57 @@ class PlanningService:
                 ),
             }
         )
-        client = VultrInferenceClient(
+        return VultrInferenceClient(
             effective_settings,
             transport=chosen_transport,
             allow_live_network=allow_live,
         )
-        return client, provider_mode, simulated, provider_label
+
+    def _resolve_provider_context(
+        self,
+        transport_override: httpx.BaseTransport | None = None,
+        *,
+        is_synthetic_dataset: bool = True,
+    ) -> tuple[VultrInferenceClient, Literal["SIMULATED_MOCK", "LIVE_VULTR_AI", "DETERMINISTIC_FALLBACK"], bool, str]:
+        inference_client = self._effective_inference_client(transport_override)
+        has_vultr_creds = (
+            self.settings.vultr_inference_api_key is not None
+            and bool(self.settings.vultr_inference_model)
+        )
+        model_name = self.settings.vultr_inference_model or SIMULATED_MODEL_ID
+        if transport_override is not None:
+            provider_mode: Literal["SIMULATED_MOCK", "LIVE_VULTR_AI", "DETERMINISTIC_FALLBACK"] = (
+                "LIVE_VULTR_AI" if has_vultr_creds else "SIMULATED_MOCK"
+            )
+            simulated = (provider_mode != "LIVE_VULTR_AI")
+            provider_label = (
+                f"Vultr Serverless Inference ({model_name})"
+                if provider_mode == "LIVE_VULTR_AI"
+                else SIMULATED_PROVIDER_LABEL
+            )
+        elif self._transport is not None:
+            provider_mode = "LIVE_VULTR_AI" if has_vultr_creds else "SIMULATED_MOCK"
+            simulated = (provider_mode != "LIVE_VULTR_AI")
+            provider_label = (
+                f"Vultr Serverless Inference ({model_name})"
+                if provider_mode == "LIVE_VULTR_AI"
+                else SIMULATED_PROVIDER_LABEL
+            )
+        elif has_vultr_creds:
+            provider_mode = "LIVE_VULTR_AI"
+            simulated = False
+            provider_label = f"Vultr Serverless Inference ({model_name})"
+        else:
+            if is_synthetic_dataset:
+                provider_mode = "SIMULATED_MOCK"
+                simulated = True
+                provider_label = SIMULATED_PROVIDER_LABEL
+            else:
+                provider_mode = "DETERMINISTIC_FALLBACK"
+                simulated = True
+                provider_label = "SheetSafe Deterministic Intent Parser (Offline Fallback)"
+
+        return inference_client, provider_mode, simulated, provider_label
 
     def ensure_synthetic_dataset(self, principal: SessionPrincipal) -> SyntheticDatasetSnapshot:
         """Idempotently provision the server-owned synthetic dataset for the active session."""
@@ -1824,7 +1835,7 @@ class PlanningService:
 
         # Step 2: Provider call outside SQLite writer lock
         inference_client, initial_provider_mode, initial_simulated, initial_label = (
-            self._effective_inference_client(transport, is_synthetic_dataset=is_synthetic_dataset)
+            self._resolve_provider_context(transport, is_synthetic_dataset=is_synthetic_dataset)
         )
         started_mono = time.monotonic()
         planning_result = None
@@ -2202,6 +2213,8 @@ class PlanningService:
             raise SessionError(503) from None
 
         started_mono = time.monotonic()
+        if len(csv_bytes) > MAX_CSV_UPLOAD_BYTES:
+            raise PlanningError(PlanningCode.CSV_PAYLOAD_TOO_LARGE)
         try:
             bundle = compute_validated_csv_analytics(
                 filename=filename,
@@ -2221,11 +2234,17 @@ class PlanningService:
 
         # Store in session's PrivateStorage under 'version' input category so it is cleaned up
         # on session revocation without conflicting with the synthetic 'original' slot.
+        # PrivateStorage requires chunks <= 64 KiB.
+        storage_chunk_size = 64 * 1024
+        storage_chunks = [
+            csv_bytes[i : i + storage_chunk_size]
+            for i in range(0, max(1, len(csv_bytes)), storage_chunk_size)
+        ]
         stored = self.storage.store(
             principal,
             category="version",
             file_type="csv",
-            chunks=[csv_bytes],
+            chunks=storage_chunks,
             byte_count=bundle.byte_count,
             run_id=None,
             candidate_version=0,

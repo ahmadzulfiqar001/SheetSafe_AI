@@ -28,7 +28,7 @@ from ingestion.contracts import (
 from parser_worker.csv_parser import profile_csv_fixture
 
 
-MAX_CSV_UPLOAD_BYTES = 48 * 1024  # 48 KiB bounded upload payload
+MAX_CSV_UPLOAD_BYTES = 2 * 1024 * 1024  # 2 MiB bounded upload payload
 MAX_CSV_PREVIEW_ROWS = 5
 MAX_CSV_CHART_POINTS = 25
 MAX_PREVIEW_CELL_CHARS = 120

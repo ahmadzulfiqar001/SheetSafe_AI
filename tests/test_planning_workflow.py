@@ -1230,8 +1230,16 @@ def test_step11c_streamlit_interactive_results_charts_and_revocation_cleanup(
     [b for b in at.button if b.label == "Start Synthetic Session"][0].click().run()
     at.sidebar.radio[0].set_value("AI Analysis").run()
 
+    # Ensure synthetic demo dataset is selected if active dataset selectbox is present
+    ds_boxes = [s for s in at.selectbox if "Active Dataset Source" in (s.label or "")]
+    if ds_boxes:
+        demo_options = [opt for opt in ds_boxes[0].options if "Demo:" in opt or "Synthetic" in opt]
+        if demo_options:
+            ds_boxes[0].set_value(demo_options[0]).run()
+
     # Select Line Chart preset scenario and generate preview
-    at.selectbox[0].set_value("Quarterly Revenue Line Chart (LINE_CHART)").run()
+    scenario_box = [s for s in at.selectbox if "Synthetic Analysis Scenario" in (s.label or "")][0]
+    scenario_box.set_value("Quarterly Revenue Line Chart (LINE_CHART)").run()
     [
         b for b in at.button if "Generate Simulated AI Analysis Plan (DEMO / SIMULATED)" in b.label
     ][0].click().run()
@@ -1246,7 +1254,8 @@ def test_step11c_streamlit_interactive_results_charts_and_revocation_cleanup(
     assert metrics["Publication Authorized"] == "False"
 
     # Switch to Bar Chart preset scenario and verify BAR_CHART preview
-    at.selectbox[0].set_value("Categorical Bar Chart by Region (BAR_CHART)").run()
+    scenario_box = [s for s in at.selectbox if "Synthetic Analysis Scenario" in (s.label or "")][0]
+    scenario_box.set_value("Categorical Bar Chart by Region (BAR_CHART)").run()
     [
         b for b in at.button if "Generate Simulated AI Analysis Plan (DEMO / SIMULATED)" in b.label
     ][0].click().run()
@@ -1276,7 +1285,13 @@ def test_step11c_streamlit_clears_cached_results_and_reports_after_session_expir
     at.run()
     [b for b in at.button if b.label == "Start Synthetic Session"][0].click().run()
     at.sidebar.radio[0].set_value("AI Analysis").run()
-    at.selectbox[0].set_value("Revenue per Headcount Ratio (SUMMARY_TABLE / COMPUTE_RATIO)").run()
+    ds_boxes = [s for s in at.selectbox if "Active Dataset Source" in (s.label or "")]
+    if ds_boxes:
+        demo_options = [opt for opt in ds_boxes[0].options if "Demo:" in opt or "Synthetic" in opt]
+        if demo_options:
+            ds_boxes[0].set_value(demo_options[0]).run()
+    scenario_box = [s for s in at.selectbox if "Synthetic Analysis Scenario" in (s.label or "")][0]
+    scenario_box.set_value("Revenue per Headcount Ratio (SUMMARY_TABLE / COMPUTE_RATIO)").run()
     [
         b for b in at.button if "Generate Simulated AI Analysis Plan (DEMO / SIMULATED)" in b.label
     ][0].click().run()

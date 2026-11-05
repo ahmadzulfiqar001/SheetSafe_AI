@@ -21,12 +21,14 @@ from backend.planning import (
     UploadedCsvAnalyticsOutcome,
 )
 from backend.security.sessions import SessionPrincipal
+from validator.csv_analytics import MAX_CSV_UPLOAD_BYTES
 
 
 router = APIRouter(prefix="/planning", tags=["planning"])
 
 MAX_PLANNING_BODY_BYTES = 4096
-MAX_CSV_ANALYTICS_BODY_BYTES = 60 * 1024
+# Bounded buffer to accommodate raw 2 MiB CSV plus JSON serialization and escaping overhead
+MAX_CSV_ANALYTICS_BODY_BYTES = 4 * 1024 * 1024  # 4 MiB
 
 
 class PlanningPreviewRequest(BaseModel):
@@ -40,7 +42,7 @@ class CsvAnalyticsUploadRequest(BaseModel):
     model_config = ConfigDict(strict=True, frozen=True, extra="forbid", hide_input_in_errors=True)
 
     filename: str = Field(min_length=1, max_length=256)
-    csv_text: str = Field(min_length=0, max_length=65536, repr=False)
+    csv_text: str = Field(min_length=0, max_length=MAX_CSV_UPLOAD_BYTES, repr=False)
     delimiter: str | None = Field(default=None, max_length=8)
 
 
@@ -129,6 +131,8 @@ async def csv_analytics_upload_request(request: Request) -> CsvAnalyticsUploadRe
     if "csv_text" in raw_dict and type(raw_dict["csv_text"]) is str:
         if not raw_dict["csv_text"].strip():
             raise PlanningError(PlanningCode.EMPTY_CSV_UPLOAD)
+        if len(raw_dict["csv_text"]) > MAX_CSV_UPLOAD_BYTES:
+            raise PlanningError(PlanningCode.CSV_PAYLOAD_TOO_LARGE)
     try:
         return CsvAnalyticsUploadRequest.model_validate(raw_dict)
     except ValidationError:
@@ -158,6 +162,8 @@ def create_csv_analytics(
         raw_bytes = payload.csv_text.encode("utf-8", errors="strict")
     except UnicodeEncodeError:
         raise PlanningError(PlanningCode.INVALID_UTF8_ENCODING) from None
+    if len(raw_bytes) > MAX_CSV_UPLOAD_BYTES:
+        raise PlanningError(PlanningCode.CSV_PAYLOAD_TOO_LARGE)
     return service.analyze_uploaded_csv(
         principal,
         filename=payload.filename,

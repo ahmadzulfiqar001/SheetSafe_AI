@@ -589,8 +589,9 @@ def _render_datasets_page(snapshot: BackendStatusSnapshot, session: ActiveSessio
 
     st.divider()
     st.markdown("#### Upload CSV for Deterministic Pandas Analytics (Active MVP Workflow)")
+    max_mb = MAX_CSV_UPLOAD_BYTES // (1024 * 1024)
     st.caption(
-        f"Upload a real UTF-8 `.csv` dataset (up to {MAX_CSV_UPLOAD_BYTES // 1024} KiB) to FastAPI "
+        f"Upload a real UTF-8 `.csv` dataset (up to {max_mb} MiB) to FastAPI "
         "`POST /api/v1/planning/csv-analytics`. Uses **deterministic, validated pandas operations only** "
         "(`execution_mode=DETERMINISTIC_PANDAS_HOST`, `ai_code_executed=False`). "
         "AI-generated Python execution remains disabled."
@@ -604,7 +605,7 @@ def _render_datasets_page(snapshot: BackendStatusSnapshot, session: ActiveSessio
             type=["csv"],
             disabled=csv_controls_disabled,
             key="csv_analytics_file_uploader",
-            help="Select a UTF-8 .csv file (max 48 KiB) to compute validated row/column counts, column types, first rows, missing-value counts, numeric summaries, and a chart.",
+            help=f"Select a UTF-8 .csv file (max {max_mb} MiB) to compute validated row/column counts, column types, first rows, missing-value counts, numeric summaries, and a chart.",
         )
     with col_csv_delim:
         delim_label = st.selectbox(

@@ -27,7 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 DEFAULT_API_BASE_URL = "http://127.0.0.1:8000"
 DEFAULT_CLIENT_ORIGIN = "http://localhost:8501"
 MAX_API_RESPONSE_BYTES = 32 * 1024
-MAX_CSV_UPLOAD_BYTES = 48 * 1024
+MAX_CSV_UPLOAD_BYTES = 2 * 1024 * 1024  # 2 MiB
 
 
 class FrontendClientCode(StrEnum):

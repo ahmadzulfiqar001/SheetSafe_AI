@@ -219,7 +219,7 @@ def test_deterministic_pandas_chart_modes_for_categorical_and_text_only_csvs() -
         ("header_only.csv", b"col1,col2\n", None, CsvAnalyticsCode.EMPTY_CSV_UPLOAD),
         (
             "oversized.csv",
-            b"a,b\n" + (b"1,2\n" * ((MAX_CSV_UPLOAD_BYTES // 4) + 10)),
+            b"col_a,col_b\n" + (b"1234567890," * 9 + b"123456789\n") * 21000,
             None,
             CsvAnalyticsCode.CSV_PAYLOAD_TOO_LARGE,
         ),
@@ -1090,4 +1090,248 @@ def test_fastapi_real_csv_natural_language_analysis_endpoint(
     assert preview_data["real_data_result"]["scalar_value"] == 46301.25
     assert "North America" in preview_data["real_data_result"]["answer_text"]
     assert preview_data["real_data_result"]["ai_code_executed"] is False
+
+
+def _generate_synthetic_csv_bytes(target_byte_count: int, *, rows_count: int | None = None) -> bytes:
+    """Generate a clean, deterministic, multi-column valid UTF-8 CSV payload with exact or approximate target size."""
+    header = b"order_id,region,category,sales_amount,units,notes\n"
+    # Row template is ~95 bytes
+    # e.g.: b"ORD-00001,North America,Enterprise,12500.50,25,standard_quarterly_audit_record_for_enterprise_analytics\n"
+    rows_list = [header]
+    current_bytes = len(header)
+    row_idx = 1
+    regions = [b"North America", b"Europe", b"Asia Pacific", b"Latin America"]
+    categories = [b"Enterprise", b"MidMarket", b"Commercial", b"Public Sector"]
+
+    while True:
+        if rows_count is not None and row_idx > rows_count:
+            break
+        if rows_count is None and current_bytes >= target_byte_count:
+            break
+
+        reg = regions[row_idx % len(regions)]
+        cat = categories[row_idx % len(categories)]
+        amount = 1000.0 + (row_idx % 500) * 12.5
+        units = 10 + (row_idx % 40)
+        row_line = (
+            f"ORD-{row_idx:06d},".encode("utf-8")
+            + reg
+            + b","
+            + cat
+            + f",{amount:.2f},{units},standard_quarterly_audit_record_for_enterprise_analytics\n".encode("utf-8")
+        )
+        rows_list.append(row_line)
+        current_bytes += len(row_line)
+        row_idx += 1
+
+    return b"".join(rows_list)
+
+
+def test_csv_upload_capacity_464_kb_real_world_dataset() -> None:
+    # 464 KB is approximately 475,136 bytes (~5,000 rows x 95 bytes)
+    csv_464kb = _generate_synthetic_csv_bytes(475_136)
+    assert 450 * 1024 <= len(csv_464kb) <= 500 * 1024
+
+    # 1. Direct CSV analytics validation
+    bundle = compute_validated_csv_analytics(
+        filename="sales_464kb.csv",
+        raw_bytes=csv_464kb,
+    )
+    assert bundle.filename == "sales_464kb.csv"
+    assert bundle.byte_count == len(csv_464kb)
+    assert bundle.column_count == 6
+    assert bundle.row_count >= 4000
+    assert bundle.total_missing_cells == 0
+    assert bundle.dataset_completeness_pct == 100.0
+    assert len(bundle.numeric_summaries) == 2  # sales_amount and units
+    assert bundle.chart.chart_kind in {"BAR", "LINE"}
+
+    # 2. Service level ingestion & persistence
+    scratch = Path(__file__).resolve().parents[1] / "var" / "test_scratch_capacity_464kb"
+    if scratch.exists():
+        shutil.rmtree(scratch)
+    scratch.mkdir(parents=True)
+
+    try:
+        settings = Settings(
+            _env_file=None,
+            environment="development",
+            database_path=scratch / "planning.sqlite3",
+            private_storage_path=scratch / "store",
+            allowed_origins=(ORIGIN,),
+            synthetic_planning_enabled=True,
+        )
+        db = Database(settings)
+        db.initialize()
+        storage = PrivateStorage(db, settings)
+        storage.initialize()
+        service = PlanningService(db, storage, settings)
+
+        now = db.now()
+        principal = SessionPrincipal(
+            session_id="5" * 32,
+            audit_pseudonym="p" * 16,
+            expires_at=now + 1800,
+            auth_token_hash="5" * 64,
+            csrf_token="5" * 64,
+        )
+        with db.transaction() as conn:
+            conn.execute(
+                """INSERT INTO sessions(session_id, auth_token_hash, audit_pseudonym, mode, created_at, expires_at)
+                   VALUES (?, ?, ?, 'synthetic', ?, ?)""",
+                (principal.session_id, principal.auth_token_hash, principal.audit_pseudonym, now, principal.expires_at),
+            )
+
+        outcome = service.analyze_uploaded_csv(
+            principal,
+            filename="sales_464kb.csv",
+            csv_bytes=csv_464kb,
+        )
+        assert outcome.byte_count == len(csv_464kb)
+        assert outcome.row_count == bundle.row_count
+
+        # 3. Ask natural language question against 464 KB dataset
+        preview = service.create_plan_preview(
+            principal,
+            question="What is the average sales_amount?",
+            dataset_id=outcome.dataset_id,
+        )
+        assert preview.provider_mode == "DETERMINISTIC_FALLBACK"
+        assert preview.real_data_result is not None
+        assert preview.real_data_result.scalar_value is not None
+        assert preview.real_data_result.ai_code_executed is False
+
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_csv_upload_capacity_valid_below_2_mib() -> None:
+    # 1.8 MiB is approximately 1,887,436 bytes (well below 2 MiB limit)
+    csv_1_8mb = _generate_synthetic_csv_bytes(1_887_436)
+    assert 1.7 * 1024 * 1024 <= len(csv_1_8mb) < MAX_CSV_UPLOAD_BYTES
+
+    bundle = compute_validated_csv_analytics(
+        filename="large_sales.csv",
+        raw_bytes=csv_1_8mb,
+    )
+    assert bundle.byte_count == len(csv_1_8mb)
+    assert bundle.row_count >= 18000
+    assert bundle.column_count == 6
+    assert len(bundle.numeric_summaries) == 2
+
+
+def test_csv_upload_capacity_rejection_above_2_mib() -> None:
+    # Generate CSV exceeding 2 MiB by 2,048 bytes
+    oversized_bytes = _generate_synthetic_csv_bytes(MAX_CSV_UPLOAD_BYTES + 2048)
+    assert len(oversized_bytes) > MAX_CSV_UPLOAD_BYTES
+
+    # 1. Rejection at compute_validated_csv_analytics level
+    with pytest.raises(CsvAnalyticsError) as exc_analytics:
+        compute_validated_csv_analytics(
+            filename="too_large.csv",
+            raw_bytes=oversized_bytes,
+        )
+    assert exc_analytics.value.code is CsvAnalyticsCode.CSV_PAYLOAD_TOO_LARGE
+    assert "exceeds maximum size" in str(exc_analytics.value)
+    assert "2097152" in str(exc_analytics.value)
+
+    # 2. Rejection at PlanningService level
+    scratch = Path(__file__).resolve().parents[1] / "var" / "test_scratch_capacity_reject"
+    if scratch.exists():
+        shutil.rmtree(scratch)
+    scratch.mkdir(parents=True)
+
+    try:
+        settings = Settings(
+            _env_file=None,
+            environment="development",
+            database_path=scratch / "planning.sqlite3",
+            private_storage_path=scratch / "store",
+            allowed_origins=(ORIGIN,),
+            synthetic_planning_enabled=True,
+        )
+        db = Database(settings)
+        db.initialize()
+        storage = PrivateStorage(db, settings)
+        storage.initialize()
+        service = PlanningService(db, storage, settings)
+
+        now = db.now()
+        principal = SessionPrincipal(
+            session_id="6" * 32,
+            audit_pseudonym="p" * 16,
+            expires_at=now + 1800,
+            auth_token_hash="6" * 64,
+            csrf_token="6" * 64,
+        )
+        with db.transaction() as conn:
+            conn.execute(
+                """INSERT INTO sessions(session_id, auth_token_hash, audit_pseudonym, mode, created_at, expires_at)
+                   VALUES (?, ?, ?, 'synthetic', ?, ?)""",
+                (principal.session_id, principal.auth_token_hash, principal.audit_pseudonym, now, principal.expires_at),
+            )
+
+        with pytest.raises(PlanningError) as exc_service:
+            service.analyze_uploaded_csv(
+                principal,
+                filename="too_large.csv",
+                csv_bytes=oversized_bytes,
+            )
+        assert exc_service.value.code is PlanningCode.CSV_PAYLOAD_TOO_LARGE
+
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+    # 3. Rejection at SheetSafeApiClient level before network transmission
+    def mock_session_handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/api/v1/sessions":
+            return httpx.Response(
+                201,
+                headers={"Set-Cookie": "__Host-sheetsafe_session=" + "A" * 43 + "; HttpOnly; SameSite=Strict; Path=/"},
+                json={
+                    "session_id": "a" * 32,
+                    "mode": "synthetic",
+                    "expires_at": int(time.time()) + 3600,
+                    "lifetime_seconds": 3600,
+                    "private_uploads_enabled": False,
+                    "csrf_token": "b" * 64,
+                },
+            )
+        return httpx.Response(500)
+
+    mock_client = SheetSafeApiClient(
+        api_base_url=DEV_BASE,
+        client_origin=ORIGIN,
+        transport=httpx.MockTransport(mock_session_handler),
+    )
+    mock_client.create_synthetic_session()
+    with pytest.raises(FrontendClientError) as exc_client:
+        mock_client.upload_csv_for_analytics(
+            filename="too_large.csv",
+            content=oversized_bytes,
+        )
+    assert exc_client.value.code is FrontendClientCode.INVALID_REQUEST
+    assert "exceeds maximum size" in str(exc_client.value)
+    assert "2097152" in str(exc_client.value)
+
+
+def test_csv_upload_capacity_fastapi_json_body_and_overhead() -> None:
+    """Verify that JSON serialization overhead is accounted for and memory remains bounded."""
+    from backend.api.planning import MAX_CSV_ANALYTICS_BODY_BYTES
+
+    # 1. Verify body size constant accommodates 2 MiB raw CSV plus JSON serialization
+    assert MAX_CSV_ANALYTICS_BODY_BYTES >= MAX_CSV_UPLOAD_BYTES
+    assert MAX_CSV_ANALYTICS_BODY_BYTES == 4 * 1024 * 1024  # 4 MiB bounded memory
+
+    # 2. Simulate JSON serialization of 464 KB CSV: json.dumps overhead is handled cleanly
+    csv_464kb = _generate_synthetic_csv_bytes(475_136)
+    csv_text = csv_464kb.decode("utf-8")
+    payload_dict = {
+        "filename": "sales_464kb.csv",
+        "csv_text": csv_text,
+        "delimiter": ",",
+    }
+    encoded_json = json.dumps(payload_dict).encode("utf-8")
+    assert len(encoded_json) > len(csv_464kb)  # Overhead is present
+    assert len(encoded_json) < MAX_CSV_ANALYTICS_BODY_BYTES  # Within 4 MiB buffer
 
