@@ -599,6 +599,8 @@ class NativeCliSmokeTransport:
             "ALL",
             "--security-opt",
             "no-new-privileges=true",
+            "--security-opt",
+            "apparmor=docker-default",
             "--cpu-period",
             "100000",
             "--cpu-quota",
@@ -855,6 +857,15 @@ def _diagnose_projection_mismatch(
         if top_key not in raw_dict:
             return f"TopLevel.{top_key}:missing_required_field"
         if not _same(raw_dict[top_key], expected_top[top_key]):
+            if top_key == "AppArmorProfile":
+                aa_val = raw_dict["AppArmorProfile"]
+                if type(aa_val) is not str:
+                    return "TopLevel.AppArmorProfile:invalid_type"
+                if aa_val == "unconfined":
+                    return "TopLevel.AppArmorProfile:unconfined_rejected"
+                if aa_val == "":
+                    return "TopLevel.AppArmorProfile:empty_without_explicit_policy"
+                return "TopLevel.AppArmorProfile:unexpected_profile"
             prefix = top_key if top_key in ("Mounts", "NetworkSettings") else f"TopLevel.{top_key}"
             return f"{prefix}:value_mismatch"
     for section_name in ("Config", "HostConfig", "State"):
@@ -870,12 +881,74 @@ def _diagnose_projection_mismatch(
             return f"{section_name}.{unexpected[0]}:unexpected_field"
         for k, exp_v in exp_sec.items():
             if not _same(sec_val[k], exp_v):
+                if (
+                    section_name == "HostConfig"
+                    and k == "SecurityOpt"
+                    and type(sec_val[k]) is list
+                    and any(
+                        type(opt) is str and "unconfined" in opt.lower()
+                        for opt in sec_val[k]
+                    )
+                ):
+                    return "HostConfig.SecurityOpt:unconfined_rejected"
                 return f"{section_name}.{k}:value_mismatch"
     return "TopLevel:policy_mismatch"
 
 
+def _validate_prestart_apparmor_profile(
+    raw_apparmor: object,
+    *,
+    raw_state: object,
+    raw_host: object,
+    explicit_apparmor_default: bool,
+    host_apparmor_available: bool,
+    policy: SandboxPolicy,
+) -> str:
+    """Validate pre-start AppArmorProfile and return normalized 'docker-default'.
+
+    Distinguishes invalid_type, unconfined_rejected, empty_non_created_state,
+    empty_without_host_apparmor, empty_without_explicit_policy, host_lsm_unverified,
+    and unexpected_profile without echoing raw profile strings.
+    """
+    if type(raw_apparmor) is not str:
+        raise PolicyMismatchError("TopLevel.AppArmorProfile:invalid_type")
+    if raw_apparmor == "unconfined":
+        raise PolicyMismatchError("TopLevel.AppArmorProfile:unconfined_rejected")
+    if not policy.require_available_lsm or not host_apparmor_available:
+        if raw_apparmor == "":
+            raise PolicyMismatchError(
+                "TopLevel.AppArmorProfile:empty_without_host_apparmor"
+            )
+        raise PolicyMismatchError("TopLevel.AppArmorProfile:host_lsm_unverified")
+    if raw_apparmor == "docker-default":
+        return "docker-default"
+    if raw_apparmor == "":
+        is_created_prestart = (
+            type(raw_state) is dict
+            and raw_state.get("Status") == "created"
+            and raw_state.get("Running") is False
+            and raw_state.get("Pid") == 0
+            and type(raw_host) is dict
+            and raw_host.get("Privileged") is False
+        )
+        if not is_created_prestart:
+            raise PolicyMismatchError(
+                "TopLevel.AppArmorProfile:empty_non_created_state"
+            )
+        if not explicit_apparmor_default:
+            raise PolicyMismatchError(
+                "TopLevel.AppArmorProfile:empty_without_explicit_policy"
+            )
+        return "docker-default"
+    raise PolicyMismatchError("TopLevel.AppArmorProfile:unexpected_profile")
+
+
 def normalize_created_inspect(
-    raw: object, spec: ContainerJobSpec, container_id: str
+    raw: object,
+    spec: ContainerJobSpec,
+    container_id: str,
+    *,
+    host_apparmor_available: bool = True,
 ) -> dict:
     """Explicitly validated normalization boundary for pre-start container inspect metadata.
 
@@ -952,6 +1025,15 @@ def normalize_created_inspect(
         and "Hostname" not in raw_config_obj
     )
     if is_internal_projection:
+        if not host_apparmor_available:
+            _validate_prestart_apparmor_profile(
+                raw_dict.get("AppArmorProfile"),
+                raw_state=raw_state_obj,
+                raw_host=raw_host_obj,
+                explicit_apparmor_default=False,
+                host_apparmor_available=host_apparmor_available,
+                policy=SandboxPolicy(),
+            )
         try:
             verify_configuration(raw_dict, spec, container_id)
         except RunnerLifecycleError as exc:
@@ -972,8 +1054,25 @@ def normalize_created_inspect(
         LOCAL_CONFIG_DIGEST,
     }:
         raise PolicyMismatchError("TopLevel.Image:value_mismatch")
-    if not exact(raw_dict["AppArmorProfile"], "docker-default"):
-        raise PolicyMismatchError("TopLevel.AppArmorProfile:value_mismatch")
+    raw_sec_opt_pre = (
+        raw_host_obj.get("SecurityOpt") if type(raw_host_obj) is dict else None
+    )
+    explicit_apparmor_default = (
+        type(raw_sec_opt_pre) is list
+        and all(type(opt) is str for opt in raw_sec_opt_pre)
+        and any(
+            opt in {"apparmor=docker-default", "apparmor:docker-default"}
+            for opt in raw_sec_opt_pre
+        )
+    )
+    normalized_apparmor = _validate_prestart_apparmor_profile(
+        raw_dict["AppArmorProfile"],
+        raw_state=raw_state_obj,
+        raw_host=raw_host_obj,
+        explicit_apparmor_default=explicit_apparmor_default,
+        host_apparmor_available=host_apparmor_available,
+        policy=policy,
+    )
 
     if "Created" in raw_dict:
         try:
@@ -1228,11 +1327,34 @@ def normalize_created_inspect(
         raise PolicyMismatchError("HostConfig:invalid_type")
     host = dict(raw_dict["HostConfig"])
 
-    if host.get("SecurityOpt") in (
-        ["no-new-privileges"],
-        ["no-new-privileges:true"],
+    if "SecurityOpt" not in host:
+        raise PolicyMismatchError("HostConfig.SecurityOpt:missing_required_field")
+    raw_sec_opt = host.get("SecurityOpt")
+    if type(raw_sec_opt) is not list or not all(
+        type(opt) is str for opt in raw_sec_opt
     ):
-        host["SecurityOpt"] = ["no-new-privileges=true"]
+        raise PolicyMismatchError("HostConfig.SecurityOpt:invalid_type")
+    if any("unconfined" in opt.lower() for opt in raw_sec_opt):
+        raise PolicyMismatchError("HostConfig.SecurityOpt:unconfined_rejected")
+    nnp_variants = {
+        "no-new-privileges=true",
+        "no-new-privileges:true",
+        "no-new-privileges",
+    }
+    aa_default_variants = {
+        "apparmor=docker-default",
+        "apparmor:docker-default",
+    }
+    nnp_items = [opt for opt in raw_sec_opt if opt in nnp_variants]
+    aa_items = [opt for opt in raw_sec_opt if opt in aa_default_variants]
+    other_items = [
+        opt
+        for opt in raw_sec_opt
+        if opt not in nnp_variants and opt not in aa_default_variants
+    ]
+    if len(nnp_items) != 1 or len(aa_items) > 1 or bool(other_items):
+        raise PolicyMismatchError("HostConfig.SecurityOpt:value_mismatch")
+    host["SecurityOpt"] = ["no-new-privileges=true"]
 
     # On cgroups v2 (Ubuntu 24.04 / Docker 29), OomKillDisable (*bool) is null when not set.
     if "OomKillDisable" not in host or host["OomKillDisable"] is None:
@@ -1494,7 +1616,7 @@ def normalize_created_inspect(
         "State": state,
         "Mounts": mounts,
         "NetworkSettings": {"Ports": {}, "Networks": {"none": {}}},
-        "AppArmorProfile": raw_dict["AppArmorProfile"],
+        "AppArmorProfile": normalized_apparmor,
     }
 
     verify_configuration(projection, spec, container_id)
@@ -1502,7 +1624,11 @@ def normalize_created_inspect(
 
 
 def validate_runtime_inspect(
-    raw: object, spec: ContainerJobSpec, container_id: str
+    raw: object,
+    spec: ContainerJobSpec,
+    container_id: str,
+    *,
+    require_apparmor_profile: bool = False,
 ) -> tuple[bool, int | None, bool, int]:
     """Validate runtime container inspect payload and return (is_running, exit_code, oom_killed, total_cpu_ns)."""
     if not _valid_id(container_id) or _owned_id(raw, spec) != container_id:
@@ -1576,6 +1702,23 @@ def validate_runtime_inspect(
                 "Inspect CPUStats.cpu_usage.total_usage is invalid.",
             )
         total_cpu_ns = raw_total
+
+    if require_apparmor_profile or "AppArmorProfile" in raw:
+        runtime_aa = raw.get("AppArmorProfile")
+        if type(runtime_aa) is not str:
+            raise PolicyMismatchError("Runtime.AppArmorProfile:invalid_type")
+        if runtime_aa == "":
+            raise PolicyMismatchError(
+                "Runtime.AppArmorProfile:empty_after_start"
+            )
+        if runtime_aa == "unconfined":
+            raise PolicyMismatchError(
+                "Runtime.AppArmorProfile:unconfined_rejected"
+            )
+        if runtime_aa != "docker-default":
+            raise PolicyMismatchError(
+                "Runtime.AppArmorProfile:unexpected_profile"
+            )
 
     return is_running, exit_code, oom_killed, total_cpu_ns
 
@@ -3044,6 +3187,7 @@ class SmokeAdapter:
         start_mono = self._clock()
 
         # 3. Optional preflight verification BEFORE any container creation or transport call
+        host_apparmor_available = True
         if self._preflight_reader is not None:
             try:
                 pf_report = run_preflight(self._preflight_reader)
@@ -3058,6 +3202,10 @@ class SmokeAdapter:
                     SmokeFailureCode.PREFLIGHT_FAILED,
                     f"Preflight issues: {pf_report.issues}",
                 )
+            host_apparmor_available = bool(
+                pf_report.engine is not None
+                and pf_report.engine.apparmor_advertised
+            )
 
         # 4. Dry-run early exit (Default safe path: zero transport calls, zero containers)
         if dry_run:
@@ -3190,7 +3338,12 @@ class SmokeAdapter:
                 ) from exc
 
             try:
-                normalize_created_inspect(created_meta, spec, container_id)
+                normalize_created_inspect(
+                    created_meta,
+                    spec,
+                    container_id,
+                    host_apparmor_available=host_apparmor_available,
+                )
             except PolicyMismatchError as exc:
                 failure = SmokeFailureCode.POLICY_MISMATCH
                 failure_detail = exc.detail
@@ -3291,8 +3444,23 @@ class SmokeAdapter:
                             container_id, timeout=inspect_timeout
                         )
                         is_running, obs_exit, obs_oom, total_cpu_ns = (
-                            validate_runtime_inspect(meta, spec, container_id)
+                            validate_runtime_inspect(
+                                meta,
+                                spec,
+                                container_id,
+                                require_apparmor_profile=True,
+                            )
                         )
+                    except PolicyMismatchError as exc:
+                        failure = SmokeFailureCode.POLICY_MISMATCH
+                        failure_detail = exc.detail
+                        config_verified = False
+                        outcome = SmokeOutcome.FAILED
+                        if not self._terminate_and_verify_stopped(
+                            container_id, spec
+                        ):
+                            watchdog_kill_unresolved = True
+                        raise SmokeAdmissionError(failure, exc.detail) from exc
                     except RunnerLifecycleError as exc:
                         failure = (
                             SmokeFailureCode.INVALID_IDENTITY

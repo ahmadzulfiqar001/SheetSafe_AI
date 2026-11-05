@@ -755,7 +755,10 @@ def build_docker29_cli_created_inspect_response(
     raw["HostConfig"]["DnsSearch"] = []
     raw["HostConfig"].pop("Mounts", None)
     raw["HostConfig"].pop("Sysctls", None)
-    raw["HostConfig"]["SecurityOpt"] = ["no-new-privileges:true"]
+    raw["HostConfig"]["SecurityOpt"] = [
+        "no-new-privileges:true",
+        "apparmor=docker-default",
+    ]
     raw["HostConfig"]["MaskedPaths"] = [
         "/proc/asound",
         "/proc/acpi",
@@ -821,22 +824,35 @@ def test_smoke_adapter_docker29_cli_created_inspect_compatibility_and_diagnostic
             normalize_created_inspect(storage_variant, spec, cid)["Id"] == cid
         )
 
-    # 2. Full SmokeAdapter lifecycle with Docker 29.9.3 pre-start inspect payload succeeds
+    # 2. Full SmokeAdapter lifecycle with Docker 29.9.3 pre-start inspect payload succeeds,
+    # including when Docker 29 defers top-level AppArmorProfile="" at State.Status=="created"
+    # until `docker start` populates AppArmorProfile="docker-default" at runtime.
     fake_docker = FakeSmokeDocker(use_native_inspect_format=True)
     fake_docker.container_running = False
     fake_docker.exit_code = 0
     created_specs: dict[str, ContainerJobSpec] = {}
     orig_create = fake_docker.create
+    orig_start = fake_docker.start
 
     def create_with_d29(job_spec: ContainerJobSpec, *, timeout: float) -> str:
         created_cid = orig_create(job_spec, timeout=timeout)
         created_specs[created_cid] = job_spec
-        fake_docker.records[created_cid] = (
-            build_docker29_cli_created_inspect_response(job_spec, created_cid)
+        d29_rec = build_docker29_cli_created_inspect_response(
+            job_spec, created_cid
         )
+        d29_rec["AppArmorProfile"] = ""  # Deferred at pre-start in Docker 29
+        fake_docker.records[created_cid] = d29_rec
         return created_cid
 
+    def start_with_d29(container_id: str, *, timeout: float) -> None:
+        orig_start(container_id, timeout=timeout)
+        if container_id in fake_docker.records:
+            fake_docker.records[container_id]["AppArmorProfile"] = (
+                "docker-default"
+            )
+
     fake_docker.create = create_with_d29  # type: ignore[method-assign]
+    fake_docker.start = start_with_d29  # type: ignore[method-assign]
     adapter = SmokeAdapter(fake_docker, preflight_reader=FakeEngineReader())
     receipt = adapter.run_smoke("smoke-v1", dry_run=False)
     assert receipt.outcome is SmokeOutcome.COMPLETED
@@ -847,6 +863,68 @@ def test_smoke_adapter_docker29_cli_created_inspect_compatibility_and_diagnostic
     assert receipt.failure_detail is None
     assert receipt.to_dict()["failure_detail"] is None
 
+    # 2b. If pre-start AppArmorProfile was deferred ("") and runtime inspect after start STILL
+    # reports "" (or "unconfined"), runtime verification fails closed with POLICY_MISMATCH.
+    for bad_runtime_aa, expected_rt_detail in (
+        ("", "Runtime.AppArmorProfile:empty_after_start"),
+        ("unconfined", "Runtime.AppArmorProfile:unconfined_rejected"),
+        ("custom-profile", "Runtime.AppArmorProfile:unexpected_profile"),
+    ):
+        rt_docker = FakeSmokeDocker(use_native_inspect_format=True)
+        rt_docker.container_running = False
+        rt_docker.exit_code = 0
+        rt_orig_create = rt_docker.create
+        rt_orig_start = rt_docker.start
+
+        def create_rt_d29(job_spec: ContainerJobSpec, *, timeout: float) -> str:
+            c_id = rt_orig_create(job_spec, timeout=timeout)
+            rec = build_docker29_cli_created_inspect_response(job_spec, c_id)
+            rec["AppArmorProfile"] = ""
+            rt_docker.records[c_id] = rec
+            return c_id
+
+        def start_rt_bad(
+            container_id: str, *, timeout: float, _aa: str = bad_runtime_aa
+        ) -> None:
+            rt_orig_start(container_id, timeout=timeout)
+            if container_id in rt_docker.records:
+                rt_docker.records[container_id]["AppArmorProfile"] = _aa
+
+        rt_docker.create = create_rt_d29  # type: ignore[method-assign]
+        rt_docker.start = start_rt_bad  # type: ignore[method-assign]
+        rt_adapter = SmokeAdapter(
+            rt_docker, preflight_reader=FakeEngineReader()
+        )
+        rt_receipt = rt_adapter.run_smoke("smoke-v1", dry_run=False)
+        assert rt_receipt.outcome is SmokeOutcome.FAILED
+        assert rt_receipt.failure is SmokeFailureCode.POLICY_MISMATCH
+        assert rt_receipt.failure_detail == expected_rt_detail
+        assert rt_receipt.configuration_verified is False
+        assert rt_receipt.cleanup_confirmed is True
+
+    # 2c. Pre-start AppArmorProfile == "" without host AppArmor available is rejected
+    deferred_aa = deepcopy(docker29_payload)
+    deferred_aa["AppArmorProfile"] = ""
+    with pytest.raises(PolicyMismatchError) as no_host_aa_exc:
+        normalize_created_inspect(
+            deferred_aa, spec, cid, host_apparmor_available=False
+        )
+    assert (
+        no_host_aa_exc.value.detail
+        == "TopLevel.AppArmorProfile:empty_without_host_apparmor"
+    )
+    with pytest.raises(PolicyMismatchError) as unverified_lsm_exc:
+        normalize_created_inspect(
+            deepcopy(docker29_payload),
+            spec,
+            cid,
+            host_apparmor_available=False,
+        )
+    assert (
+        unverified_lsm_exc.value.detail
+        == "TopLevel.AppArmorProfile:host_lsm_unverified"
+    )
+
     # 3. Field-level mismatch diagnostics identify the exact section.field without leaking sensitive values
     diagnostic_cases: list[tuple[Callable[[dict], None], str]] = [
         (
@@ -855,7 +933,44 @@ def test_smoke_adapter_docker29_cli_created_inspect_compatibility_and_diagnostic
         ),
         (
             lambda d: d.__setitem__("AppArmorProfile", "unconfined"),
-            "TopLevel.AppArmorProfile:value_mismatch",
+            "TopLevel.AppArmorProfile:unconfined_rejected",
+        ),
+        (
+            lambda d: d.__setitem__("AppArmorProfile", "custom-untrusted-aa"),
+            "TopLevel.AppArmorProfile:unexpected_profile",
+        ),
+        (
+            lambda d: d.__setitem__("AppArmorProfile", None),
+            "TopLevel.AppArmorProfile:invalid_type",
+        ),
+        (
+            lambda d: (
+                d.__setitem__("AppArmorProfile", ""),
+                d["HostConfig"].__setitem__(
+                    "SecurityOpt", ["no-new-privileges=true"]
+                ),
+            ),
+            "TopLevel.AppArmorProfile:empty_without_explicit_policy",
+        ),
+        (
+            lambda d: (
+                d.__setitem__("AppArmorProfile", ""),
+                d["State"].__setitem__("Status", "running"),
+            ),
+            "TopLevel.AppArmorProfile:empty_non_created_state",
+        ),
+        (
+            lambda d: d["HostConfig"].__setitem__(
+                "SecurityOpt",
+                ["no-new-privileges=true", "apparmor=unconfined"],
+            ),
+            "HostConfig.SecurityOpt:unconfined_rejected",
+        ),
+        (
+            lambda d: d["HostConfig"].__setitem__(
+                "SecurityOpt", ["apparmor=docker-default"]
+            ),
+            "HostConfig.SecurityOpt:value_mismatch",
         ),
         (
             lambda d: d["GraphDriver"].__setitem__("Name", "vfs"),
@@ -1468,6 +1583,7 @@ def test_native_cli_smoke_transport_mappings_and_error_handling(monkeypatch):
     assert "--read-only" in create_args
     assert "--cap-drop" in create_args and "ALL" in create_args
     assert "--security-opt" in create_args and "no-new-privileges=true" in create_args
+    assert "apparmor=docker-default" in create_args
     assert "--cpu-period" in create_args and "100000" in create_args
     assert "--cpu-quota" in create_args and "100000" in create_args
     assert "--memory" in create_args and f"{1024**3}b" in create_args
