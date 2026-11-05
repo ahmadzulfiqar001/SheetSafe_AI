@@ -10,7 +10,7 @@ from runner.policy import SandboxPolicy
 
 INSPECTION_API = "1.56"  # Reviewed initial schema, not a claim of all-version support.
 # Bound to the reviewed local manifest; distinct from its ID or a registry digest.
-LOCAL_CONFIG_DIGEST = "sha256:59f66d35ff913f60851bde600c75680bc0054c04f32ba72ec42ca2ae2ec6d546"
+LOCAL_CONFIG_DIGEST = "sha256:b8f4b51b1c59238d91633eb8cd99bc7f3fcc4a56f1e18f446681b5803d635336"
 
 
 class MetadataError(ValueError):

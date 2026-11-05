@@ -16,10 +16,12 @@ started or executed. No commit, deployment or cloud expenditure occurred.
 
 | Identity | Exact value / status |
 | --- | --- |
-| Approved local manifest/image ID for static selection | `sha256:551ae45bad03b4a1856ae503c62c01a8078394a19d3c318b53fc9f2e98f66bc9` |
-| Bound local configuration blob digest | `sha256:59f66d35ff913f60851bde600c75680bc0054c04f32ba72ec42ca2ae2ec6d546` |
+| Approved local manifest/image ID for static selection | `sha256:7bf7f76f3e3e1bb35adeb41176551f0368d77f3dfd467e00dae8b0346e67ee20` |
+| Bound local configuration blob digest | `sha256:b8f4b51b1c59238d91633eb8cd99bc7f3fcc4a56f1e18f446681b5803d635336` |
+| Superseded Step 7F local manifest/image ID (historical) | `sha256:551ae45bad03b4a1856ae503c62c01a8078394a19d3c318b53fc9f2e98f66bc9` |
+| Superseded Step 7F configuration blob digest (historical) | `sha256:59f66d35ff913f60851bde600c75680bc0054c04f32ba72ec42ca2ae2ec6d546` |
 | Source/base registry index digest, separately recorded in Dockerfile | `sha256:6a0e06f5ba0b373d051aabd3fffb9b873f27f9a2a3a14bcbe37dee6f0e3bbc70` |
-| Fixed diagnostic tag | `sheetsafe-runner:environment-review` |
+| Fixed diagnostic tag | `sheetsafe-runner:permissions-review` (previously `sheetsafe-runner:environment-review`) |
 | Remotely verified final runner registry digest | None |
 | Final identity approved for execution | None |
 
@@ -57,8 +59,8 @@ ID without pulls or fallbacks, and satisfy the separately approved runtime gates
 There is still no concrete lifecycle transport or approved creation path. The
 existing injectable lifecycle contract is exercised with fakes only.
 
-The old `4f6d2d...` manifest and `0d78a20...` configuration identities are no
-longer accepted. A build, download or retag cannot change these source-controlled
+The old `4f6d2d...` / `0d78a20...` (Step 7B) and `551ae45bad...` / `59f66d35ff...`
+(Step 7F) manifest and configuration identities are no longer accepted. A build, download or retag cannot change these source-controlled
 pins automatically. Frozen Python values guard routine mutation; they do not
 defend against a compromised operator process, local daemon or image store.
 Image-store/context ownership and host service permissions remain deployment
@@ -72,7 +74,7 @@ Official read-only inspection and tag semantics:
 ### Real inspection and current preflight outcome
 
 ```powershell
-docker --context desktop-linux image inspect sha256:551ae45bad03b4a1856ae503c62c01a8078394a19d3c318b53fc9f2e98f66bc9 --format '{{json .}}'
+docker --context desktop-linux image inspect sha256:7bf7f76f3e3e1bb35adeb41176551f0368d77f3dfd467e00dae8b0346e67ee20 --format '{{json .}}'
 uv run --frozen --no-sync python -m var.step7g-inspection.verify_selection
 ```
 

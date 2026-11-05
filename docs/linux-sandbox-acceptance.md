@@ -127,12 +127,15 @@ provenance; never export a user-specific container. Archive checksum is not the
 image ID. After approved loading, use existing static preflight to compare:
 
 - local reviewed identity:
-  `sha256:551ae45bad03b4a1856ae503c62c01a8078394a19d3c318b53fc9f2e98f66bc9`;
+  `sha256:7bf7f76f3e3e1bb35adeb41176551f0368d77f3dfd467e00dae8b0346e67ee20`
+  (superseding Step 7F's `sha256:551ae45bad03b4a1856ae503c62c01a8078394a19d3c318b53fc9f2e98f66bc9`);
 - separate config digest:
-  `sha256:59f66d35ff913f60851bde600c75680bc0054c04f32ba72ec42ca2ae2ec6d546`;
+  `sha256:b8f4b51b1c59238d91633eb8cd99bc7f3fcc4a56f1e18f446681b5803d635336`
+  (superseding Step 7F's `sha256:59f66d35ff913f60851bde600c75680bc0054c04f32ba72ec42ca2ae2ec6d546`);
 - linux/amd64, user 10001:10001, fixed entrypoint, smoke-v1-only command,
-  minimal reviewed environment, no unexpected volumes/healthcheck/assets;
-- fixed diagnostic tag resolves to the same identity; no pull/fallback.
+  minimal reviewed environment, `/opt/sheetsafe` mode `0755` (`0:0`) and
+  `/opt/sheetsafe/bootstrap.py` mode `0444` (`0:0`), no unexpected volumes/healthcheck/assets;
+- fixed diagnostic tag (`sheetsafe-runner:permissions-review`) resolves to the same identity; no pull/fallback.
 
 Native classic/containerd image stores may expose identity differently. Missing
 descriptor/config annotations or changed local identity is a blocker, not a

@@ -122,7 +122,7 @@ def test_fixed_spec_security_fields_and_server_generated_identity(monkeypatch):
     assert spec.name == "sheetsafe-smoke-" + spec.job_id
     assert spec.platform == "linux/amd64" and spec.image_id == LOCAL_IMAGE_ID
     body = spec.create_body()
-    assert body["Image"] == "sha256:551ae45bad03b4a1856ae503c62c01a8078394a19d3c318b53fc9f2e98f66bc9"
+    assert body["Image"] == "sha256:7bf7f76f3e3e1bb35adeb41176551f0368d77f3dfd467e00dae8b0346e67ee20"
     assert body["User"] == "10001:10001"
     assert body["Entrypoint"] == ["/usr/local/bin/python", "-I", "-S", "-B", "-u", "/opt/sheetsafe/bootstrap.py"]
     assert body["Cmd"] == ["smoke-v1"]
