@@ -2111,14 +2111,16 @@ class PlanningService:
 
         duration_ms = max(0, int((time.monotonic() - started_mono) * 1000))
 
-        # Store in session's PrivateStorage under 'snapshot' category so it is cleaned up
+        # Store in session's PrivateStorage under 'version' input category so it is cleaned up
         # on session revocation without conflicting with the synthetic 'original' slot.
         stored = self.storage.store(
             principal,
-            category="snapshot",
+            category="version",
             file_type="csv",
             chunks=[csv_bytes],
             byte_count=bundle.byte_count,
+            run_id=None,
+            candidate_version=0,
         )
 
         dataset_id = uuid4().hex

@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import json
+import shutil
 import sys
 import time
 
@@ -14,6 +15,16 @@ from backend.config import Settings
 from backend.inference import build_validated_dataset_schema
 from backend.main import create_app
 from backend.planning import UploadedCsvAnalyticsOutcome
+from backend.security.sessions import SessionPrincipal
+from backend.storage.database import Database
+from backend.storage.files import (
+    CATEGORIES,
+    INPUT_LIMIT,
+    PARSED_LIMIT,
+    PrivateStorage,
+    SessionError,
+    TYPES,
+)
 from frontend.api_client import (
     FrontendClientCode,
     FrontendClientError,
@@ -276,7 +287,23 @@ def test_fastapi_csv_analytics_endpoint_and_coexistence_with_synthetic_demo(
     assert len(body["numeric_summaries"]) == 2
     assert body["chart"]["chart_kind"] == "LINE"
 
-    # 3. Synthetic demo dataset still provisions cleanly in the same session
+    # Verify storage contract: stored under 'version' input category with sealed SHA256 and null run_id
+    db = csv_app_client.app.state.database
+    storage = csv_app_client.app.state.storage
+    with db.connection() as conn:
+        st_row = conn.execute(
+            "SELECT * FROM storage_objects WHERE session_id=? AND category='version'",
+            (session_id,),
+        ).fetchone()
+        assert st_row is not None
+        assert st_row["category"] == "version"
+        assert st_row["file_type"] == "csv"
+        assert st_row["run_id"] is None
+        assert st_row["candidate_version"] == 0
+        assert st_row["state"] == "SEALED"
+        assert st_row["byte_count"] == len(SAMPLE_CSV_BYTES)
+
+    # 3. Synthetic demo dataset still provisions cleanly in the same session without storage-slot conflict
     syn_resp = csv_app_client.post(
         "/api/v1/planning/synthetic-dataset",
         json={},
@@ -284,6 +311,18 @@ def test_fastapi_csv_analytics_endpoint_and_coexistence_with_synthetic_demo(
     )
     assert syn_resp.status_code == 200
     assert syn_resp.json()["is_synthetic_fixture"] is True
+
+    # Verify coexistence: both 'version' (uploaded) and 'original' (synthetic) exist in the same session
+    with db.connection() as conn:
+        categories = {
+            r["category"]
+            for r in conn.execute(
+                "SELECT category FROM storage_objects WHERE session_id=?",
+                (session_id,),
+            ).fetchall()
+        }
+        assert "version" in categories
+        assert "original" in categories
 
     # 4. Sensitive column header is blocked with 422 SENSITIVE_METADATA_BLOCKED
     sensitive_resp = csv_app_client.post(
@@ -293,6 +332,142 @@ def test_fastapi_csv_analytics_endpoint_and_coexistence_with_synthetic_demo(
     )
     assert sensitive_resp.status_code == 422
     assert sensitive_resp.json()["code"] == "SENSITIVE_METADATA_BLOCKED"
+
+    # 5. Multiple CSV uploads in the same session succeed without storage collision
+    second_csv = b"item,price\nwidget,19.99\ngadget,29.99\n"
+    second_resp = csv_app_client.post(
+        "/api/v1/planning/csv-analytics",
+        json={"filename": "second.csv", "csv_text": second_csv.decode("utf-8")},
+        headers=_auth_headers(csv_app_client, cred, csrf),
+    )
+    assert second_resp.status_code == 200
+    assert second_resp.json()["row_count"] == 2
+
+
+def test_csv_analytics_storage_lifecycle_contract_and_limits() -> None:
+    """Direct contract verification of category/type rules, metadata bounds, and storage coexistence."""
+    assert "snapshot" not in CATEGORIES
+    assert "version" in CATEGORIES
+    assert "csv" in TYPES["version"]
+    assert PrivateStorage._limit("version", "csv") == PARSED_LIMIT
+    assert PrivateStorage._limit("original", "csv") == INPUT_LIMIT
+
+    scratch = Path(__file__).resolve().parents[1] / "var" / "test_scratch_storage_contract"
+    if scratch.exists():
+        shutil.rmtree(scratch)
+    scratch.mkdir(parents=True)
+
+    try:
+        settings = Settings(
+            _env_file=None,
+            environment="development",
+            database_path=scratch / "test.sqlite3",
+            private_storage_path=scratch / "store",
+            allowed_origins=(ORIGIN,),
+        )
+        db = Database(settings)
+        db.initialize()
+        storage = PrivateStorage(db, settings)
+        storage.initialize()
+
+        principal = SessionPrincipal(
+            session_id="1" * 32,
+            audit_pseudonym="p" * 16,
+            expires_at=2000000000,
+            auth_token_hash="0" * 64,
+            csrf_token="0" * 64,
+        )
+        with db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO sessions(session_id, auth_token_hash, audit_pseudonym) VALUES (?, ?, ?)",
+                (principal.session_id, "0" * 64, principal.audit_pseudonym),
+            )
+
+        # 1. Reject unallowlisted category 'snapshot' -> 415
+        with pytest.raises(SessionError) as exc_info:
+            storage.store(
+                principal,
+                category="snapshot",
+                file_type="csv",
+                chunks=[b"a,b\n1,2\n"],
+                byte_count=8,
+            )
+        assert exc_info.value.status_code == 415
+
+        # 2. Reject non-input metadata (run_id) with input category 'version' -> 400
+        with pytest.raises(SessionError) as exc_info:
+            storage.store(
+                principal,
+                category="version",
+                file_type="csv",
+                chunks=[b"a,b\n1,2\n"],
+                byte_count=8,
+                run_id="r" * 32,
+            )
+        assert exc_info.value.status_code == 400
+
+        # 3. Reject non-input metadata (candidate_version != 0) with 'version' -> 400
+        with pytest.raises(SessionError) as exc_info:
+            storage.store(
+                principal,
+                category="version",
+                file_type="csv",
+                chunks=[b"a,b\n1,2\n"],
+                byte_count=8,
+                candidate_version=1,
+            )
+        assert exc_info.value.status_code == 400
+
+        # 4. Reject unsupported file type for 'version' -> 415
+        with pytest.raises(SessionError) as exc_info:
+            storage.store(
+                principal,
+                category="version",
+                file_type="py",
+                chunks=[b"print(1)\n"],
+                byte_count=9,
+            )
+        assert exc_info.value.status_code == 415
+
+        # 5. Valid store with category='version', file_type='csv' -> SEALED and readable
+        csv_data = b"col_a,col_b\n10,20\n30,40\n"
+        stored = storage.store(
+            principal,
+            category="version",
+            file_type="csv",
+            chunks=[csv_data],
+            byte_count=len(csv_data),
+            run_id=None,
+            candidate_version=0,
+        )
+        assert stored.category == "version"
+        assert stored.file_type == "csv"
+        assert stored.byte_count == len(csv_data)
+
+        # 6. Read back matches original uploaded bytes exactly
+        assert storage.read(principal, stored.object_id) == csv_data
+
+        # 7. Multiple 'version' files in the same session succeed without collision
+        stored2 = storage.store(
+            principal,
+            category="version",
+            file_type="csv",
+            chunks=[b"x,y\n1,2\n"],
+            byte_count=8,
+        )
+        assert stored2.object_id != stored.object_id
+
+        # 8. Synthetic fixture 'original' also stores in the same session without slot conflict
+        stored_orig = storage.store(
+            principal,
+            category="original",
+            file_type="csv",
+            chunks=[b"orig,val\n1,1\n"],
+            byte_count=13,
+        )
+        assert stored_orig.category == "original"
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 @pytest.mark.skipif(
