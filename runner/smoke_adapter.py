@@ -923,6 +923,7 @@ def normalize_created_inspect(
         "MountLabel",
         "ExecIDs",
         "GraphDriver",
+        "Storage",
         "ImageManifestDescriptor",
         "SizeRw",
         "SizeRootFs",
@@ -1050,7 +1051,7 @@ def normalize_created_inspect(
                     "TopLevel.ImageManifestDescriptor.platform:value_mismatch"
                 )
 
-    # 2. GraphDriver validation (supports overlay2 with layer path map or None, and overlayfs snapshotter)
+    # 2. GraphDriver & Storage validation (supports overlay2 GraphDriver and Docker 29 containerd Storage.RootFS.Snapshot)
     if "GraphDriver" in raw_dict and raw_dict["GraphDriver"] is not None:
         gd = raw_dict["GraphDriver"]
         if (
@@ -1072,6 +1073,48 @@ def normalize_created_inspect(
                     or any(ord(c) < 32 or ord(c) == 127 for c in v)
                 ):
                     raise PolicyMismatchError("GraphDriver.Data:value_mismatch")
+
+    if "Storage" in raw_dict and raw_dict["Storage"] is not None:
+        storage_obj = raw_dict["Storage"]
+        if type(storage_obj) is not dict:
+            raise PolicyMismatchError("TopLevel.Storage:invalid_type")
+        extra_storage_keys = sorted(storage_obj.keys() - {"RootFS"})
+        if extra_storage_keys:
+            raise PolicyMismatchError(
+                f"TopLevel.Storage.{extra_storage_keys[0]}:unexpected_field"
+            )
+        rootfs_obj = storage_obj.get("RootFS")
+        if rootfs_obj is not None:
+            if type(rootfs_obj) is not dict:
+                raise PolicyMismatchError(
+                    "TopLevel.Storage.RootFS:invalid_type"
+                )
+            extra_rootfs_keys = sorted(rootfs_obj.keys() - {"Snapshot"})
+            if extra_rootfs_keys:
+                raise PolicyMismatchError(
+                    f"TopLevel.Storage.RootFS.{extra_rootfs_keys[0]}:unexpected_field"
+                )
+            snapshot_obj = rootfs_obj.get("Snapshot")
+            if snapshot_obj is not None:
+                if type(snapshot_obj) is not dict:
+                    raise PolicyMismatchError(
+                        "TopLevel.Storage.RootFS.Snapshot:invalid_type"
+                    )
+                extra_snap_keys = sorted(snapshot_obj.keys() - {"Name"})
+                if extra_snap_keys:
+                    raise PolicyMismatchError(
+                        f"TopLevel.Storage.RootFS.Snapshot.{extra_snap_keys[0]}:unexpected_field"
+                    )
+                snap_name = snapshot_obj.get("Name")
+                if snap_name is not None:
+                    if (
+                        type(snap_name) is not str
+                        or not (0 < len(snap_name) <= 64)
+                        or snap_name not in {"overlayfs", "overlay2"}
+                    ):
+                        raise PolicyMismatchError(
+                            "TopLevel.Storage.RootFS.Snapshot.Name:value_mismatch"
+                        )
 
     expected_config = spec.create_body()
     expected_host = expected_config.pop("HostConfig")

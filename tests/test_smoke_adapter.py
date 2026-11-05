@@ -728,7 +728,7 @@ def build_docker29_cli_created_inspect_response(
         "annotations": {"config.digest": LOCAL_CONFIG_DIGEST},
         "platform": {"architecture": "amd64", "os": "linux"},
     }
-    # 2. GraphDriver with overlay2 layer path dictionary
+    # 2. GraphDriver and Docker 29 containerd Storage metadata
     raw["GraphDriver"] = {
         "Name": "overlay2",
         "Data": {
@@ -738,6 +738,7 @@ def build_docker29_cli_created_inspect_response(
             "WorkDir": "/var/lib/docker/overlay2/layer1/work",
         },
     }
+    raw["Storage"] = {"RootFS": {"Snapshot": {"Name": "overlayfs"}}}
     # 3. Config fields from `docker create` CLI
     raw["Config"]["AttachStdout"] = True
     raw["Config"]["AttachStderr"] = True
@@ -800,13 +801,25 @@ def test_smoke_adapter_docker29_cli_created_inspect_compatibility_and_diagnostic
     assert projection["HostConfig"]["ReadonlyRootfs"] is True
     assert projection["HostConfig"]["OomKillDisable"] is False
 
-    # Also verify containerd snapshotter variant (`Driver: "overlayfs"`, `GraphDriver: {"Name": "overlayfs", "Data": None}`)
-    overlayfs_payload = deepcopy(docker29_payload)
-    overlayfs_payload["Driver"] = "overlayfs"
-    overlayfs_payload["GraphDriver"] = {"Name": "overlayfs", "Data": None}
-    assert (
-        normalize_created_inspect(overlayfs_payload, spec, cid)["Id"] == cid
-    )
+    # Also verify containerd snapshotter variants and documented null/omitted Storage forms
+    for valid_storage in (
+        {"RootFS": {"Snapshot": {"Name": "overlayfs"}}},
+        {"RootFS": {"Snapshot": {"Name": "overlay2"}}},
+        {"RootFS": {"Snapshot": {"Name": None}}},
+        {"RootFS": {"Snapshot": {}}},
+        {"RootFS": {"Snapshot": None}},
+        {"RootFS": {}},
+        {"RootFS": None},
+        {},
+        None,
+    ):
+        storage_variant = deepcopy(docker29_payload)
+        storage_variant["Driver"] = "overlayfs"
+        storage_variant["GraphDriver"] = None
+        storage_variant["Storage"] = valid_storage
+        assert (
+            normalize_created_inspect(storage_variant, spec, cid)["Id"] == cid
+        )
 
     # 2. Full SmokeAdapter lifecycle with Docker 29.9.3 pre-start inspect payload succeeds
     fake_docker = FakeSmokeDocker(use_native_inspect_format=True)
@@ -847,6 +860,36 @@ def test_smoke_adapter_docker29_cli_created_inspect_compatibility_and_diagnostic
         (
             lambda d: d["GraphDriver"].__setitem__("Name", "vfs"),
             "GraphDriver:value_mismatch",
+        ),
+        (
+            lambda d: d.__setitem__("Storage", "not-a-dict"),
+            "TopLevel.Storage:invalid_type",
+        ),
+        (
+            lambda d: d["Storage"].__setitem__("ExtraStorageField", True),
+            "TopLevel.Storage.ExtraStorageField:unexpected_field",
+        ),
+        (
+            lambda d: d["Storage"]["RootFS"].__setitem__("ExtraRootField", True),
+            "TopLevel.Storage.RootFS.ExtraRootField:unexpected_field",
+        ),
+        (
+            lambda d: d["Storage"]["RootFS"]["Snapshot"].__setitem__(
+                "ExtraSnapField", "/host/path"
+            ),
+            "TopLevel.Storage.RootFS.Snapshot.ExtraSnapField:unexpected_field",
+        ),
+        (
+            lambda d: d["Storage"]["RootFS"]["Snapshot"].__setitem__(
+                "Name", "vfs"
+            ),
+            "TopLevel.Storage.RootFS.Snapshot.Name:value_mismatch",
+        ),
+        (
+            lambda d: d["Storage"]["RootFS"]["Snapshot"].__setitem__(
+                "Name", ""
+            ),
+            "TopLevel.Storage.RootFS.Snapshot.Name:value_mismatch",
         ),
         (
             lambda d: d["Config"].__setitem__("User", "0:0"),
