@@ -1673,38 +1673,46 @@ def test_smoke_adapter_rejects_symlinks_and_hardlinks(tmp_path: Path):
     """Symlinked state file, lock file, state directory, ancestor directory, and hardlinks fail closed."""
     fake_docker = FakeSmokeDocker()
 
-    real_dir = tmp_path / "real_runner"
-    real_dir.mkdir(mode=0o700)
-    real_dir.chmod(0o700)
     outside_target = tmp_path / "outside_target.json"
     outside_target.write_text("{}", encoding="utf-8")
     outside_target.chmod(0o600)
 
-    # 1. Symlinked state file is rejected
-    sym_state = real_dir / "smoke_state.json"
+    # 1. Symlinked state file is rejected without creating smoke_state.lock (isolated directory)
+    case1_dir = tmp_path / "case1_sym_state"
+    case1_dir.mkdir(mode=0o700)
+    case1_dir.chmod(0o700)
+    sym_state = case1_dir / "smoke_state.json"
     _create_symlink_for_test(outside_target, sym_state)
     adapter1 = SmokeAdapter(fake_docker, state_path=sym_state)
     assert adapter1.admissions_blocked is True
     with pytest.raises(SmokeAdmissionError) as exc_info:
         adapter1.run_smoke("smoke-v1", dry_run=False)
     assert exc_info.value.code is SmokeFailureCode.STATE_STORAGE_UNSAFE
-    sym_state.unlink()
+    assert not (case1_dir / DEFAULT_LOCK_FILE_NAME).exists()
 
-    # 2. Symlinked lock file is rejected
-    sym_lock = real_dir / DEFAULT_LOCK_FILE_NAME
+    # 2. Symlinked lock file is rejected (isolated directory)
+    case2_dir = tmp_path / "case2_sym_lock"
+    case2_dir.mkdir(mode=0o700)
+    case2_dir.chmod(0o700)
+    sym_lock = case2_dir / DEFAULT_LOCK_FILE_NAME
     _create_symlink_for_test(outside_target, sym_lock)
     adapter2 = SmokeAdapter(
-        fake_docker, state_path=real_dir / "smoke_state.json"
+        fake_docker, state_path=case2_dir / "smoke_state.json"
     )
     assert adapter2.admissions_blocked is True
     with pytest.raises(SmokeAdmissionError) as exc_info:
         adapter2.run_smoke("smoke-v1", dry_run=False)
     assert exc_info.value.code is SmokeFailureCode.STATE_STORAGE_UNSAFE
-    sym_lock.unlink()
 
-    # 3. Symlinked state directory is rejected
-    sym_dir = tmp_path / "symlinked_runner_dir"
-    _create_symlink_for_test(real_dir, sym_dir, target_is_directory=True)
+    # 3. Symlinked state directory is rejected (isolated directory)
+    case3_base = tmp_path / "case3_sym_dir"
+    case3_base.mkdir(mode=0o700)
+    case3_base.chmod(0o700)
+    case3_real = case3_base / "real_runner"
+    case3_real.mkdir(mode=0o700)
+    case3_real.chmod(0o700)
+    sym_dir = case3_base / "symlinked_runner_dir"
+    _create_symlink_for_test(case3_real, sym_dir, target_is_directory=True)
     adapter3 = SmokeAdapter(
         fake_docker, state_path=sym_dir / "smoke_state.json"
     )
@@ -1713,27 +1721,33 @@ def test_smoke_adapter_rejects_symlinks_and_hardlinks(tmp_path: Path):
         adapter3.run_smoke("smoke-v1", dry_run=False)
     assert exc_info.value.code is SmokeFailureCode.STATE_STORAGE_UNSAFE
 
-    # 4. Symlinked ancestor directory is rejected
-    real_parent = tmp_path / "real_parent"
+    # 4. Symlinked ancestor directory is rejected (isolated directory)
+    case4_base = tmp_path / "case4_sym_ancestor"
+    case4_base.mkdir(mode=0o700)
+    case4_base.chmod(0o700)
+    real_parent = case4_base / "real_parent"
     real_parent.mkdir(mode=0o700)
     real_parent.chmod(0o700)
     nested_dir = real_parent / "runner"
     nested_dir.mkdir(mode=0o700)
     nested_dir.chmod(0o700)
-    sym_parent = tmp_path / "sym_parent"
+    sym_parent = case4_base / "sym_parent"
     _create_symlink_for_test(real_parent, sym_parent, target_is_directory=True)
     adapter4 = SmokeAdapter(
         fake_docker,
         state_path=sym_parent / "runner" / "smoke_state.json",
-        trusted_ancestor_root=tmp_path,
+        trusted_ancestor_root=case4_base,
     )
     assert adapter4.admissions_blocked is True
     with pytest.raises(SmokeAdmissionError) as exc_info:
         adapter4.run_smoke("smoke-v1", dry_run=False)
     assert exc_info.value.code is SmokeFailureCode.STATE_STORAGE_UNSAFE
 
-    # 5. Hardlinked state file (st_nlink > 1) is rejected
-    valid_state = real_dir / "smoke_state.json"
+    # 5. Hardlinked state file (st_nlink > 1) is rejected (isolated directory)
+    case5_dir = tmp_path / "case5_hardlink_state"
+    case5_dir.mkdir(mode=0o700)
+    case5_dir.chmod(0o700)
+    valid_state = case5_dir / "smoke_state.json"
     adapter_ok = SmokeAdapter(fake_docker, state_path=valid_state)
     adapter_ok.initialize_ledger()
     hardlink_path = tmp_path / "hardlinked_state.json"
@@ -1759,6 +1773,36 @@ def test_smoke_adapter_rejects_symlinks_and_hardlinks(tmp_path: Path):
         if win_hardlinks is not None:
             win_hardlinks.discard(Path(os.path.abspath(valid_state)))
         hardlink_path.unlink()
+
+    # 6. Hardlinked lock file (st_nlink > 1) is rejected (isolated directory)
+    case6_dir = tmp_path / "case6_hardlink_lock"
+    case6_dir.mkdir(mode=0o700)
+    case6_dir.chmod(0o700)
+    case6_state = case6_dir / "smoke_state.json"
+    adapter6_init = SmokeAdapter(fake_docker, state_path=case6_state)
+    adapter6_init.initialize_ledger()
+    case6_lock = case6_dir / DEFAULT_LOCK_FILE_NAME
+    assert case6_lock.exists()
+    hardlink_lock_path = tmp_path / "hardlinked_lock.lock"
+    if os.name != "nt":
+        os.link(case6_lock, hardlink_lock_path)
+    else:
+        try:
+            os.link(case6_lock, hardlink_lock_path)
+        except OSError:
+            hardlink_lock_path.write_bytes(b"")
+            if win_hardlinks is not None:
+                win_hardlinks.add(Path(os.path.abspath(case6_lock)))
+    try:
+        adapter6 = SmokeAdapter(fake_docker, state_path=case6_state)
+        assert adapter6.admissions_blocked is True
+        with pytest.raises(SmokeAdmissionError) as exc_info:
+            adapter6.run_smoke("smoke-v1", dry_run=False)
+        assert exc_info.value.code is SmokeFailureCode.STATE_STORAGE_UNSAFE
+    finally:
+        if win_hardlinks is not None:
+            win_hardlinks.discard(Path(os.path.abspath(case6_lock)))
+        hardlink_lock_path.unlink()
 
     assert len(fake_docker.calls) == 0
 

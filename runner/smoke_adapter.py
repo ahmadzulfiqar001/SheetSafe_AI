@@ -1860,7 +1860,16 @@ class _DurableSmokeLedger:
             yield
             return
 
+        euid, egid = self._check_operator_not_guest()
         with self._open_validated_state_dir() as dir_fd:
+            for fname in (self.path.name, self.lock_name):
+                full_p = self.state_dir / fname
+                try:
+                    facts = self._lstat_at(dir_fd, fname, full_p)
+                except FileNotFoundError:
+                    continue
+                self._validate_file_facts(full_p, facts, euid, egid)
+
             lock_fd = self._open_validated_regular_file(
                 dir_fd,
                 self.lock_name,
