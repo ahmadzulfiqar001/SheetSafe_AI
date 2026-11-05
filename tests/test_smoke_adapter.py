@@ -52,6 +52,7 @@ from runner.smoke_adapter import (
     DryRunSmokeTransport,
     LocalOperatorEnvironmentReader,
     NativeCliSmokeTransport,
+    PolicyMismatchError,
     SmokeAdapter,
     SmokeAdmissionError,
     SmokeFailureCode,
@@ -690,6 +691,241 @@ def test_smoke_adapter_native_inspect_normalization_boundary():
         with pytest.raises(RunnerLifecycleError) as exc_info:
             normalize_created_inspect(tampered, spec, cid)
         assert exc_info.value.code is FailureCode.POLICY_MISMATCH
+        assert isinstance(exc_info.value, PolicyMismatchError)
+        assert exc_info.value.detail
+
+
+def build_docker29_cli_created_inspect_response(
+    spec: ContainerJobSpec,
+    container_id: str,
+) -> dict:
+    """Construct a realistic Docker 29.9.3 (Ubuntu 24.04, cgroups v2) pre-start `docker inspect` payload.
+
+    Reflects actual differences produced by `docker create` CLI + `docker inspect` before `docker start`:
+    - Empty pre-start networking file paths (`ResolvConfPath: ""`, `HostnamePath: ""`, `HostsPath: ""`)
+    - Top-level `ImageManifestDescriptor` (containerd image store), `SizeRw: None`, `SizeRootFs: None`
+    - `GraphDriver` with populated `Data` layer directory map (`LowerDir`, `MergedDir`, `UpperDir`, `WorkDir`)
+    - `Config` with `AttachStdout: True`, `AttachStderr: True`, omitted `ExposedPorts` and `Volumes` (`omitempty`),
+      omitted `NetworkDisabled` (since `--network none` sets `HostConfig.NetworkMode="none"`), `StopTimeout: None`
+    - `HostConfig` with `IOMaximumIOps: 0`, `IOMaximumBandwidth: 0`, `OomKillDisable: None` (cgroups v2 default),
+      `DnsOptions: []`, `DnsSearch: []`, omitted `Mounts` and `Sysctls` (`omitempty`),
+      `SecurityOpt: ["no-new-privileges:true"]`, and core Moby `MaskedPaths`
+    - `State` with `Health: None`
+    - `NetworkSettings` with `SecondaryIPAddresses: None`, `SecondaryIPv6Addresses: None`, empty legacy
+      `DefaultNetworkSettings` fields, and `Networks.none.IPAMOperational: False`
+    """
+    raw = build_native_inspect_response(spec, container_id)
+    # 1. Top-level Docker 29 pre-start fields
+    raw["ResolvConfPath"] = ""
+    raw["HostnamePath"] = ""
+    raw["HostsPath"] = ""
+    raw["SizeRw"] = None
+    raw["SizeRootFs"] = None
+    raw["ImageManifestDescriptor"] = {
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "digest": LOCAL_IMAGE_ID,
+        "size": 1842,
+        "annotations": {"config.digest": LOCAL_CONFIG_DIGEST},
+        "platform": {"architecture": "amd64", "os": "linux"},
+    }
+    # 2. GraphDriver with overlay2 layer path dictionary
+    raw["GraphDriver"] = {
+        "Name": "overlay2",
+        "Data": {
+            "LowerDir": "/var/lib/docker/overlay2/layer1/diff:/var/lib/docker/overlay2/layer0/diff",
+            "MergedDir": "/var/lib/docker/overlay2/layer1/merged",
+            "UpperDir": "/var/lib/docker/overlay2/layer1/diff",
+            "WorkDir": "/var/lib/docker/overlay2/layer1/work",
+        },
+    }
+    # 3. Config fields from `docker create` CLI
+    raw["Config"]["AttachStdout"] = True
+    raw["Config"]["AttachStderr"] = True
+    raw["Config"].pop("ExposedPorts", None)
+    raw["Config"].pop("Volumes", None)
+    raw["Config"].pop("NetworkDisabled", None)
+    raw["Config"]["StopTimeout"] = None
+    raw["Config"]["Shell"] = None
+    # 4. HostConfig fields from Docker 29 on Ubuntu 24.04 (cgroups v2)
+    raw["HostConfig"]["IOMaximumIOps"] = 0
+    raw["HostConfig"]["IOMaximumBandwidth"] = 0
+    raw["HostConfig"]["OomKillDisable"] = None
+    raw["HostConfig"]["DnsOptions"] = []
+    raw["HostConfig"]["DnsSearch"] = []
+    raw["HostConfig"].pop("Mounts", None)
+    raw["HostConfig"].pop("Sysctls", None)
+    raw["HostConfig"]["SecurityOpt"] = ["no-new-privileges:true"]
+    raw["HostConfig"]["MaskedPaths"] = [
+        "/proc/asound",
+        "/proc/acpi",
+        "/proc/kcore",
+        "/proc/keys",
+        "/proc/latency_stats",
+        "/proc/timer_list",
+        "/proc/timer_stats",
+        "/proc/sched_debug",
+        "/proc/scsi",
+        "/sys/firmware",
+    ]
+    # 5. State with Health: None
+    raw["State"]["Health"] = None
+    # 6. NetworkSettings with SecondaryIPAddresses, SecondaryIPv6Addresses, legacy empty fields, and IPAMOperational
+    raw["NetworkSettings"]["SecondaryIPAddresses"] = None
+    raw["NetworkSettings"]["SecondaryIPv6Addresses"] = None
+    raw["NetworkSettings"]["EndpointID"] = ""
+    raw["NetworkSettings"]["Gateway"] = ""
+    raw["NetworkSettings"]["GlobalIPv6Address"] = ""
+    raw["NetworkSettings"]["GlobalIPv6PrefixLen"] = 0
+    raw["NetworkSettings"]["IPAddress"] = ""
+    raw["NetworkSettings"]["IPPrefixLen"] = 0
+    raw["NetworkSettings"]["IPv6Gateway"] = ""
+    raw["NetworkSettings"]["MacAddress"] = ""
+    raw["NetworkSettings"]["Networks"]["none"]["IPAMOperational"] = False
+    return raw
+
+
+def test_smoke_adapter_docker29_cli_created_inspect_compatibility_and_diagnostics():
+    """Docker 29.9.3 native `docker create` + `docker inspect` output passes verification and reports bounded field diagnostics on mismatch."""
+    spec = ContainerJobSpec.for_fixture(FixtureRequest("smoke-v1"))
+    cid = "d" * 64
+    docker29_payload = build_docker29_cli_created_inspect_response(spec, cid)
+
+    # 1. Realistic Docker 29.9.3 pre-start inspect payload normalizes cleanly and passes verify_configuration
+    projection = normalize_created_inspect(
+        deepcopy(docker29_payload), spec, cid
+    )
+    assert projection["Id"] == cid
+    assert projection["Config"]["User"] == "10001:10001"
+    assert projection["HostConfig"]["NetworkMode"] == "none"
+    assert projection["HostConfig"]["ReadonlyRootfs"] is True
+    assert projection["HostConfig"]["OomKillDisable"] is False
+
+    # Also verify containerd snapshotter variant (`Driver: "overlayfs"`, `GraphDriver: {"Name": "overlayfs", "Data": None}`)
+    overlayfs_payload = deepcopy(docker29_payload)
+    overlayfs_payload["Driver"] = "overlayfs"
+    overlayfs_payload["GraphDriver"] = {"Name": "overlayfs", "Data": None}
+    assert (
+        normalize_created_inspect(overlayfs_payload, spec, cid)["Id"] == cid
+    )
+
+    # 2. Full SmokeAdapter lifecycle with Docker 29.9.3 pre-start inspect payload succeeds
+    fake_docker = FakeSmokeDocker(use_native_inspect_format=True)
+    fake_docker.container_running = False
+    fake_docker.exit_code = 0
+    created_specs: dict[str, ContainerJobSpec] = {}
+    orig_create = fake_docker.create
+
+    def create_with_d29(job_spec: ContainerJobSpec, *, timeout: float) -> str:
+        created_cid = orig_create(job_spec, timeout=timeout)
+        created_specs[created_cid] = job_spec
+        fake_docker.records[created_cid] = (
+            build_docker29_cli_created_inspect_response(job_spec, created_cid)
+        )
+        return created_cid
+
+    fake_docker.create = create_with_d29  # type: ignore[method-assign]
+    adapter = SmokeAdapter(fake_docker, preflight_reader=FakeEngineReader())
+    receipt = adapter.run_smoke("smoke-v1", dry_run=False)
+    assert receipt.outcome is SmokeOutcome.COMPLETED
+    assert receipt.configuration_verified is True
+    assert receipt.started is True
+    assert receipt.cleanup_confirmed is True
+    assert receipt.failure is None
+    assert receipt.failure_detail is None
+    assert receipt.to_dict()["failure_detail"] is None
+
+    # 3. Field-level mismatch diagnostics identify the exact section.field without leaking sensitive values
+    diagnostic_cases: list[tuple[Callable[[dict], None], str]] = [
+        (
+            lambda d: d.__setitem__("UnexpectedTopKey", "secret_val"),
+            "TopLevel.UnexpectedTopKey:unexpected_field",
+        ),
+        (
+            lambda d: d.__setitem__("AppArmorProfile", "unconfined"),
+            "TopLevel.AppArmorProfile:value_mismatch",
+        ),
+        (
+            lambda d: d["GraphDriver"].__setitem__("Name", "vfs"),
+            "GraphDriver:value_mismatch",
+        ),
+        (
+            lambda d: d["Config"].__setitem__("User", "0:0"),
+            "Config.User:value_mismatch",
+        ),
+        (
+            lambda d: d["Config"].__setitem__("AttachStdin", True),
+            "Config.AttachStdin:value_mismatch",
+        ),
+        (
+            lambda d: d["Config"].__setitem__(
+                "Env", ["SECRET_API_KEY=super_secret_token_99999"]
+            ),
+            "Config.Env:value_mismatch",
+        ),
+        (
+            lambda d: d["HostConfig"].__setitem__("Privileged", True),
+            "HostConfig.Privileged:value_mismatch",
+        ),
+        (
+            lambda d: d["HostConfig"].__setitem__("OomKillDisable", True),
+            "HostConfig.OomKillDisable:value_mismatch",
+        ),
+        (
+            lambda d: d["HostConfig"].__setitem__("GroupAdd", ["docker"]),
+            "HostConfig.GroupAdd:value_mismatch",
+        ),
+        (
+            lambda d: d["HostConfig"].__setitem__(
+                "Binds", ["/var/run/docker.sock:/var/run/docker.sock"]
+            ),
+            "HostConfig.Binds:value_mismatch",
+        ),
+        (
+            lambda d: d["State"].__setitem__("Running", True),
+            "State.Running:value_mismatch",
+        ),
+        (
+            lambda d: d["NetworkSettings"]["Networks"]["none"].__setitem__(
+                "IPAddress", "10.0.0.5"
+            ),
+            "NetworkSettings.Networks.none.IPAddress:value_mismatch",
+        ),
+        (
+            lambda d: d["Mounts"].append({"Source": "/etc/shadow"}),
+            "Mounts:value_mismatch",
+        ),
+    ]
+    for mutate_fn, expected_detail in diagnostic_cases:
+        bad = deepcopy(docker29_payload)
+        mutate_fn(bad)
+        with pytest.raises(PolicyMismatchError) as exc_info:
+            normalize_created_inspect(bad, spec, cid)
+        assert exc_info.value.code is FailureCode.POLICY_MISMATCH
+        assert exc_info.value.detail == expected_detail
+        assert "super_secret_token_99999" not in str(exc_info.value)
+        assert "/etc/shadow" not in str(exc_info.value)
+
+    # 4. SmokeReceipt surfaces bounded `failure_detail` on POLICY_MISMATCH and still cleans up container
+    tampered_docker = FakeSmokeDocker()
+    tampered_docker.inspect_hook = lambda self, ref: (
+        self.records[ref]["HostConfig"].__setitem__("Privileged", True)
+        if not self.started and ref in self.records
+        else None
+    )
+    tampered_adapter = SmokeAdapter(tampered_docker)
+    mismatch_receipt = tampered_adapter.run_smoke("smoke-v1", dry_run=False)
+    assert mismatch_receipt.outcome is SmokeOutcome.FAILED
+    assert mismatch_receipt.failure is SmokeFailureCode.POLICY_MISMATCH
+    assert (
+        mismatch_receipt.failure_detail
+        == "HostConfig.Privileged:value_mismatch"
+    )
+    assert (
+        mismatch_receipt.to_dict()["failure_detail"]
+        == "HostConfig.Privileged:value_mismatch"
+    )
+    assert mismatch_receipt.started is False
+    assert mismatch_receipt.cleanup_confirmed is True
 
 
 def test_smoke_adapter_preflight_failure_fails_closed():

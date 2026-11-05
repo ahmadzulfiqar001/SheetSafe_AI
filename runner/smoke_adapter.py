@@ -62,6 +62,7 @@ from runner.docker_backend import (
 )
 from runner.engine_metadata import (
     HOST_DEFAULTS,
+    INSPECTION_API,
     LOCAL_CONFIG_DIGEST,
     MASKED_PATHS,
     READONLY_PATHS,
@@ -164,6 +165,37 @@ class SmokeOutcome(StrEnum):
     CANCELLED = "CANCELLED"
 
 
+MAX_DIAGNOSTIC_DETAIL_LENGTH = 128
+
+
+def _sanitize_mismatch_detail(detail: str) -> str:
+    """Return a bounded, sanitized `<section>.<field>:<reason>` diagnostic identifier.
+
+    Never echoes raw metadata values, environment variables, host paths, or secrets.
+    """
+    if type(detail) is not str or not detail:
+        return "unknown_field:policy_mismatch"
+    cleaned = re.sub(r"[^A-Za-z0-9_.:/-]", "_", detail)[
+        :MAX_DIAGNOSTIC_DETAIL_LENGTH
+    ]
+    return cleaned if cleaned else "unknown_field:policy_mismatch"
+
+
+class PolicyMismatchError(RunnerLifecycleError):
+    """Raised when pre-start container configuration violates sandbox policy.
+
+    Carries a strictly bounded, sanitized `<section>.<field>:<reason>` diagnostic
+    string (`self.detail`) that never exposes secrets or raw sensitive metadata.
+    """
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(FailureCode.POLICY_MISMATCH)
+        self.detail = _sanitize_mismatch_detail(detail)
+
+    def __str__(self) -> str:
+        return f"{self.code.value} ({self.detail})"
+
+
 class SmokeAdmissionError(RuntimeError):
     def __init__(self, code: SmokeFailureCode, detail: str = "") -> None:
         self.code = code
@@ -196,6 +228,7 @@ class SmokeReceipt:
     failure: SmokeFailureCode | None
     cleanup_failure: SmokeFailureCode | None
     dry_run: bool
+    failure_detail: str | None = None
     execution_enabled: bool = field(default=False, init=False)
     production_authorized: bool = field(default=False, init=False)
     unverified_controls: tuple[str, ...] = field(
@@ -222,6 +255,7 @@ class SmokeReceipt:
             "logs_truncated": self.logs_truncated,
             "cleanup_confirmed": self.cleanup_confirmed,
             "failure": self.failure.value if self.failure else None,
+            "failure_detail": self.failure_detail,
             "cleanup_failure": (
                 self.cleanup_failure.value if self.cleanup_failure else None
             ),
@@ -462,6 +496,27 @@ class NativeCliSmokeTransport:
         self._sessions: dict[str, _AttachedContainerSession] = {}
         self._lock = threading.Lock()
 
+    @staticmethod
+    def _cli_env() -> dict[str, str]:
+        allowed_env = {
+            "PATH",
+            "SYSTEMROOT",
+            "WINDIR",
+            "USERPROFILE",
+            "HOME",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "TEMP",
+            "TMP",
+        }
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key.upper() in allowed_env
+        }
+        env["DOCKER_API_VERSION"] = INSPECTION_API
+        return env
+
     def _exec(
         self,
         arguments: list[str],
@@ -477,6 +532,7 @@ class NativeCliSmokeTransport:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                env=self._cli_env(),
                 start_new_session=True,
             )
         except OSError as exc:
@@ -621,6 +677,7 @@ class NativeCliSmokeTransport:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                env=self._cli_env(),
                 start_new_session=True,
             )
         except OSError as exc:
@@ -697,6 +754,126 @@ class NativeCliSmokeTransport:
         self._exec(args, timeout=budget)
 
 
+CORE_MASKED_PATHS = frozenset(
+    {
+        "/proc/asound",
+        "/proc/acpi",
+        "/proc/kcore",
+        "/proc/keys",
+        "/proc/latency_stats",
+        "/proc/timer_list",
+        "/proc/sched_debug",
+        "/proc/scsi",
+        "/sys/firmware",
+    }
+)
+
+SMOKE_HOST_DEFAULTS = {
+    **HOST_DEFAULTS,
+    "IOMaximumIOps": 0,
+    "IOMaximumBandwidth": 0,
+    "KernelMemory": 0,
+    "KernelMemoryTCP": 0,
+}
+
+SMOKE_EMPTY_LIST_HOST_OPTIONAL = frozenset(
+    {
+        "GroupAdd",
+        "DnsOptions",
+        "DnsSearch",
+        "Ulimits",
+        "BlkioWeightDevice",
+        "BlkioDeviceReadBps",
+        "BlkioDeviceWriteBps",
+        "BlkioDeviceReadIOps",
+        "BlkioDeviceWriteIOps",
+    }
+)
+
+SMOKE_EMPTY_DICT_HOST_OPTIONAL = frozenset({"StorageOpt", "Annotations"})
+
+
+def _validate_section_fields(
+    section: str,
+    raw: dict,
+    required: dict,
+    optional: dict,
+    *,
+    empty_list_optional: frozenset[str] = frozenset(),
+    empty_dict_optional: frozenset[str] = frozenset(),
+) -> dict:
+    """Validate section fields fail-closed and raise bounded field-level PolicyMismatchError."""
+    missing = sorted(required.keys() - raw.keys())
+    if missing:
+        raise PolicyMismatchError(f"{section}.{missing[0]}:missing_required_field")
+    unexpected = sorted(raw.keys() - required.keys() - optional.keys())
+    if unexpected:
+        raise PolicyMismatchError(f"{section}.{unexpected[0]}:unexpected_field")
+
+    result = {}
+    for name, expected in {**optional, **required}.items():
+        if name in raw:
+            value = raw[name]
+            if value is None and expected in ([], {}):
+                value = [] if expected == [] else {}
+            elif name in empty_list_optional and exact(value, []):
+                value = None
+            elif name in empty_dict_optional and exact(value, {}):
+                value = None
+            if not exact(value, expected):
+                raise PolicyMismatchError(f"{section}.{name}:value_mismatch")
+            if name in required:
+                result[name] = value
+    return result
+
+
+def _diagnose_projection_mismatch(
+    raw_dict: dict, spec: ContainerJobSpec, container_id: str
+) -> str:
+    """Identify the first mismatching section.field in an internal projection without echoing values."""
+    expected_config = spec.create_body()
+    expected_host = expected_config.pop("HostConfig")
+    expected_top = {
+        "Id": container_id,
+        "Name": "/" + spec.name,
+        "Image": spec.image_id,
+        "Config": expected_config,
+        "HostConfig": expected_host,
+        "State": {
+            "Status": "created",
+            "Running": False,
+            "Paused": False,
+            "Restarting": False,
+            "Dead": False,
+            "Pid": 0,
+        },
+        "Mounts": [],
+        "NetworkSettings": {"Ports": {}, "Networks": {"none": {}}},
+        "AppArmorProfile": "docker-default",
+    }
+    for top_key in ("Id", "Name", "Image", "AppArmorProfile", "Mounts", "NetworkSettings"):
+        if top_key not in raw_dict:
+            return f"TopLevel.{top_key}:missing_required_field"
+        if not _same(raw_dict[top_key], expected_top[top_key]):
+            prefix = top_key if top_key in ("Mounts", "NetworkSettings") else f"TopLevel.{top_key}"
+            return f"{prefix}:value_mismatch"
+    for section_name in ("Config", "HostConfig", "State"):
+        sec_val = raw_dict.get(section_name)
+        exp_sec = expected_top[section_name]
+        if type(sec_val) is not dict:
+            return f"{section_name}:invalid_type"
+        missing = sorted(exp_sec.keys() - sec_val.keys())
+        if missing:
+            return f"{section_name}.{missing[0]}:missing_required_field"
+        unexpected = sorted(sec_val.keys() - exp_sec.keys())
+        if unexpected:
+            return f"{section_name}.{unexpected[0]}:unexpected_field"
+        for k, exp_v in exp_sec.items():
+            if not _same(sec_val[k], exp_v):
+                return f"{section_name}.{k}:value_mismatch"
+    return "TopLevel:policy_mismatch"
+
+
 def normalize_created_inspect(
     raw: object, spec: ContainerJobSpec, container_id: str
 ) -> dict:
@@ -704,15 +881,22 @@ def normalize_created_inspect(
 
     Accepts either:
     1. The exact internal projection expected by verify_configuration (with zero extra/unreviewed fields), or
-    2. Native Docker Engine inspect JSON, validated fail-closed against audited defaults
-       (HOST_DEFAULTS, MASKED_PATHS, READONLY_PATHS, environment, network none, etc.).
+    2. Native Docker Engine inspect JSON (including Docker 29 CLI `docker create` + `docker inspect`),
+       validated fail-closed against audited defaults (SMOKE_HOST_DEFAULTS, CORE_MASKED_PATHS,
+       READONLY_PATHS, environment, network none, etc.).
 
+    Raises PolicyMismatchError (subclass of RunnerLifecycleError with FailureCode.POLICY_MISMATCH)
+    carrying a bounded, sanitized `<section>.<field>:<reason>` diagnostic on any violation.
     Never weakens verify_configuration or ignores unknown/unsafe metadata fields.
     """
     if not _valid_id(container_id) or _owned_id(raw, spec) != container_id:
         raise RunnerLifecycleError(FailureCode.INVALID_IDENTITY)
 
-    raw_dict = object_value(raw)
+    try:
+        raw_dict = object_value(raw)
+    except MetadataError as exc:
+        raise PolicyMismatchError("TopLevel:invalid_type") from exc
+
     required_top = {
         "Id",
         "Name",
@@ -739,13 +923,18 @@ def normalize_created_inspect(
         "MountLabel",
         "ExecIDs",
         "GraphDriver",
+        "ImageManifestDescriptor",
+        "SizeRw",
+        "SizeRootFs",
+        "Node",
     }
 
-    if not (
-        required_top <= raw_dict.keys()
-        and not (raw_dict.keys() - required_top - optional_top)
-    ):
-        raise RunnerLifecycleError(FailureCode.POLICY_MISMATCH)
+    missing_top = sorted(required_top - raw_dict.keys())
+    if missing_top:
+        raise PolicyMismatchError(f"TopLevel.{missing_top[0]}:missing_required_field")
+    unexpected_top = sorted(raw_dict.keys() - required_top - optional_top)
+    if unexpected_top:
+        raise PolicyMismatchError(f"TopLevel.{unexpected_top[0]}:unexpected_field")
 
     raw_host_obj = raw_dict.get("HostConfig")
     raw_state_obj = raw_dict.get("State")
@@ -762,188 +951,508 @@ def normalize_created_inspect(
         and "Hostname" not in raw_config_obj
     )
     if is_internal_projection:
-        verify_configuration(raw_dict, spec, container_id)
+        try:
+            verify_configuration(raw_dict, spec, container_id)
+        except RunnerLifecycleError as exc:
+            if exc.code is FailureCode.POLICY_MISMATCH:
+                raise PolicyMismatchError(
+                    _diagnose_projection_mismatch(raw_dict, spec, container_id)
+                ) from exc
+            raise
         return raw_dict
 
-    try:
-        policy = SandboxPolicy()
-        require(
-            exact(raw_dict["Name"], "/" + spec.name) and type(raw_dict["Image"]) is str
-        )
-        require(raw_dict["Image"] in {spec.image_id, LOCAL_CONFIG_DIGEST})
+    policy = SandboxPolicy()
 
-        for name in (
-            "Created",
-            "Driver",
-            "ResolvConfPath",
-            "HostnamePath",
-            "HostsPath",
+    # 1. Top-level scalar & descriptor checks
+    if not exact(raw_dict["Name"], "/" + spec.name):
+        raise PolicyMismatchError("TopLevel.Name:value_mismatch")
+    if type(raw_dict["Image"]) is not str or raw_dict["Image"] not in {
+        spec.image_id,
+        LOCAL_CONFIG_DIGEST,
+    }:
+        raise PolicyMismatchError("TopLevel.Image:value_mismatch")
+    if not exact(raw_dict["AppArmorProfile"], "docker-default"):
+        raise PolicyMismatchError("TopLevel.AppArmorProfile:value_mismatch")
+
+    if "Created" in raw_dict:
+        try:
+            string(raw_dict["Created"])
+        except MetadataError as exc:
+            raise PolicyMismatchError("TopLevel.Created:invalid_value") from exc
+
+    if "Driver" in raw_dict:
+        if raw_dict["Driver"] not in {"overlay2", "overlayfs"}:
+            raise PolicyMismatchError("TopLevel.Driver:value_mismatch")
+
+    # Pre-start created containers in Docker Engine have "" for networking file paths
+    # until containerStart initializes /etc/resolv.conf, /etc/hostname, and /etc/hosts.
+    for path_field in ("ResolvConfPath", "HostnamePath", "HostsPath"):
+        if path_field in raw_dict and raw_dict[path_field] != "":
+            try:
+                string(raw_dict[path_field])
+            except MetadataError as exc:
+                raise PolicyMismatchError(
+                    f"TopLevel.{path_field}:invalid_value"
+                ) from exc
+
+    for name, expected_val in {
+        "Path": policy.entrypoint[0],
+        "Args": [*policy.entrypoint[1:], "smoke-v1"],
+        "Platform": "linux",
+        "RestartCount": 0,
+        "LogPath": "",
+        "ProcessLabel": "",
+        "MountLabel": "",
+        "ExecIDs": None,
+        "Node": None,
+    }.items():
+        if name in raw_dict and not exact(raw_dict[name], expected_val):
+            raise PolicyMismatchError(f"TopLevel.{name}:value_mismatch")
+
+    for size_field in ("SizeRw", "SizeRootFs"):
+        if size_field in raw_dict and raw_dict[size_field] is not None:
+            val = raw_dict[size_field]
+            if type(val) is not int or val < 0:
+                raise PolicyMismatchError(f"TopLevel.{size_field}:invalid_value")
+
+    if (
+        "ImageManifestDescriptor" in raw_dict
+        and raw_dict["ImageManifestDescriptor"] is not None
+    ):
+        desc = raw_dict["ImageManifestDescriptor"]
+        allowed_desc_keys = {
+            "mediaType",
+            "digest",
+            "size",
+            "urls",
+            "annotations",
+            "data",
+            "platform",
+            "artifactType",
+        }
+        if type(desc) is not dict or bool(desc.keys() - allowed_desc_keys):
+            raise PolicyMismatchError(
+                "TopLevel.ImageManifestDescriptor:value_mismatch"
+            )
+        if "digest" in desc and desc["digest"] is not None:
+            if desc["digest"] not in {spec.image_id, LOCAL_CONFIG_DIGEST}:
+                raise PolicyMismatchError(
+                    "TopLevel.ImageManifestDescriptor.digest:value_mismatch"
+                )
+        if "platform" in desc and desc["platform"] is not None:
+            plat = desc["platform"]
+            if (
+                type(plat) is not dict
+                or plat.get("os") != "linux"
+                or plat.get("architecture") != "amd64"
+            ):
+                raise PolicyMismatchError(
+                    "TopLevel.ImageManifestDescriptor.platform:value_mismatch"
+                )
+
+    # 2. GraphDriver validation (supports overlay2 with layer path map or None, and overlayfs snapshotter)
+    if "GraphDriver" in raw_dict and raw_dict["GraphDriver"] is not None:
+        gd = raw_dict["GraphDriver"]
+        if (
+            type(gd) is not dict
+            or set(gd.keys()) != {"Name", "Data"}
+            or gd.get("Name") not in {"overlay2", "overlayfs"}
         ):
-            if name in raw_dict:
-                string(raw_dict[name])
+            raise PolicyMismatchError("GraphDriver:value_mismatch")
+        gd_data = gd.get("Data")
+        if gd_data is not None:
+            if type(gd_data) is not dict or len(gd_data) > 16:
+                raise PolicyMismatchError("GraphDriver.Data:value_mismatch")
+            for k, v in gd_data.items():
+                if (
+                    type(k) is not str
+                    or not (0 < len(k) <= 64)
+                    or type(v) is not str
+                    or len(v) > 4096
+                    or any(ord(c) < 32 or ord(c) == 127 for c in v)
+                ):
+                    raise PolicyMismatchError("GraphDriver.Data:value_mismatch")
 
-        for name, expected_val in {
-            "Path": policy.entrypoint[0],
-            "Args": [*policy.entrypoint[1:], "smoke-v1"],
-            "Platform": "linux",
-            "RestartCount": 0,
-            "LogPath": "",
-            "ProcessLabel": "",
-            "MountLabel": "",
-            "ExecIDs": None,
-        }.items():
-            if name in raw_dict:
-                require(exact(raw_dict[name], expected_val))
+    expected_config = spec.create_body()
+    expected_host = expected_config.pop("HostConfig")
 
-        if "GraphDriver" in raw_dict:
-            require(
-                exact(raw_dict["GraphDriver"], {"Name": "overlay2", "Data": None})
-            )
+    # 3. Config validation
+    if type(raw_dict["Config"]) is not dict:
+        raise PolicyMismatchError("Config:invalid_type")
+    config = dict(raw_dict["Config"])
 
-        expected_config = spec.create_body()
-        expected_host = expected_config.pop("HostConfig")
-
-        config = dict(object_value(raw_dict["Config"]))
-        require(environment(config.get("Env")) == tuple(sorted(policy.environment)))
-        config["Env"] = expected_config["Env"]
-        config = _review_fields(
-            config,
-            expected_config,
-            {
-                "Hostname": container_id[:12],
-                "Domainname": "",
-                "AttachStdin": False,
-                "AttachStdout": False,
-                "AttachStderr": False,
-                "OnBuild": None,
-                "ArgsEscaped": True,
-            },
-        )
-
-        host = dict(object_value(raw_dict["HostConfig"]))
-        if exact(host.get("SecurityOpt"), ["no-new-privileges"]):
-            host["SecurityOpt"] = ["no-new-privileges=true"]
-        masked, readonly = host.get("MaskedPaths"), host.get("ReadonlyPaths")
-        for paths in (masked, readonly):
-            require(type(paths) is list and all(type(path) is str for path in paths))
-            require(len(paths) <= 4096 and len(paths) == len(set(paths)))
-        require(
-            set(MASKED_PATHS) <= set(masked) and set(READONLY_PATHS) == set(readonly)
-        )
-        require(
-            all(
-                path in MASKED_PATHS
-                or re.fullmatch(
-                    r"/sys/devices/system/cpu/cpu[0-9]+/thermal_throttle", path
-                )
-                for path in masked
-            )
-        )
-        host["MaskedPaths"], host["ReadonlyPaths"] = MASKED_PATHS, READONLY_PATHS
-        required_host = {
-            **expected_host,
-            "MaskedPaths": MASKED_PATHS,
-            "ReadonlyPaths": READONLY_PATHS,
-        }
-        host = _review_fields(host, required_host, HOST_DEFAULTS)
-        host.pop("MaskedPaths")
-        host.pop("ReadonlyPaths")
-
-        state = _review_fields(
-            object_value(raw_dict["State"]),
-            {
-                "Status": "created",
-                "Running": False,
-                "Paused": False,
-                "Restarting": False,
-                "Dead": False,
-                "Pid": 0,
-            },
-            {
-                "OOMKilled": False,
-                "ExitCode": 0,
-                "Error": "",
-                "StartedAt": "0001-01-01T00:00:00Z",
-                "FinishedAt": "0001-01-01T00:00:00Z",
-            },
-        )
-
-        network = object_value(raw_dict["NetworkSettings"])
-        require({"Ports", "Networks"} <= network.keys())
-        require(
-            not network.keys()
-            - {
-                "Ports",
-                "Networks",
-                "SandboxID",
-                "SandboxKey",
-                "Bridge",
-                "HairpinMode",
-                "LinkLocalIPv6Address",
-                "LinkLocalIPv6PrefixLen",
-            }
-        )
-        require(network["Ports"] is None or exact(network["Ports"], {}))
-        endpoints = object_value(network["Networks"])
-        require(set(endpoints) == {"none"})
-        endpoint = object_value(endpoints["none"])
-        for name in ("NetworkID", "EndpointID"):
-            if name in endpoint:
-                require(
-                    type(endpoint[name]) is str
-                    and re.fullmatch(r"(?:[0-9a-f]{64})?", endpoint[name]) is not None
-                )
-        _review_fields(
-            {
-                key: value
-                for key, value in endpoint.items()
-                if key not in {"NetworkID", "EndpointID"}
-            },
-            {},
-            {
-                "IPAMConfig": None,
-                "Links": None,
-                "Aliases": None,
-                "DNSNames": None,
-                "DriverOpts": None,
-                "Gateway": "",
-                "IPAddress": "",
-                "IPPrefixLen": 0,
-                "IPv6Gateway": "",
-                "GlobalIPv6Address": "",
-                "GlobalIPv6PrefixLen": 0,
-                "MacAddress": "",
-                "GwPriority": 0,
-            },
-        )
-        for name in ("SandboxID", "SandboxKey"):
-            if name in network:
-                require(type(network[name]) is str and len(network[name]) <= 256)
-        for name, expected_value in {
-            "Bridge": "",
-            "HairpinMode": False,
-            "LinkLocalIPv6Address": "",
-            "LinkLocalIPv6PrefixLen": 0,
-        }.items():
-            if name in network:
-                require(exact(network[name], expected_value))
-
-        mounts = raw_dict["Mounts"]
-        if mounts is None:
-            mounts = []
-        projection = {
-            "Id": container_id,
-            "Name": raw_dict["Name"],
-            "Image": spec.image_id,
-            "Config": config,
-            "HostConfig": host,
-            "State": state,
-            "Mounts": mounts,
-            "NetworkSettings": {"Ports": {}, "Networks": {"none": {}}},
-            "AppArmorProfile": raw_dict["AppArmorProfile"],
-        }
+    try:
+        parsed_env = environment(config.get("Env"))
     except MetadataError as exc:
-        raise RunnerLifecycleError(FailureCode.POLICY_MISMATCH) from exc
+        raise PolicyMismatchError("Config.Env:invalid_value") from exc
+    if parsed_env != tuple(sorted(policy.environment)):
+        raise PolicyMismatchError("Config.Env:value_mismatch")
+    config["Env"] = expected_config["Env"]
+
+    if "Image" in config and config["Image"] in {
+        spec.image_id,
+        LOCAL_CONFIG_DIGEST,
+    }:
+        config["Image"] = spec.image_id
+
+    # `docker create` CLI sets AttachStdout=True and AttachStderr=True by default so
+    # `docker start --attach` can stream stdout/stderr; stdin and tty must remain False.
+    for stream_flag in ("AttachStdout", "AttachStderr"):
+        if stream_flag in config:
+            if type(config[stream_flag]) is not bool:
+                raise PolicyMismatchError(f"Config.{stream_flag}:value_mismatch")
+            config.pop(stream_flag)
+
+    if "Hostname" in config:
+        if config["Hostname"] not in {container_id[:12], ""}:
+            raise PolicyMismatchError("Config.Hostname:value_mismatch")
+        config.pop("Hostname")
+
+    if "ArgsEscaped" in config:
+        if type(config["ArgsEscaped"]) is not bool:
+            raise PolicyMismatchError("Config.ArgsEscaped:value_mismatch")
+        config.pop("ArgsEscaped")
+
+    if "OnBuild" in config:
+        if config["OnBuild"] is not None and not exact(config["OnBuild"], []):
+            raise PolicyMismatchError("Config.OnBuild:value_mismatch")
+        config.pop("OnBuild")
+
+    for null_or_empty_list_opt in ("Shell",):
+        if null_or_empty_list_opt in config:
+            if config[null_or_empty_list_opt] is not None and not exact(
+                config[null_or_empty_list_opt], []
+            ):
+                raise PolicyMismatchError(
+                    f"Config.{null_or_empty_list_opt}:value_mismatch"
+                )
+            config.pop(null_or_empty_list_opt)
+
+    if "StopTimeout" in config:
+        if config["StopTimeout"] is not None:
+            raise PolicyMismatchError("Config.StopTimeout:value_mismatch")
+        config.pop("StopTimeout")
+
+    if "MacAddress" in config:
+        if not exact(config["MacAddress"], ""):
+            raise PolicyMismatchError("Config.MacAddress:value_mismatch")
+        config.pop("MacAddress")
+
+    # ExposedPorts and Volumes have `omitempty` in Docker 29 container.Config when empty.
+    for empty_map_field in ("Volumes", "ExposedPorts"):
+        if empty_map_field not in config or config[empty_map_field] is None:
+            config[empty_map_field] = {}
+
+    # `docker create --network none` sets HostConfig.NetworkMode="none" and may omit
+    # or set False on Config.NetworkDisabled (`json:",omitempty"`).
+    if "NetworkDisabled" not in config:
+        config["NetworkDisabled"] = True
+    elif type(config["NetworkDisabled"]) is bool:
+        config["NetworkDisabled"] = True
+    else:
+        raise PolicyMismatchError("Config.NetworkDisabled:value_mismatch")
+
+    if "Healthcheck" in config and type(config["Healthcheck"]) is dict:
+        hc = config["Healthcheck"]
+        allowed_hc_zeros = {
+            "Interval",
+            "Timeout",
+            "StartPeriod",
+            "StartInterval",
+            "Retries",
+        }
+        if (
+            exact(hc.get("Test"), ["NONE"])
+            and not (hc.keys() - {"Test"} - allowed_hc_zeros)
+            and all(
+                exact(hc[k], 0) for k in hc.keys() - {"Test"}
+            )
+        ):
+            config["Healthcheck"] = {"Test": ["NONE"]}
+
+    config = _validate_section_fields(
+        "Config",
+        config,
+        expected_config,
+        {
+            "Domainname": "",
+            "AttachStdin": False,
+        },
+    )
+
+    # 4. HostConfig validation
+    if type(raw_dict["HostConfig"]) is not dict:
+        raise PolicyMismatchError("HostConfig:invalid_type")
+    host = dict(raw_dict["HostConfig"])
+
+    if host.get("SecurityOpt") in (
+        ["no-new-privileges"],
+        ["no-new-privileges:true"],
+    ):
+        host["SecurityOpt"] = ["no-new-privileges=true"]
+
+    # On cgroups v2 (Ubuntu 24.04 / Docker 29), OomKillDisable (*bool) is null when not set.
+    if "OomKillDisable" not in host or host["OomKillDisable"] is None:
+        host["OomKillDisable"] = False
+
+    # Empty slice/map fields in HostConfig (such as Mounts, Sysctls, DeviceRequests, etc.)
+    # may be omitted (`omitempty`) or null when empty in Docker 29 inspect output.
+    for list_field in (
+        "Binds",
+        "Mounts",
+        "VolumesFrom",
+        "Devices",
+        "DeviceRequests",
+        "DeviceCgroupRules",
+        "CapAdd",
+        "Dns",
+        "ExtraHosts",
+        "Links",
+    ):
+        if list_field not in host or host[list_field] is None:
+            host[list_field] = []
+
+    for dict_field in ("PortBindings", "Sysctls"):
+        if dict_field not in host or host[dict_field] is None:
+            host[dict_field] = {}
+
+    if "LogConfig" in host and type(host["LogConfig"]) is dict:
+        lc = host["LogConfig"]
+        if (
+            set(lc.keys()) <= {"Type", "Config"}
+            and exact(lc.get("Type"), policy.daemon_log_driver)
+            and (lc.get("Config") is None or exact(lc.get("Config"), {}))
+        ):
+            host["LogConfig"] = {"Type": policy.daemon_log_driver, "Config": {}}
+
+    if "ConsoleSize" in host and host["ConsoleSize"] is None:
+        host["ConsoleSize"] = [0, 0]
+
+    if "Init" in host and exact(host["Init"], False):
+        host["Init"] = None
+
+    if "MemorySwappiness" in host and exact(host["MemorySwappiness"], -1):
+        host["MemorySwappiness"] = None
+
+    masked, readonly = host.get("MaskedPaths"), host.get("ReadonlyPaths")
+    if (
+        type(masked) is not list
+        or not all(type(path) is str for path in masked)
+        or len(masked) > 4096
+        or len(masked) != len(set(masked))
+    ):
+        raise PolicyMismatchError("HostConfig.MaskedPaths:invalid_value")
+    if (
+        type(readonly) is not list
+        or not all(type(path) is str for path in readonly)
+        or len(readonly) > 4096
+        or len(readonly) != len(set(readonly))
+    ):
+        raise PolicyMismatchError("HostConfig.ReadonlyPaths:invalid_value")
+
+    if set(READONLY_PATHS) != set(readonly):
+        raise PolicyMismatchError("HostConfig.ReadonlyPaths:value_mismatch")
+    if not (CORE_MASKED_PATHS <= set(masked)):
+        raise PolicyMismatchError("HostConfig.MaskedPaths:value_mismatch")
+    if not all(
+        path in MASKED_PATHS
+        or re.fullmatch(
+            r"/sys/devices/system/cpu/cpu[0-9]+/thermal_throttle", path
+        )
+        for path in masked
+    ):
+        raise PolicyMismatchError("HostConfig.MaskedPaths:value_mismatch")
+
+    host["MaskedPaths"], host["ReadonlyPaths"] = MASKED_PATHS, READONLY_PATHS
+    required_host = {
+        **expected_host,
+        "MaskedPaths": MASKED_PATHS,
+        "ReadonlyPaths": READONLY_PATHS,
+    }
+    host = _validate_section_fields(
+        "HostConfig",
+        host,
+        required_host,
+        SMOKE_HOST_DEFAULTS,
+        empty_list_optional=SMOKE_EMPTY_LIST_HOST_OPTIONAL,
+        empty_dict_optional=SMOKE_EMPTY_DICT_HOST_OPTIONAL,
+    )
+    host.pop("MaskedPaths")
+    host.pop("ReadonlyPaths")
+
+    # 5. State validation
+    if type(raw_dict["State"]) is not dict:
+        raise PolicyMismatchError("State:invalid_type")
+    raw_state = dict(raw_dict["State"])
+    if "Health" in raw_state and type(raw_state["Health"]) is dict:
+        hlth = raw_state["Health"]
+        if (
+            set(hlth.keys()) <= {"Status", "FailingStreak", "Log"}
+            and hlth.get("Status") in {"none", "starting"}
+            and exact(hlth.get("FailingStreak", 0), 0)
+            and (hlth.get("Log") is None or exact(hlth.get("Log"), []))
+        ):
+            raw_state["Health"] = None
+
+    state = _validate_section_fields(
+        "State",
+        raw_state,
+        {
+            "Status": "created",
+            "Running": False,
+            "Paused": False,
+            "Restarting": False,
+            "Dead": False,
+            "Pid": 0,
+        },
+        {
+            "OOMKilled": False,
+            "ExitCode": 0,
+            "Error": "",
+            "StartedAt": "0001-01-01T00:00:00Z",
+            "FinishedAt": "0001-01-01T00:00:00Z",
+            "Health": None,
+        },
+    )
+
+    # 6. NetworkSettings validation
+    if type(raw_dict["NetworkSettings"]) is not dict:
+        raise PolicyMismatchError("NetworkSettings:invalid_type")
+    network = raw_dict["NetworkSettings"]
+    for req_net_key in ("Ports", "Networks"):
+        if req_net_key not in network:
+            raise PolicyMismatchError(
+                f"NetworkSettings.{req_net_key}:missing_required_field"
+            )
+
+    allowed_net_keys = {
+        "Ports",
+        "Networks",
+        "SandboxID",
+        "SandboxKey",
+        "Bridge",
+        "HairpinMode",
+        "LinkLocalIPv6Address",
+        "LinkLocalIPv6PrefixLen",
+        "SecondaryIPAddresses",
+        "SecondaryIPv6Addresses",
+        "DefaultAddressPools",
+        "EndpointID",
+        "Gateway",
+        "GlobalIPv6Address",
+        "GlobalIPv6PrefixLen",
+        "IPAddress",
+        "IPPrefixLen",
+        "IPv6Gateway",
+        "MacAddress",
+    }
+    unexpected_net = sorted(network.keys() - allowed_net_keys)
+    if unexpected_net:
+        raise PolicyMismatchError(
+            f"NetworkSettings.{unexpected_net[0]}:unexpected_field"
+        )
+
+    if network["Ports"] is not None and not exact(network["Ports"], {}):
+        raise PolicyMismatchError("NetworkSettings.Ports:value_mismatch")
+
+    if type(network["Networks"]) is not dict or set(network["Networks"].keys()) != {
+        "none"
+    }:
+        raise PolicyMismatchError("NetworkSettings.Networks:value_mismatch")
+
+    endpoint = network["Networks"]["none"]
+    if type(endpoint) is not dict:
+        raise PolicyMismatchError("NetworkSettings.Networks.none:invalid_type")
+
+    for name in ("NetworkID", "EndpointID"):
+        if name in endpoint:
+            if (
+                type(endpoint[name]) is not str
+                or re.fullmatch(r"(?:[0-9a-f]{64})?", endpoint[name]) is None
+            ):
+                raise PolicyMismatchError(
+                    f"NetworkSettings.Networks.none.{name}:value_mismatch"
+                )
+
+    _validate_section_fields(
+        "NetworkSettings.Networks.none",
+        {
+            key: value
+            for key, value in endpoint.items()
+            if key not in {"NetworkID", "EndpointID"}
+        },
+        {},
+        {
+            "IPAMConfig": None,
+            "Links": None,
+            "Aliases": None,
+            "DNSNames": None,
+            "DriverOpts": None,
+            "Gateway": "",
+            "IPAddress": "",
+            "IPPrefixLen": 0,
+            "IPv6Gateway": "",
+            "GlobalIPv6Address": "",
+            "GlobalIPv6PrefixLen": 0,
+            "MacAddress": "",
+            "GwPriority": 0,
+            "IPAMOperational": False,
+        },
+    )
+
+    for name in ("SandboxID", "SandboxKey"):
+        if name in network:
+            if type(network[name]) is not str or len(network[name]) > 256:
+                raise PolicyMismatchError(f"NetworkSettings.{name}:value_mismatch")
+
+    for null_or_empty_net in (
+        "SecondaryIPAddresses",
+        "SecondaryIPv6Addresses",
+        "DefaultAddressPools",
+    ):
+        if null_or_empty_net in network:
+            if network[null_or_empty_net] is not None and not exact(
+                network[null_or_empty_net], []
+            ):
+                raise PolicyMismatchError(
+                    f"NetworkSettings.{null_or_empty_net}:value_mismatch"
+                )
+
+    for name, expected_value in {
+        "Bridge": "",
+        "HairpinMode": False,
+        "LinkLocalIPv6Address": "",
+        "LinkLocalIPv6PrefixLen": 0,
+        "EndpointID": "",
+        "Gateway": "",
+        "GlobalIPv6Address": "",
+        "GlobalIPv6PrefixLen": 0,
+        "IPAddress": "",
+        "IPPrefixLen": 0,
+        "IPv6Gateway": "",
+        "MacAddress": "",
+    }.items():
+        if name in network and not exact(network[name], expected_value):
+            raise PolicyMismatchError(f"NetworkSettings.{name}:value_mismatch")
+
+    # 7. Mounts validation
+    mounts = raw_dict["Mounts"]
+    if mounts is None:
+        mounts = []
+    if not exact(mounts, []):
+        raise PolicyMismatchError("Mounts:value_mismatch")
+
+    projection = {
+        "Id": container_id,
+        "Name": raw_dict["Name"],
+        "Image": spec.image_id,
+        "Config": config,
+        "HostConfig": host,
+        "State": state,
+        "Mounts": mounts,
+        "NetworkSettings": {"Ports": {}, "Networks": {"none": {}}},
+        "AppArmorProfile": raw_dict["AppArmorProfile"],
+    }
 
     verify_configuration(projection, spec, container_id)
     return projection
@@ -2578,6 +3087,7 @@ class SmokeAdapter:
         logs_truncated = False
         cleanup_confirmed = False
         failure: SmokeFailureCode | None = None
+        failure_detail: str | None = None
         cleanup_failure: SmokeFailureCode | None = None
         create_rejected = False
         watchdog_kill_unresolved = False
@@ -2638,14 +3148,20 @@ class SmokeAdapter:
 
             try:
                 normalize_created_inspect(created_meta, spec, container_id)
+            except PolicyMismatchError as exc:
+                failure = SmokeFailureCode.POLICY_MISMATCH
+                failure_detail = exc.detail
+                raise SmokeAdmissionError(failure, exc.detail) from exc
             except RunnerLifecycleError as exc:
                 if exc.code is FailureCode.INVALID_IDENTITY:
                     failure = SmokeFailureCode.INVALID_IDENTITY
                 else:
                     failure = SmokeFailureCode.POLICY_MISMATCH
+                    failure_detail = "verify_configuration:policy_mismatch"
                 raise SmokeAdmissionError(failure, str(exc)) from exc
             except Exception as exc:
                 failure = SmokeFailureCode.POLICY_MISMATCH
+                failure_detail = "normalize_created_inspect:unexpected_error"
                 raise SmokeAdmissionError(
                     SmokeFailureCode.POLICY_MISMATCH, str(exc)
                 ) from exc
@@ -2931,6 +3447,7 @@ class SmokeAdapter:
             failure=failure,
             cleanup_failure=cleanup_failure,
             dry_run=False,
+            failure_detail=failure_detail,
         )
 
         with self._lock:
