@@ -17,7 +17,7 @@ import hashlib
 from http.cookies import SimpleCookie
 import json
 import re
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 import httpx
@@ -331,14 +331,32 @@ class SyntheticVerificationPreviewView(StrictFrontendModel):
         return self
 
 
+class RealDataAnalysisResultView(StrictFrontendModel):
+    """Client view for deterministic dataframe analysis computed on real uploaded data."""
+
+    answer_text: str = Field(min_length=3, max_length=500)
+    scalar_value: float | int | None = None
+    result_type: str = Field(min_length=1, max_length=64)
+    columns: tuple[str, ...] = ()
+    column_headers: dict[str, str] = Field(default_factory=dict)
+    rows: tuple[dict[str, Any], ...] = ()
+    row_count: int = Field(default=0, ge=0)
+    chart_kind: Literal["BAR", "LINE", "NONE"] = "NONE"
+    chart_x_label: str | None = None
+    chart_y_label: str | None = None
+    chart_series: tuple[ChartPointView, ...] = ()
+    execution_mode: Literal["DETERMINISTIC_DATAFRAME_HOST"] = "DETERMINISTIC_DATAFRAME_HOST"
+    ai_code_executed: Literal[False] = False
+
+
 class PlanningPreviewView(StrictFrontendModel):
     run_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     session_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     dataset_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     dataset_version: int = Field(ge=1)
     run_state: Literal["AWAIT_CONFIRMATION", "NEEDS_CLARIFICATION"]
-    provider_mode: Literal["SIMULATED_MOCK"] = "SIMULATED_MOCK"
-    simulated_response: Literal[True] = True
+    provider_mode: Literal["SIMULATED_MOCK", "LIVE_VULTR_AI", "DETERMINISTIC_FALLBACK"] = "SIMULATED_MOCK"
+    simulated_response: bool = True
     provider_label: str
     is_synthetic_dataset: bool = True
     execution_enabled: Literal[False] = False
@@ -349,6 +367,7 @@ class PlanningPreviewView(StrictFrontendModel):
     plan_sha256: str | None = None
     code_preview: CodeGenerationPreviewView | None = None
     synthetic_verification_preview: SyntheticVerificationPreviewView | None = None
+    real_data_result: RealDataAnalysisResultView | None = None
     request_id: str | None = None
 
     @model_validator(mode="after")

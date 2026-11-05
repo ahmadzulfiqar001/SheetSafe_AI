@@ -14,7 +14,19 @@ from streamlit.testing.v1 import AppTest
 from backend.config import Settings
 from backend.inference import build_validated_dataset_schema
 from backend.main import create_app
-from backend.planning import UploadedCsvAnalyticsOutcome
+from backend.planning import (
+    PlanningCode,
+    PlanningError,
+    PlanningPreviewOutcome,
+    PlanningService,
+    UploadedCsvAnalyticsOutcome,
+)
+from validator.natural_language_analysis import (
+    ChartPointPreview,
+    RealDataAnalysisResult,
+    execute_deterministic_dataframe_analysis,
+    parse_natural_language_intent,
+)
 from backend.security.sessions import SessionPrincipal
 from backend.storage.database import Database
 from backend.storage.files import (
@@ -640,4 +652,442 @@ def test_api_client_csv_analytics_via_mock_transport() -> None:
     with pytest.raises(FrontendClientError) as exc_info:
         mock_client.upload_csv_for_analytics(filename="empty.csv", content=b"")
     assert exc_info.value.code is FrontendClientCode.INVALID_REQUEST
+
+
+def test_natural_language_intent_parser_allowlisted_operations() -> None:
+    bundle = compute_validated_csv_analytics(filename="sales.csv", raw_bytes=SAMPLE_CSV_BYTES)
+    schema = build_validated_dataset_schema(bundle.profile)
+
+    # 1. Extremum question: "Which region has the highest total revenue?"
+    env1 = parse_natural_language_intent("Which region has the highest total revenue?", schema)
+    assert env1.status == "PLAN_READY"
+    assert env1.plan is not None
+    assert env1.plan.expected_result_type in {"RANKED_TABLE", "SCALAR_METRIC"}
+    assert any(op.operation in {"TOP_N", "GROUP_AGGREGATE"} for op in env1.plan.operations)
+    assert any(op.aggregation in {"max", "sum"} for op in env1.plan.operations)
+
+    # 2. Average metric question: "What is the average revenue_usd?"
+    env2 = parse_natural_language_intent("What is the average revenue_usd?", schema)
+    assert env2.status == "PLAN_READY"
+    assert env2.plan is not None
+    assert env2.plan.expected_result_type == "SCALAR_METRIC"
+    assert any(op.operation == "SUMMARY_STATS" and op.aggregation == "mean" for op in env2.plan.operations)
+
+    # 3. Grouped breakdown question: "Show total revenue by department."
+    env3 = parse_natural_language_intent("Show total revenue by department.", schema)
+    assert env3.status == "PLAN_READY"
+    assert env3.plan is not None
+    assert env3.plan.expected_result_type in {"GROUPED_TABLE", "BAR_CHART"}
+    assert any(op.operation == "GROUP_AGGREGATE" for op in env3.plan.operations)
+
+
+def test_natural_language_intent_parser_rejects_missing_column() -> None:
+    bundle = compute_validated_csv_analytics(filename="sales.csv", raw_bytes=SAMPLE_CSV_BYTES)
+    schema = build_validated_dataset_schema(bundle.profile)
+
+    # Missing metric column: "profit" does not exist in schema
+    env = parse_natural_language_intent("What is the average profit?", schema)
+    assert env.status == "CLARIFICATION_REQUIRED"
+    assert env.clarification is not None
+    assert env.clarification.reason_code == "MISSING_TARGET_COLUMN"
+    assert "profit" in env.clarification.clarification_prompt
+    assert len(env.clarification.candidate_columns) > 0
+
+    # Missing grouping column: "nonexistent_dept"
+    env2 = parse_natural_language_intent("Show revenue by nonexistent_dept", schema)
+    assert env2.status == "CLARIFICATION_REQUIRED"
+    assert env2.clarification is not None
+    assert env2.clarification.reason_code == "MISSING_TARGET_COLUMN"
+
+
+def test_natural_language_intent_parser_handles_ambiguous_question() -> None:
+    bundle = compute_validated_csv_analytics(filename="sales.csv", raw_bytes=SAMPLE_CSV_BYTES)
+    schema = build_validated_dataset_schema(bundle.profile)
+
+    env = parse_natural_language_intent("Which metric has the best performance?", schema)
+    assert env.status == "CLARIFICATION_REQUIRED"
+    assert env.clarification is not None
+    assert env.clarification.reason_code == "AMBIGUOUS_METRIC"
+
+
+def test_deterministic_dataframe_analysis_answers_real_csv_queries() -> None:
+    bundle = compute_validated_csv_analytics(filename="sales.csv", raw_bytes=SAMPLE_CSV_BYTES)
+    schema = build_validated_dataset_schema(bundle.profile)
+
+    # 1. Extremum / Ranked question
+    env_top = parse_natural_language_intent("Which region has the highest total revenue?", schema)
+    assert env_top.plan is not None
+    res_top = execute_deterministic_dataframe_analysis(
+        csv_bytes=SAMPLE_CSV_BYTES,
+        delimiter=bundle.profile.delimiter,
+        plan=env_top.plan,
+        schema=schema,
+    )
+    assert res_top.scalar_value == 46301.25
+    assert "North America" in res_top.answer_text
+    assert res_top.ai_code_executed is False
+    assert res_top.execution_mode == "DETERMINISTIC_DATAFRAME_HOST"
+
+    # 2. Scalar average question
+    env_avg = parse_natural_language_intent("What is the average revenue_usd?", schema)
+    assert env_avg.plan is not None
+    res_avg = execute_deterministic_dataframe_analysis(
+        csv_bytes=SAMPLE_CSV_BYTES,
+        delimiter=bundle.profile.delimiter,
+        plan=env_avg.plan,
+        schema=schema,
+    )
+    assert res_avg.scalar_value == 11667.0
+    assert "11,667" in res_avg.answer_text
+
+    # 3. Grouped breakdown with chart series
+    env_grp = parse_natural_language_intent("Show total revenue by department.", schema)
+    assert env_grp.plan is not None
+    res_grp = execute_deterministic_dataframe_analysis(
+        csv_bytes=SAMPLE_CSV_BYTES,
+        delimiter=bundle.profile.delimiter,
+        plan=env_grp.plan,
+        schema=schema,
+    )
+    assert len(res_grp.rows) == 3
+    assert res_grp.chart_kind == "BAR"
+    assert len(res_grp.chart_series) == 3
+    sums_by_dept = {str(pt.x): pt.y for pt in res_grp.chart_series}
+    assert sums_by_dept["Enterprise"] == 46301.25
+    assert sums_by_dept["MidMarket"] == 17500.00
+    assert sums_by_dept["Commercial"] == 6200.75
+
+
+def test_planning_service_real_csv_natural_language_workflow() -> None:
+    scratch = Path(__file__).resolve().parents[1] / "var" / "test_scratch_planning_nla"
+    if scratch.exists():
+        shutil.rmtree(scratch)
+    scratch.mkdir(parents=True)
+
+    try:
+        settings = Settings(
+            _env_file=None,
+            environment="development",
+            database_path=scratch / "planning.sqlite3",
+            private_storage_path=scratch / "store",
+            allowed_origins=(ORIGIN,),
+            synthetic_planning_enabled=True,
+        )
+        db = Database(settings)
+        db.initialize()
+        storage = PrivateStorage(db, settings)
+        storage.initialize()
+        service = PlanningService(db, storage, settings)
+
+        now = db.now()
+        principal = SessionPrincipal(
+            session_id="2" * 32,
+            audit_pseudonym="p" * 16,
+            expires_at=now + 1800,
+            auth_token_hash="1" * 64,
+            csrf_token="1" * 64,
+        )
+        with db.transaction() as conn:
+            conn.execute(
+                """INSERT INTO sessions(session_id, auth_token_hash, audit_pseudonym, mode, created_at, expires_at)
+                   VALUES (?, ?, ?, 'synthetic', ?, ?)""",
+                (principal.session_id, principal.auth_token_hash, principal.audit_pseudonym, now, principal.expires_at),
+            )
+
+        # 1. Store uploaded CSV
+        outcome = service.analyze_uploaded_csv(
+            principal,
+            filename="sales.csv",
+            csv_bytes=SAMPLE_CSV_BYTES,
+        )
+        assert outcome.dataset_id is not None
+        assert outcome.row_count == 6
+
+        # 2. Run Natural Language Query against uploaded CSV
+        preview = service.create_plan_preview(
+            principal,
+            question="Which region has the highest total revenue?",
+            dataset_id=outcome.dataset_id,
+        )
+        assert preview.dataset_id == outcome.dataset_id
+        assert preview.is_synthetic_dataset is False
+        assert preview.provider_mode == "DETERMINISTIC_FALLBACK"
+        assert preview.simulated_response is True
+        assert preview.run_state == "AWAIT_CONFIRMATION"
+        assert preview.real_data_result is not None
+        assert preview.real_data_result.scalar_value == 46301.25
+        assert "North America" in preview.real_data_result.answer_text
+        assert preview.real_data_result.ai_code_executed is False
+
+        # 3. Query with clarification requirement
+        clar_preview = service.create_plan_preview(
+            principal,
+            question="What is the average profit?",
+            dataset_id=outcome.dataset_id,
+        )
+        assert clar_preview.run_state == "NEEDS_CLARIFICATION"
+        assert clar_preview.envelope.status == "CLARIFICATION_REQUIRED"
+        assert clar_preview.envelope.clarification is not None
+        assert clar_preview.envelope.clarification.reason_code == "MISSING_TARGET_COLUMN"
+        assert clar_preview.real_data_result is None
+
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_planning_service_real_csv_session_isolation() -> None:
+    scratch = Path(__file__).resolve().parents[1] / "var" / "test_scratch_planning_iso"
+    if scratch.exists():
+        shutil.rmtree(scratch)
+    scratch.mkdir(parents=True)
+
+    try:
+        settings = Settings(
+            _env_file=None,
+            environment="development",
+            database_path=scratch / "planning.sqlite3",
+            private_storage_path=scratch / "store",
+            allowed_origins=(ORIGIN,),
+            synthetic_planning_enabled=True,
+        )
+        db = Database(settings)
+        db.initialize()
+        storage = PrivateStorage(db, settings)
+        storage.initialize()
+        service = PlanningService(db, storage, settings)
+
+        now = db.now()
+        principal_a = SessionPrincipal(
+            session_id="a" * 32,
+            audit_pseudonym="pa" * 8,
+            expires_at=now + 1800,
+            auth_token_hash="a" * 64,
+            csrf_token="a" * 64,
+        )
+        principal_b = SessionPrincipal(
+            session_id="b" * 32,
+            audit_pseudonym="pb" * 8,
+            expires_at=now + 1800,
+            auth_token_hash="b" * 64,
+            csrf_token="b" * 64,
+        )
+        with db.transaction() as conn:
+            conn.execute(
+                """INSERT INTO sessions(session_id, auth_token_hash, audit_pseudonym, mode, created_at, expires_at)
+                   VALUES (?, ?, ?, 'synthetic', ?, ?)""",
+                (principal_a.session_id, principal_a.auth_token_hash, principal_a.audit_pseudonym, now, principal_a.expires_at),
+            )
+            conn.execute(
+                """INSERT INTO sessions(session_id, auth_token_hash, audit_pseudonym, mode, created_at, expires_at)
+                   VALUES (?, ?, ?, 'synthetic', ?, ?)""",
+                (principal_b.session_id, principal_b.auth_token_hash, principal_b.audit_pseudonym, now, principal_b.expires_at),
+            )
+
+        # Session A uploads dataset
+        outcome_a = service.analyze_uploaded_csv(
+            principal_a,
+            filename="sales.csv",
+            csv_bytes=SAMPLE_CSV_BYTES,
+        )
+
+        # Session B attempts to access Session A's dataset -> rejected with 404 NOT_FOUND
+        with pytest.raises(SessionError) as exc_info:
+            service.create_plan_preview(
+                principal_b,
+                question="Which region has the highest total revenue?",
+                dataset_id=outcome_a.dataset_id,
+            )
+        assert exc_info.value.status_code == 404
+
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_planning_service_vultr_graceful_fallback_on_unreachable_provider() -> None:
+    scratch = Path(__file__).resolve().parents[1] / "var" / "test_scratch_planning_fallback"
+    if scratch.exists():
+        shutil.rmtree(scratch)
+    scratch.mkdir(parents=True)
+
+    def failing_vultr_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "Vultr Serverless Inference temporarily unavailable"})
+
+    failing_transport = httpx.MockTransport(failing_vultr_handler)
+
+    try:
+        settings = Settings(
+            _env_file=None,
+            environment="development",
+            database_path=scratch / "planning.sqlite3",
+            private_storage_path=scratch / "store",
+            allowed_origins=(ORIGIN,),
+            synthetic_planning_enabled=True,
+            vultr_inference_api_key="mock_vultr_api_key",
+            vultr_inference_model="vultr-llama-3",
+        )
+        db = Database(settings)
+        db.initialize()
+        storage = PrivateStorage(db, settings)
+        storage.initialize()
+        service = PlanningService(db, storage, settings, transport=failing_transport)
+
+        now = db.now()
+        principal = SessionPrincipal(
+            session_id="3" * 32,
+            audit_pseudonym="p" * 16,
+            expires_at=now + 1800,
+            auth_token_hash="3" * 64,
+            csrf_token="3" * 64,
+        )
+        with db.transaction() as conn:
+            conn.execute(
+                """INSERT INTO sessions(session_id, auth_token_hash, audit_pseudonym, mode, created_at, expires_at)
+                   VALUES (?, ?, ?, 'synthetic', ?, ?)""",
+                (principal.session_id, principal.auth_token_hash, principal.audit_pseudonym, now, principal.expires_at),
+            )
+
+        outcome = service.analyze_uploaded_csv(principal, filename="sales.csv", csv_bytes=SAMPLE_CSV_BYTES)
+
+        # Provider fails with 503 -> gracefully falls back to deterministic intent parser
+        preview = service.create_plan_preview(
+            principal,
+            question="What is the average revenue_usd?",
+            dataset_id=outcome.dataset_id,
+        )
+        assert preview.provider_mode == "DETERMINISTIC_FALLBACK"
+        assert preview.simulated_response is True
+        assert preview.real_data_result is not None
+        assert preview.real_data_result.scalar_value == 11667.0
+        assert "Offline Fallback" in preview.provider_label
+
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_planning_service_live_vultr_ai_mode() -> None:
+    scratch = Path(__file__).resolve().parents[1] / "var" / "test_scratch_planning_vultr_live"
+    if scratch.exists():
+        shutil.rmtree(scratch)
+    scratch.mkdir(parents=True)
+
+    # Valid OpenAI chat completion response payload
+    vultr_model = "vultr-llama-3"
+    bundle = compute_validated_csv_analytics(filename="sales.csv", raw_bytes=SAMPLE_CSV_BYTES)
+    schema = build_validated_dataset_schema(bundle.profile)
+    valid_envelope = parse_natural_language_intent("What is the average revenue_usd?", schema)
+
+    def success_vultr_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-test-vultr-123",
+                "object": "chat.completion",
+                "created": 1700000000,
+                "model": vultr_model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": valid_envelope.model_dump_json(),
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 120,
+                    "completion_tokens": 80,
+                    "total_tokens": 200,
+                },
+            },
+        )
+
+    success_transport = httpx.MockTransport(success_vultr_handler)
+
+    try:
+        settings = Settings(
+            _env_file=None,
+            environment="development",
+            database_path=scratch / "planning.sqlite3",
+            private_storage_path=scratch / "store",
+            allowed_origins=(ORIGIN,),
+            synthetic_planning_enabled=True,
+            vultr_inference_api_key="mock_vultr_api_key",
+            vultr_inference_model=vultr_model,
+        )
+        db = Database(settings)
+        db.initialize()
+        storage = PrivateStorage(db, settings)
+        storage.initialize()
+        service = PlanningService(db, storage, settings, transport=success_transport)
+
+        now = db.now()
+        principal = SessionPrincipal(
+            session_id="4" * 32,
+            audit_pseudonym="p" * 16,
+            expires_at=now + 1800,
+            auth_token_hash="4" * 64,
+            csrf_token="4" * 64,
+        )
+        with db.transaction() as conn:
+            conn.execute(
+                """INSERT INTO sessions(session_id, auth_token_hash, audit_pseudonym, mode, created_at, expires_at)
+                   VALUES (?, ?, ?, 'synthetic', ?, ?)""",
+                (principal.session_id, principal.auth_token_hash, principal.audit_pseudonym, now, principal.expires_at),
+            )
+
+        outcome = service.analyze_uploaded_csv(principal, filename="sales.csv", csv_bytes=SAMPLE_CSV_BYTES)
+
+        # Provider succeeds -> LIVE_VULTR_AI mode with simulated_response=False
+        preview = service.create_plan_preview(
+            principal,
+            question="What is the average revenue_usd?",
+            dataset_id=outcome.dataset_id,
+        )
+        assert preview.provider_mode == "LIVE_VULTR_AI"
+        assert preview.simulated_response is False
+        assert preview.model == vultr_model
+        assert preview.real_data_result is not None
+        assert preview.real_data_result.scalar_value == 11667.0
+        assert preview.real_data_result.ai_code_executed is False
+
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows Security blocks temp directory and Starlette TestClient lifespan thread; verified on Vultr Ubuntu",
+)
+def test_fastapi_real_csv_natural_language_analysis_endpoint(
+    csv_app_client: TestClient,
+) -> None:
+    session_id, cred, csrf = _bootstrap_session(csv_app_client)
+
+    # 1. Upload CSV dataset
+    upload_resp = csv_app_client.post(
+        "/api/v1/planning/csv-analytics",
+        json={"filename": "sales.csv", "csv_text": SAMPLE_CSV_BYTES.decode("utf-8")},
+        headers=_auth_headers(csv_app_client, cred, csrf),
+    )
+    assert upload_resp.status_code == 200
+    dataset_id = upload_resp.json()["dataset_id"]
+
+    # 2. Ask natural language question about uploaded CSV
+    preview_resp = csv_app_client.post(
+        "/api/v1/planning/preview",
+        json={
+            "question": "Which region has the highest total revenue?",
+            "dataset_id": dataset_id,
+        },
+        headers=_auth_headers(csv_app_client, cred, csrf),
+    )
+    assert preview_resp.status_code == 200
+    preview_data = preview_resp.json()
+    assert preview_data["dataset_id"] == dataset_id
+    assert preview_data["is_synthetic_dataset"] is False
+    assert preview_data["real_data_result"] is not None
+    assert preview_data["real_data_result"]["scalar_value"] == 46301.25
+    assert "North America" in preview_data["real_data_result"]["answer_text"]
+    assert preview_data["real_data_result"]["ai_code_executed"] is False
 

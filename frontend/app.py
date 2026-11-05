@@ -871,70 +871,129 @@ def _render_analysis_page(snapshot: BackendStatusSnapshot, session: ActiveSessio
 
     client: SheetSafeApiClient = st.session_state["api_client"]
     syn_ds: SyntheticDatasetView | None = st.session_state.get("synthetic_dataset")
+    uploaded_view: UploadedCsvAnalyticsOutcome | None = st.session_state.get("uploaded_csv_analytics")
     latest_preview: PlanningPreviewView | None = st.session_state.get("latest_plan_preview")
     planning_error: str | None = st.session_state.get("planning_error")
 
+    # Dataset selection: user uploaded CSV takes priority if available, with synthetic demo always available
+    dataset_options: list[str] = []
+    dataset_id_map: dict[str, str | None] = {}
+
+    if uploaded_view is not None:
+        up_label = f"Uploaded CSV: {uploaded_view.filename} ({uploaded_view.row_count} rows, {uploaded_view.column_count} cols) [{uploaded_view.dataset_id[:8]}...]"
+        dataset_options.append(up_label)
+        dataset_id_map[up_label] = uploaded_view.dataset_id
+
+    demo_label = (
+        f"Demo: Synthetic Quarterly Revenue & Headcount [{syn_ds.dataset_id[:8]}...]"
+        if syn_ds is not None
+        else "Demo: Synthetic Quarterly Revenue & Headcount (Server-Owned)"
+    )
+    dataset_options.append(demo_label)
+    dataset_id_map[demo_label] = syn_ds.dataset_id if syn_ds is not None else None
+
     col_q, col_schema = st.columns([3, 2])
     with col_q:
-        st.markdown("#### 1. Select Demonstration Dataset & Enter Analysis Question")
-        st.text_input(
-            "Selected Dataset Source",
-            value=(
-                f"{syn_ds.fixture_label} [{syn_ds.dataset_id[:8]}...]"
-                if syn_ds is not None
-                else "DEMO / SYNTHETIC FIXTURE — Quarterly Regional Revenue & Headcount (Server-Owned)"
-            ),
-            disabled=True,
-        )
-
-        if session is None:
-            st.info("Start a synthetic session on the Dashboard or Settings / Privacy page to enable planning preview.")
-        else:
-            if st.button(
-                "Load / Verify Synthetic Demo Dataset Schema",
-                disabled=not snapshot.readiness_ok,
-                width="stretch",
-            ):
-                try:
-                    with st.spinner("Provisioning synthetic demo dataset via POST /api/v1/planning/synthetic-dataset..."):
-                        loaded_ds = client.bootstrap_synthetic_dataset()
-                    st.session_state["synthetic_dataset"] = loaded_ds
-                    st.session_state["planning_error"] = None
-                    _record_activity(
-                        "SYNTHETIC_DATASET_READY",
-                        f"Dataset {loaded_ds.dataset_id[:8]}... schema={loaded_ds.dataset_schema.schema_sha256[:12]}...",
-                        loaded_ds.request_id,
-                    )
-                    st.rerun()
-                except FrontendClientError as exc:
-                    if exc.status_code == 401:
-                        _clear_ephemeral_session_views()
-                    st.session_state["planning_error"] = f"{exc.backend_code}: {exc.safe_message}"
-                    _record_activity("SYNTHETIC_DATASET_FAILED", exc.safe_message, exc.request_id)
-                    st.rerun()
-
-        scenario_labels = [label for label, _ in SYNTHETIC_DEMO_SCENARIOS]
-        scenario_map = dict(SYNTHETIC_DEMO_SCENARIOS)
-        selected_scenario = st.selectbox(
-            "Quick Synthetic Analysis Scenario (Optional Preset)",
-            options=scenario_labels,
+        st.markdown("#### 1. Select Dataset & Enter Analysis Question")
+        selected_ds_label = st.selectbox(
+            "Active Dataset Source",
+            options=dataset_options,
             index=0,
-            help=(
-                "Choose 'Custom / Typed Question Below' to submit the text area question directly, "
-                "or select a deterministic offline demonstration scenario."
-            ),
+            help="Choose between your real uploaded CSV dataset and the synthetic demo fixture.",
         )
-        preset_question = scenario_map.get(selected_scenario)
+        target_ds_id = dataset_id_map.get(selected_ds_label)
+        is_uploaded_selected = (uploaded_view is not None and target_ds_id == uploaded_view.dataset_id)
 
-        # Selecting a preset pre-fills the text area; any edits the user then makes are
-        # submitted as typed (the text area value is always the submitted question).
+        if not is_uploaded_selected:
+            if session is None:
+                st.info("Start a synthetic session on the Dashboard or Settings / Privacy page to enable planning preview.")
+            else:
+                if st.button(
+                    "Load / Verify Synthetic Demo Dataset Schema",
+                    disabled=not snapshot.readiness_ok,
+                    width="stretch",
+                ):
+                    try:
+                        with st.spinner("Provisioning synthetic demo dataset via POST /api/v1/planning/synthetic-dataset..."):
+                            loaded_ds = client.bootstrap_synthetic_dataset()
+                        st.session_state["synthetic_dataset"] = loaded_ds
+                        st.session_state["planning_error"] = None
+                        _record_activity(
+                            "SYNTHETIC_DATASET_READY",
+                            f"Dataset {loaded_ds.dataset_id[:8]}... schema={loaded_ds.dataset_schema.schema_sha256[:12]}...",
+                            loaded_ds.request_id,
+                        )
+                        st.rerun()
+                    except FrontendClientError as exc:
+                        if exc.status_code == 401:
+                            _clear_ephemeral_session_views()
+                        st.session_state["planning_error"] = f"{exc.backend_code}: {exc.safe_message}"
+                        _record_activity("SYNTHETIC_DATASET_FAILED", exc.safe_message, exc.request_id)
+                        st.rerun()
+
+        # Dynamic sample scenarios based on active dataset
+        if is_uploaded_selected and uploaded_view is not None:
+            num_cols = [c.name for c in uploaded_view.columns if c.inferred_type in {"number", "integer"}]
+            cat_cols = [c.name for c in uploaded_view.columns if c.inferred_type in {"text", "date", "boolean"}]
+            smart_scenarios: list[tuple[str, str | None]] = [("Custom / Typed Question Below", None)]
+            if cat_cols and num_cols:
+                primary_cat = cat_cols[0]
+                primary_num = num_cols[0]
+                smart_scenarios.append(
+                    (f"Highest Total: Which {primary_cat} has the highest total {primary_num}?", f"Which {primary_cat} has the highest total {primary_num}?")
+                )
+                smart_scenarios.append(
+                    (f"Average Metric: What is the average {primary_num}?", f"What is the average {primary_num}?")
+                )
+                smart_scenarios.append(
+                    (f"Grouped Total: Show total {primary_num} by {primary_cat}.", f"Show total {primary_num} by {primary_cat}.")
+                )
+                if len(cat_cols) > 1:
+                    sec_cat = cat_cols[1]
+                    smart_scenarios.append(
+                        (f"By Second Dimension: Show total {primary_num} by {sec_cat}.", f"Show total {primary_num} by {sec_cat}.")
+                    )
+            elif num_cols:
+                smart_scenarios.append(
+                    (f"Average: What is the average {num_cols[0]}?", f"What is the average {num_cols[0]}?")
+                )
+                smart_scenarios.append(
+                    (f"Total: What is the total {num_cols[0]}?", f"What is the total {num_cols[0]}?")
+                )
+
+            scenario_labels = [label for label, _ in smart_scenarios]
+            scenario_map = dict(smart_scenarios)
+            selected_scenario = st.selectbox(
+                "Quick Analysis Scenario (Suggested for Uploaded Dataset)",
+                options=scenario_labels,
+                index=0,
+            )
+            default_q = scenario_map.get(selected_scenario)
+            if default_q is None:
+                default_q = (
+                    f"Which {cat_cols[0]} has the highest total {num_cols[0]}?"
+                    if cat_cols and num_cols
+                    else f"What is the average {num_cols[0]}?"
+                    if num_cols
+                    else "Summarize data"
+                )
+        else:
+            scenario_labels = [label for label, _ in SYNTHETIC_DEMO_SCENARIOS]
+            scenario_map = dict(SYNTHETIC_DEMO_SCENARIOS)
+            selected_scenario = st.selectbox(
+                "Quick Synthetic Analysis Scenario (Optional Preset)",
+                options=scenario_labels,
+                index=0,
+                help=(
+                    "Choose 'Custom / Typed Question Below' to submit the text area question directly, "
+                    "or select a deterministic offline demonstration scenario."
+                ),
+            )
+            default_q = scenario_map.get(selected_scenario) or "What is total revenue_usd grouped by department, sorted highest to lowest?"
+
         question_input = st.text_area(
             "Enter an analysis question (3 to 500 characters; treated strictly as untrusted data)",
-            value=(
-                preset_question
-                if preset_question is not None
-                else "What is total revenue_usd grouped by department, sorted highest to lowest?"
-            ),
+            value=default_q,
             max_chars=500,
             height=105,
             help=(
@@ -945,8 +1004,13 @@ def _render_analysis_page(snapshot: BackendStatusSnapshot, session: ActiveSessio
         effective_question = question_input
 
         backend_ready = snapshot.readiness_ok
+        button_label = (
+            "Run AI Analysis on Uploaded CSV (Deterministic Execution)"
+            if is_uploaded_selected
+            else "Generate Simulated AI Analysis Plan (DEMO / SIMULATED)"
+        )
         plan_btn_clicked = st.button(
-            "Generate Simulated AI Analysis Plan (DEMO / SIMULATED)",
+            button_label,
             disabled=(session is None or not backend_ready),
             width="stretch",
             type="primary",
@@ -955,15 +1019,19 @@ def _render_analysis_page(snapshot: BackendStatusSnapshot, session: ActiveSessio
             st.caption("Backend is currently OFFLINE or NOT READY. Start FastAPI to enable planning.")
         if plan_btn_clicked and session is not None:
             try:
-                with st.spinner("Calling POST /api/v1/planning/preview (Simulated Mock Transport)..."):
-                    target_ds_id = syn_ds.dataset_id if syn_ds is not None else None
+                spinner_msg = (
+                    "Running analysis on uploaded CSV via POST /api/v1/planning/preview..."
+                    if is_uploaded_selected
+                    else "Calling POST /api/v1/planning/preview (Simulated Mock Transport)..."
+                )
+                with st.spinner(spinner_msg):
                     preview_outcome = client.create_planning_preview(
                         effective_question,
                         dataset_id=target_ds_id,
                     )
                 st.session_state["latest_plan_preview"] = preview_outcome
                 st.session_state["planning_error"] = None
-                if syn_ds is None:
+                if syn_ds is None and not is_uploaded_selected:
                     st.session_state["synthetic_dataset"] = SyntheticDatasetView(
                         dataset_id=preview_outcome.dataset_id,
                         session_id=preview_outcome.session_id,
@@ -1000,38 +1068,57 @@ def _render_analysis_page(snapshot: BackendStatusSnapshot, session: ActiveSessio
 
     with col_schema:
         st.markdown("#### 2. Validated Schema Metadata (`ValidatedDatasetSchema.v1`)")
-        active_schema = (
-            latest_preview.dataset_schema
-            if latest_preview is not None
-            else syn_ds.dataset_schema
-            if syn_ds is not None
-            else None
-        )
-        if active_schema is None:
-            st.info(
-                "Load the synthetic demonstration dataset or submit a planning preview to inspect "
-                "the validated `ValidatedDatasetSchema` (column IDs, vetted names, inferred types, "
-                "and missing counts — zero raw cells or preview rows)."
-            )
-        else:
+        if is_uploaded_selected and uploaded_view is not None:
             st.caption(
-                f"Rows: `{active_schema.row_count}` &bull; Columns: `{active_schema.column_count}` "
-                f"&bull; Schema SHA-256: `{active_schema.schema_sha256[:16]}...`"
+                f"Rows: `{uploaded_view.row_count}` &bull; Columns: `{uploaded_view.column_count}` "
+                f"&bull; Completeness: `{uploaded_view.dataset_completeness_pct:.1f}%`"
             )
             schema_table = [
                 {
-                    "Column ID": col.column_id,
                     "Column Name": col.name,
                     "Inferred Type": col.inferred_type,
                     "Missing Count": col.missing_count,
+                    "Completeness": f"{col.completeness_pct:.1f}%",
                 }
-                for col in active_schema.columns
+                for col in uploaded_view.columns
             ]
             st.dataframe(schema_table, width="stretch", hide_index=True)
             st.caption(
-                "Strictly Excluded from Outbound Payload: Raw CSV/XLSX bytes, preview rows, cell values, "
-                "worksheet names, storage paths, session tokens, and API credentials."
+                "Strictly Excluded from Outbound AI Payload: Raw CSV bytes, cell values, storage paths, and session tokens."
             )
+        else:
+            active_schema = (
+                latest_preview.dataset_schema
+                if latest_preview is not None
+                else syn_ds.dataset_schema
+                if syn_ds is not None
+                else None
+            )
+            if active_schema is None:
+                st.info(
+                    "Load the synthetic demonstration dataset or submit a planning preview to inspect "
+                    "the validated `ValidatedDatasetSchema` (column IDs, vetted names, inferred types, "
+                    "and missing counts — zero raw cells or preview rows)."
+                )
+            else:
+                st.caption(
+                    f"Rows: `{active_schema.row_count}` &bull; Columns: `{active_schema.column_count}` "
+                    f"&bull; Schema SHA-256: `{active_schema.schema_sha256[:16]}...`"
+                )
+                schema_table = [
+                    {
+                        "Column ID": col.column_id,
+                        "Column Name": col.name,
+                        "Inferred Type": col.inferred_type,
+                        "Missing Count": col.missing_count,
+                    }
+                    for col in active_schema.columns
+                ]
+                st.dataframe(schema_table, width="stretch", hide_index=True)
+                st.caption(
+                    "Strictly Excluded from Outbound Payload: Raw CSV/XLSX bytes, preview rows, cell values, "
+                    "worksheet names, storage paths, session tokens, and API credentials."
+                )
 
     if planning_error is not None:
         col_err, col_dismiss = st.columns([5, 1])
@@ -1041,6 +1128,77 @@ def _render_analysis_page(snapshot: BackendStatusSnapshot, session: ActiveSessio
             if st.button("Dismiss", key="btn_dismiss_planning_error", width="stretch"):
                 st.session_state["planning_error"] = None
                 st.rerun()
+
+    if latest_preview is not None:
+        st.divider()
+        if latest_preview.provider_mode == "LIVE_VULTR_AI":
+            st.success(
+                f"🟢 **LIVE VULTR SERVERLESS INFERENCE** &bull; "
+                f"Provider: `{latest_preview.provider_label}` &bull; "
+                f"Model: `{latest_preview.model}` &bull; "
+                f"Natural language query translated via live Vultr serverless AI. Zero-code execution invariant enforced."
+            )
+        elif latest_preview.provider_mode == "DETERMINISTIC_FALLBACK":
+            st.info(
+                f"🔵 **DETERMINISTIC INTENT PARSER (Offline Fallback — Not Live Vultr)** &bull; "
+                f"Provider: `{latest_preview.provider_label}` &bull; "
+                f"Model: `{latest_preview.model}` &bull; "
+                f"Natural language query parsed offline into allowlisted intent. Zero-code execution invariant enforced."
+            )
+        else:
+            st.warning(
+                f"🟣 **DEMO / SIMULATED PLANNING MODE** &bull; "
+                f"{latest_preview.provider_label} &bull; "
+                f"Synthetic demonstration fixture. Zero-code execution invariant enforced."
+            )
+
+        if latest_preview.real_data_result is not None:
+            res = latest_preview.real_data_result
+            st.markdown(f"### 📊 Real Dataset Analysis Result: *\"{latest_preview.question}\"*")
+            st.info(f"💡 **Answer:** **{res.answer_text}**")
+
+            if res.scalar_value is not None:
+                scalar_disp = (
+                    f"{res.scalar_value:,.2f}"
+                    if isinstance(res.scalar_value, float)
+                    else f"{res.scalar_value}"
+                )
+                st.metric("Calculated Result", scalar_disp)
+
+            if res.rows:
+                st.markdown("##### Analysis Summary Table")
+                summary_df = pd.DataFrame(list(res.rows))
+                if res.column_headers:
+                    summary_df = summary_df.rename(columns=res.column_headers)
+                st.dataframe(summary_df, width="stretch", hide_index=True)
+
+            if res.chart_series and res.chart_kind in ("BAR", "LINE"):
+                st.markdown(f"##### Analysis Visual ({res.chart_kind} Chart)")
+                x_label = res.chart_x_label or "Category"
+                y_label = res.chart_y_label or "Value"
+                chart_records = [
+                    {x_label: str(pt.x), y_label: pt.y}
+                    for pt in res.chart_series
+                ]
+                if res.chart_kind == "LINE":
+                    st.line_chart(chart_records, x=x_label, y=y_label)
+                else:
+                    st.bar_chart(chart_records, x=x_label, y=y_label)
+
+            st.caption(
+                "🔒 **Approved Deterministic Host Analytics**: Execution was performed purely with safe pandas dataframe operations. "
+                "AI-generated code, SQL, eval, and shell commands are strictly disabled."
+            )
+        elif (
+            latest_preview.envelope.status == "CLARIFICATION_REQUIRED"
+            and latest_preview.envelope.clarification is not None
+        ):
+            clar = latest_preview.envelope.clarification
+            st.warning(
+                f"⚠️ **Clarification Required (`{clar.reason_code}`)** — {clar.clarification_prompt}"
+            )
+            if clar.candidate_columns:
+                st.caption(f"Candidate Columns: `{', '.join(clar.candidate_columns)}`")
 
     st.divider()
     tab_plan, tab_code, tab_verif, tab_ops, tab_validation = st.tabs([
@@ -1055,15 +1213,21 @@ def _render_analysis_page(snapshot: BackendStatusSnapshot, session: ActiveSessio
         if latest_preview is None:
             st.info(
                 "No active `AIAnalysisPlan` preview in this view yet. Start a synthetic session and click "
-                "**Generate Simulated AI Analysis Plan (DEMO / SIMULATED)** above."
+                "**Run Analysis on Uploaded CSV** or **Generate Simulated AI Analysis Plan (DEMO)** above."
             )
         else:
-            st.warning(
+            plan_badge_text = (
                 f"**{latest_preview.provider_label}** &bull; "
                 f"`provider_mode={latest_preview.provider_mode}` &bull; "
                 f"`simulated_response={latest_preview.simulated_response}` &bull; "
                 f"`execution_enabled={latest_preview.execution_enabled}` (No Code Executed)"
             )
+            if latest_preview.provider_mode == "LIVE_VULTR_AI":
+                st.success(plan_badge_text)
+            elif latest_preview.provider_mode == "DETERMINISTIC_FALLBACK":
+                st.info(plan_badge_text)
+            else:
+                st.warning(plan_badge_text)
             m1, m2, m3, m4 = st.columns(4)
             with m1:
                 st.metric("Persisted Run State", latest_preview.run_state)
@@ -1089,7 +1253,7 @@ def _render_analysis_page(snapshot: BackendStatusSnapshot, session: ActiveSessio
             st.markdown(
                 f"- **Run ID**: `{latest_preview.run_id}`  \n"
                 f"- **Dataset ID**: `{latest_preview.dataset_id}` (`is_synthetic_dataset={latest_preview.is_synthetic_dataset}`)  \n"
-                f"- **Simulated Model ID**: `{latest_preview.model}`  \n"
+                f"- **Model ID**: `{latest_preview.model}`  \n"
                 f"- **Validated Question**: `{latest_preview.question}`  \n"
                 f"- **Schema SHA-256**: `{latest_preview.dataset_schema.schema_sha256}`  \n"
                 f"- **Plan SHA-256**: `{latest_preview.plan_sha256 or 'N/A (Clarification Required)'}`  \n"
@@ -1098,7 +1262,12 @@ def _render_analysis_page(snapshot: BackendStatusSnapshot, session: ActiveSessio
 
             if latest_preview.envelope.status == "PLAN_READY" and latest_preview.envelope.plan is not None:
                 plan = latest_preview.envelope.plan
-                st.markdown(f"##### Plan Intent Summary (DEMO / SIMULATED)\n> {plan.intent_summary}")
+                plan_summary_label = (
+                    "Plan Intent Summary"
+                    if not latest_preview.is_synthetic_dataset
+                    else "Plan Intent Summary (DEMO / SIMULATED)"
+                )
+                st.markdown(f"##### {plan_summary_label}\n> {plan.intent_summary}")
 
                 st.markdown("##### Required Columns (`RequiredColumnRef`)")
                 req_cols_rows = [
@@ -1179,11 +1348,18 @@ def _render_analysis_page(snapshot: BackendStatusSnapshot, session: ActiveSessio
 
     with tab_verif:
         if latest_preview is None or latest_preview.synthetic_verification_preview is None:
-            st.info(
-                "No demonstration-only synthetic expected-result preview in this view. Submit a `PLAN_READY` "
-                "analysis question against the synthetic fixture to inspect the independent reference "
-                "expected output preview."
-            )
+            if latest_preview is not None and not latest_preview.is_synthetic_dataset:
+                st.info(
+                    "Synthetic verification preview is tailored to the fixed demonstration fixture. "
+                    "For your uploaded CSV, ground-truth results are computed directly using approved deterministic "
+                    "dataframe operations and displayed in the Real Dataset Analysis Result card above."
+                )
+            else:
+                st.info(
+                    "No demonstration-only synthetic expected-result preview in this view. Submit a `PLAN_READY` "
+                    "analysis question against the synthetic fixture to inspect the independent reference "
+                    "expected output preview."
+                )
         else:
             vp = latest_preview.synthetic_verification_preview
             st.warning(
