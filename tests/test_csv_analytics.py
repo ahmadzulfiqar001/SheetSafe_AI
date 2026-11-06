@@ -1133,6 +1133,146 @@ def test_planning_service_token_budget_exceeded_falls_back_to_deterministic_inte
         assert preview.real_data_result.scalar_value == 11667.0
         assert preview.real_data_result.ai_code_executed is False
 
+        # Provider INVALID_PLAN_CONTRACT -> graceful fallback to DETERMINISTIC_FALLBACK on authorized dataset
+        def invalid_contract_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "model": vultr_model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "finish_reason": "stop",
+                            "message": {
+                                "role": "assistant",
+                                "content": json.dumps({"version": 1, "status": "UNKNOWN_STATUS"}),
+                            },
+                        }
+                    ],
+                },
+            )
+
+        service_invalid_contract = PlanningService(
+            db, storage, settings, transport=httpx.MockTransport(invalid_contract_handler)
+        )
+        preview_contract_fallback = service_invalid_contract.create_plan_preview(
+            principal,
+            question="What is the total revenue_usd?",
+            dataset_id=outcome.dataset_id,
+        )
+        assert preview_contract_fallback.provider_mode == "DETERMINISTIC_FALLBACK"
+        assert preview_contract_fallback.simulated_response is True
+        assert "Deterministic Intent Parser" in preview_contract_fallback.provider_label
+        assert preview_contract_fallback.real_data_result is not None
+        assert preview_contract_fallback.real_data_result.scalar_value == 70002.0
+
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_security_errors_cannot_produce_analysis_results_through_fallback() -> None:
+    """Verify that UNSAFE_OPERATION_REJECTED and PERMISSION_DENIED fail closed without fallback."""
+    scratch = Path(__file__).resolve().parents[1] / "var" / "test_scratch_security_fallback_gate"
+    if scratch.exists():
+        shutil.rmtree(scratch)
+    scratch.mkdir(parents=True)
+
+    vultr_model = "deepseek-v4.1-flash-1017"
+
+    try:
+        settings = Settings(
+            _env_file=None,
+            environment="development",
+            database_path=scratch / "planning.sqlite3",
+            private_storage_path=scratch / "store",
+            allowed_origins=(ORIGIN,),
+            synthetic_planning_enabled=True,
+            vultr_inference_api_key="mock_vultr_api_key",
+            vultr_inference_model=vultr_model,
+        )
+        db = Database(settings)
+        db.initialize()
+        storage = PrivateStorage(db, settings)
+        storage.initialize()
+
+        now = db.now()
+        principal = SessionPrincipal(
+            session_id="8" * 32,
+            audit_pseudonym="s" * 16,
+            expires_at=now + 1800,
+            auth_token_hash="8" * 64,
+            csrf_token="8" * 64,
+        )
+        with db.transaction() as conn:
+            conn.execute(
+                """INSERT INTO sessions(session_id, auth_token_hash, audit_pseudonym, mode, created_at, expires_at)
+                   VALUES (?, ?, ?, 'synthetic', ?, ?)""",
+                (principal.session_id, principal.auth_token_hash, principal.audit_pseudonym, now, principal.expires_at),
+            )
+
+        # Upload a real valid CSV
+        service_init = PlanningService(db, storage, settings, transport=httpx.MockTransport(lambda req: httpx.Response(500)))
+        outcome = service_init.analyze_uploaded_csv(principal, filename="sales.csv", csv_bytes=SAMPLE_CSV_BYTES)
+
+        # 1. Test UNSAFE_OPERATION_REJECTED (provider response with forbidden capability / code injection)
+        def unsafe_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "model": vultr_model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "finish_reason": "stop",
+                            "message": {
+                                "role": "assistant",
+                                "content": 'import os; os.system("rm -rf /"); {"version": 1, "status": "PLAN_READY"}',
+                            },
+                        }
+                    ],
+                },
+            )
+
+        service_unsafe = PlanningService(db, storage, settings, transport=httpx.MockTransport(unsafe_handler))
+        with pytest.raises(PlanningError) as exc_unsafe:
+            service_unsafe.create_plan_preview(
+                principal,
+                question="What is total revenue_usd?",
+                dataset_id=outcome.dataset_id,
+            )
+        assert exc_unsafe.value.code is PlanningCode.UNSAFE_OPERATION_REJECTED
+        assert exc_unsafe.value.status_code == 422
+
+        # Verify terminal run state is BLOCKED_POLICY in DB (zero analysis results produced)
+        with db.transaction() as conn:
+            run_row = conn.execute(
+                "SELECT state FROM runs WHERE session_id=? ORDER BY rowid DESC LIMIT 1",
+                (principal.session_id,),
+            ).fetchone()
+            assert run_row["state"] == "BLOCKED_POLICY"
+
+        # 2. Test PERMISSION_DENIED (provider returns HTTP 403)
+        def perm_denied_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(403, json={"error": "Permission denied"})
+
+        service_perm_denied = PlanningService(db, storage, settings, transport=httpx.MockTransport(perm_denied_handler))
+        with pytest.raises(PlanningError) as exc_perm:
+            service_perm_denied.create_plan_preview(
+                principal,
+                question="What is total revenue_usd?",
+                dataset_id=outcome.dataset_id,
+            )
+        assert exc_perm.value.code is PlanningCode.PROVIDER_UNAVAILABLE
+        assert exc_perm.value.status_code == 503
+
+        # Verify terminal run state is PROVIDER_UNAVAILABLE in DB (zero analysis results produced)
+        with db.transaction() as conn:
+            run_row = conn.execute(
+                "SELECT state FROM runs WHERE session_id=? ORDER BY rowid DESC LIMIT 1",
+                (principal.session_id,),
+            ).fetchone()
+            assert run_row["state"] == "PROVIDER_UNAVAILABLE"
+
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 

@@ -1870,6 +1870,9 @@ class PlanningService:
                     InferenceCode.RATE_LIMITED,
                     InferenceCode.MODEL_NOT_SUPPORTED,
                     InferenceCode.TOKEN_BUDGET_EXCEEDED,
+                    InferenceCode.RESPONSE_TOO_LARGE,
+                    InferenceCode.MALFORMED_PROVIDER_RESPONSE,
+                    InferenceCode.INVALID_PLAN_CONTRACT,
                 }:
                     provider_mode = "DETERMINISTIC_FALLBACK"
                     simulated_response = True
