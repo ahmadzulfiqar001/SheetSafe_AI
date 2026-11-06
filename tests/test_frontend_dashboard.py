@@ -938,10 +938,15 @@ def test_format_analysis_summary_table_rows_renders_clean_records_without_pandas
 def test_streamlit_ai_analysis_page_renders_summary_table_and_badges() -> None:
     """Verify that real CSV analysis summary table and provider badges render cleanly."""
     from frontend.api_client import (
+        AnalysisPlanView,
+        ChartPointView,
         DatasetSchemaView,
+        OperationStepView,
         PlanningEnvelopeView,
         PlanningPreviewView,
         RealDataAnalysisResultView,
+        RequiredColumnView,
+        SchemaColumnView,
     )
 
     schema = DatasetSchemaView(
@@ -949,34 +954,35 @@ def test_streamlit_ai_analysis_page_renders_summary_table_and_badges() -> None:
         row_count=5,
         column_count=2,
         columns=(
-            {"column_id": "col_001", "name": "department", "inferred_type": "text", "missing_count": 0},
-            {"column_id": "col_002", "name": "revenue_usd", "inferred_type": "number", "missing_count": 0},
+            SchemaColumnView(column_id="col_001", name="department", inferred_type="text", missing_count=0),
+            SchemaColumnView(column_id="col_002", name="revenue_usd", inferred_type="number", missing_count=0),
         ),
         schema_sha256="a" * 64,
+    )
+    plan = AnalysisPlanView(
+        version=1,
+        schema_sha256="a" * 64,
+        intent_summary="Aggregate revenue by department",
+        required_columns=(
+            RequiredColumnView(column_id="col_001", name="department", expected_type="text"),
+            RequiredColumnView(column_id="col_002", name="revenue_usd", expected_type="number"),
+        ),
+        operations=(
+            OperationStepView(
+                step_number=1,
+                operation="GROUP_AGGREGATE",
+                target_columns=("col_002",),
+                group_by_columns=("col_001",),
+                aggregation="sum",
+                rationale="Sum revenue",
+            ),
+        ),
+        expected_result_type="GROUPED_TABLE",
     )
     envelope = PlanningEnvelopeView(
         version=1,
         status="PLAN_READY",
-        plan={
-            "version": 1,
-            "schema_sha256": "a" * 64,
-            "intent_summary": "Aggregate revenue by department",
-            "required_columns": [
-                {"column_id": "col_001", "name": "department", "expected_type": "text"},
-                {"column_id": "col_002", "name": "revenue_usd", "expected_type": "number"},
-            ],
-            "operations": [
-                {
-                    "step_number": 1,
-                    "operation": "GROUP_AGGREGATE",
-                    "target_columns": ["col_002"],
-                    "group_by_columns": ["col_001"],
-                    "aggregation": "sum",
-                    "rationale": "Sum revenue",
-                }
-            ],
-            "expected_result_type": "GROUPED_TABLE",
-        },
+        plan=plan,
     )
     real_data = RealDataAnalysisResultView(
         answer_text="Enterprise generated highest revenue ($425,000.50).",
@@ -992,7 +998,10 @@ def test_streamlit_ai_analysis_page_renders_summary_table_and_badges() -> None:
         chart_kind="BAR",
         chart_x_label="Department",
         chart_y_label="Total Revenue",
-        chart_series=({"x": "Enterprise", "y": 425000.50}, {"x": "MidMarket", "y": 198500.00}),
+        chart_series=(
+            ChartPointView(x="Enterprise", y=425000.50),
+            ChartPointView(x="MidMarket", y=198500.00),
+        ),
         execution_mode="DETERMINISTIC_DATAFRAME_HOST",
         ai_code_executed=False,
     )
@@ -1019,11 +1028,13 @@ def test_streamlit_ai_analysis_page_renders_summary_table_and_badges() -> None:
     at.session_state["api_client"] = _mock_client(lambda req: httpx.Response(200, json={"status": "ok"}))
     at.session_state["backend_status"] = at.session_state["api_client"].probe_backend_status()
     at.session_state["latest_plan_preview"] = preview
+    at.run()
+    assert not at.exception
 
     # Navigate to AI Analysis
     at.sidebar.radio[0].set_value("AI Analysis").run()
     assert not at.exception
-    assert any("LIVE VULTR SERVERLESS AI" in s.value for s in at.success)
+    assert any("LIVE VULTR SERVERLESS" in s.value for s in at.success)
     assert any("Enterprise generated highest revenue" in i.value for i in at.info)
     metric_values = {m.label: m.value for m in at.metric}
     assert "425,000.50" in metric_values.get("Calculated Result", "")

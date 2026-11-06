@@ -280,6 +280,23 @@ def test_missing_transport_fails_closed_when_live_network_disabled():
     assert exc_info.value.code is InferenceCode.NOT_CONFIGURED
 
 
+def test_unmocked_requests_to_inference_hostname_blocked_by_test_guard():
+    """Ensure unmocked requests to api.vultrinference.com are trapped and cannot reach the network."""
+    from _pytest.outcomes import Failed
+
+    client = VultrInferenceClient(make_settings(), transport=None, allow_live_network=True)
+    with pytest.raises(Failed) as exc_info:
+        client.plan_analysis(profile=make_profile(), question="Show average revenue.")
+    assert "Unmocked outbound network call" in str(exc_info.value)
+    assert "api.vultrinference.com" in str(exc_info.value)
+
+    with pytest.raises(Failed) as exc_raw:
+        with httpx.Client() as raw_client:
+            raw_client.post("https://api.vultrinference.com/v1/chat/completions", json={})
+    assert "Unmocked outbound network call" in str(exc_raw.value)
+    assert "api.vultrinference.com" in str(exc_raw.value)
+
+
 @pytest.mark.parametrize(
     ("bad_content", "expected_code"),
     [

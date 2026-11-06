@@ -1525,6 +1525,8 @@ class PlanningService:
     def _effective_inference_client(
         self,
         transport_override: httpx.BaseTransport | None = None,
+        *,
+        force_mock: bool = False,
     ) -> VultrInferenceClient:
         has_vultr_creds = (
             self.settings.vultr_inference_api_key is not None
@@ -1535,6 +1537,9 @@ class PlanningService:
             allow_live = False
         elif self._transport is not None:
             chosen_transport = self._transport
+            allow_live = False
+        elif force_mock:
+            chosen_transport = build_deterministic_mock_transport()
             allow_live = False
         elif has_vultr_creds:
             chosen_transport = None
@@ -1566,43 +1571,44 @@ class PlanningService:
         *,
         is_synthetic_dataset: bool = True,
     ) -> tuple[VultrInferenceClient, Literal["SIMULATED_MOCK", "LIVE_VULTR_AI", "DETERMINISTIC_FALLBACK"], bool, str]:
-        inference_client = self._effective_inference_client(transport_override)
         has_vultr_creds = (
             self.settings.vultr_inference_api_key is not None
             and bool(self.settings.vultr_inference_model)
         )
         model_name = self.settings.vultr_inference_model or SIMULATED_MODEL_ID
-        if transport_override is not None:
+
+        if is_synthetic_dataset:
+            # Synthetic dataset planning is strictly an offline demo/simulated fixture workflow.
+            # It must remain deterministic SIMULATED_MOCK even when host inference credentials are set.
+            inference_client = self._effective_inference_client(
+                transport_override,
+                force_mock=True,
+            )
+            return inference_client, "SIMULATED_MOCK", True, SIMULATED_PROVIDER_LABEL
+
+        # For real uploaded CSV datasets:
+        if transport_override is not None or self._transport is not None:
+            chosen = transport_override if transport_override is not None else self._transport
+            inference_client = self._effective_inference_client(chosen)
             provider_mode: Literal["SIMULATED_MOCK", "LIVE_VULTR_AI", "DETERMINISTIC_FALLBACK"] = (
-                "LIVE_VULTR_AI" if has_vultr_creds else "SIMULATED_MOCK"
+                "LIVE_VULTR_AI" if has_vultr_creds else "DETERMINISTIC_FALLBACK"
             )
             simulated = (provider_mode != "LIVE_VULTR_AI")
             provider_label = (
                 f"Vultr Serverless Inference ({model_name})"
                 if provider_mode == "LIVE_VULTR_AI"
-                else SIMULATED_PROVIDER_LABEL
-            )
-        elif self._transport is not None:
-            provider_mode = "LIVE_VULTR_AI" if has_vultr_creds else "SIMULATED_MOCK"
-            simulated = (provider_mode != "LIVE_VULTR_AI")
-            provider_label = (
-                f"Vultr Serverless Inference ({model_name})"
-                if provider_mode == "LIVE_VULTR_AI"
-                else SIMULATED_PROVIDER_LABEL
+                else "SheetSafe Deterministic Intent Parser (Offline Fallback)"
             )
         elif has_vultr_creds:
+            inference_client = self._effective_inference_client(None)
             provider_mode = "LIVE_VULTR_AI"
             simulated = False
             provider_label = f"Vultr Serverless Inference ({model_name})"
         else:
-            if is_synthetic_dataset:
-                provider_mode = "SIMULATED_MOCK"
-                simulated = True
-                provider_label = SIMULATED_PROVIDER_LABEL
-            else:
-                provider_mode = "DETERMINISTIC_FALLBACK"
-                simulated = True
-                provider_label = "SheetSafe Deterministic Intent Parser (Offline Fallback)"
+            inference_client = self._effective_inference_client(None, force_mock=True)
+            provider_mode = "DETERMINISTIC_FALLBACK"
+            simulated = True
+            provider_label = "SheetSafe Deterministic Intent Parser (Offline Fallback)"
 
         return inference_client, provider_mode, simulated, provider_label
 
