@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 import hashlib
 import os
 import time
+from typing import Any
 
 import streamlit as st
 
@@ -851,6 +852,20 @@ def _render_uploaded_csv_analytics_view(csv_view: UploadedCsvAnalyticsView) -> N
         st.dataframe(chart_records, width="stretch", hide_index=True)
 
 
+def format_analysis_summary_table_rows(
+    rows: tuple[dict[str, Any], ...] | list[dict[str, Any]] | None,
+    column_headers: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Format and rename real dataset analysis rows into safe table records for st.dataframe."""
+    if not rows:
+        return []
+    headers = column_headers or {}
+    return [
+        {headers.get(k, k): v for k, v in row.items()}
+        for row in rows
+        if isinstance(row, dict) and row
+    ]
+
 
 def _render_analysis_page(snapshot: BackendStatusSnapshot, session: ActiveSessionView | None) -> None:
     st.subheader("AI Analysis Planning Workspace (Step 9B Offline Simulated Workflow)")
@@ -1167,11 +1182,10 @@ def _render_analysis_page(snapshot: BackendStatusSnapshot, session: ActiveSessio
                 st.metric("Calculated Result", scalar_disp)
 
             if res.rows:
-                st.markdown("##### Analysis Summary Table")
-                summary_df = pd.DataFrame(list(res.rows))
-                if res.column_headers:
-                    summary_df = summary_df.rename(columns=res.column_headers)
-                st.dataframe(summary_df, width="stretch", hide_index=True)
+                table_rows = format_analysis_summary_table_rows(res.rows, res.column_headers)
+                if table_rows:
+                    st.markdown("##### Analysis Summary Table")
+                    st.dataframe(table_rows, width="stretch", hide_index=True)
 
             if res.chart_series and res.chart_kind in ("BAR", "LINE"):
                 st.markdown(f"##### Analysis Visual ({res.chart_kind} Chart)")
