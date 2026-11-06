@@ -135,10 +135,375 @@ def test_client_rejects_out_of_bounds_timeouts_and_non_v1_paths() -> None:
         SheetSafeApiClient(read_timeout_seconds=60.0)
     assert exc_info_read.value.code is FrontendClientCode.INVALID_CONFIGURATION
 
+    with pytest.raises(FrontendClientError) as exc_info_plan_low:
+        SheetSafeApiClient(planning_read_timeout_seconds=0.01)
+    assert exc_info_plan_low.value.code is FrontendClientCode.INVALID_CONFIGURATION
+
+    with pytest.raises(FrontendClientError) as exc_info_plan_high:
+        SheetSafeApiClient(planning_read_timeout_seconds=120.0)
+    assert exc_info_plan_high.value.code is FrontendClientCode.INVALID_CONFIGURATION
+
     client = _mock_client(lambda _req: httpx.Response(200, json={"status": "ok"}))
+    assert client.timeout.connect == 2.0
+    assert client.timeout.read == 5.0
+    assert client.planning_timeout.connect == 2.0
+    assert client.planning_timeout.read == 40.0
+
     with pytest.raises(FrontendClientError) as exc_path:
         client._request_raw("GET", "/internal/admin")
     assert exc_path.value.code is FrontendClientCode.INVALID_CONFIGURATION
+
+
+def test_ai_planning_request_uses_bounded_40s_timeout_while_standard_requests_preserve_short_timeout() -> None:
+    captured_requests: list[dict] = []
+
+    def mock_backend_handler(request: httpx.Request) -> httpx.Response:
+        captured_requests.append({
+            "path": request.url.path,
+            "method": request.method,
+            "timeout": request.extensions.get("timeout"),
+            "origin": request.headers.get("origin"),
+            "csrf": request.headers.get("x-csrf-token"),
+            "cookie": request.headers.get("cookie"),
+        })
+
+        if request.url.path == "/api/v1/health":
+            return httpx.Response(200, json={"status": "ok"})
+        if request.url.path == "/api/v1/ready":
+            return httpx.Response(200, json={"status": "ready"})
+        if request.url.path == "/api/v1/sessions":
+            return httpx.Response(
+                201,
+                headers={"Set-Cookie": "__Host-sheetsafe_session=" + "S" * 43 + "; HttpOnly; SameSite=Strict; Path=/"},
+                json={
+                    "session_id": "a" * 32,
+                    "mode": "synthetic",
+                    "expires_at": 1800000000,
+                    "lifetime_seconds": 3600,
+                    "private_uploads_enabled": False,
+                    "csrf_token": "c" * 64,
+                },
+            )
+        if request.url.path == "/api/v1/planning/csv-analytics":
+            return httpx.Response(
+                200,
+                headers={"X-Request-ID": "f" * 32},
+                json={
+                    "version": 1,
+                    "dataset_id": "b" * 32,
+                    "session_id": "a" * 32,
+                    "filename": "test.csv",
+                    "byte_count": 50,
+                    "source_sha256": "0" * 64,
+                    "schema_sha256": "1" * 64,
+                    "delimiter": ",",
+                    "row_count": 2,
+                    "column_count": 2,
+                    "nonempty_cells": 6,
+                    "total_missing_cells": 0,
+                    "dataset_completeness_pct": 100.0,
+                    "is_synthetic_fixture": False,
+                    "execution_mode": "DETERMINISTIC_PANDAS_HOST",
+                    "ai_code_executed": False,
+                    "columns": [
+                        {
+                            "column_id": "col_001",
+                            "name": "region",
+                            "inferred_type": "text",
+                            "pandas_dtype": "string",
+                            "missing_count": 0,
+                            "present_count": 2,
+                            "completeness_pct": 100.0,
+                        },
+                        {
+                            "column_id": "col_002",
+                            "name": "revenue",
+                            "inferred_type": "number",
+                            "pandas_dtype": "float64",
+                            "missing_count": 0,
+                            "present_count": 2,
+                            "completeness_pct": 100.0,
+                        },
+                    ],
+                    "preview_headers": ["region", "revenue"],
+                    "preview_rows": [["North", "100.0"], ["South", "200.0"]],
+                    "numeric_summaries": [
+                        {
+                            "column_id": "col_002",
+                            "column_name": "revenue",
+                            "pandas_dtype": "float64",
+                            "non_null_count": 2,
+                            "null_count": 0,
+                            "total_sum": 300.0,
+                            "mean_value": 150.0,
+                            "median_value": 150.0,
+                            "std_value": 50.0,
+                            "min_value": 100.0,
+                            "max_value": 200.0,
+                        }
+                    ],
+                    "chart": {
+                        "chart_kind": "BAR",
+                        "chart_title": "Total revenue by region",
+                        "x_label": "region",
+                        "y_label": "revenue",
+                        "aggregation": "sum",
+                        "series": [{"x": "North", "y": 100.0}, {"x": "South", "y": 200.0}],
+                    },
+                    "warnings": [],
+                    "request_id": "f" * 32,
+                },
+            )
+        if request.url.path == "/api/v1/planning/preview":
+            return httpx.Response(
+                200,
+                headers={"X-Request-ID": "req_plan_001"},
+                json={
+                    "run_id": "e" * 32,
+                    "session_id": "a" * 32,
+                    "dataset_id": "b" * 32,
+                    "dataset_version": 1,
+                    "run_state": "AWAIT_CONFIRMATION",
+                    "provider_mode": "LIVE_VULTR_AI",
+                    "simulated_response": False,
+                    "provider_label": "Vultr Serverless Inference (llama-3.3-70b-instruct)",
+                    "is_synthetic_dataset": False,
+                    "execution_enabled": False,
+                    "model": "llama-3.3-70b-instruct",
+                    "question": "Which region has the highest revenue?",
+                    "dataset_schema": {
+                        "version": 1,
+                        "row_count": 2,
+                        "column_count": 2,
+                        "columns": [
+                            {"column_id": "col_001", "name": "region", "inferred_type": "text", "missing_count": 0},
+                            {"column_id": "col_002", "name": "revenue", "inferred_type": "number", "missing_count": 0},
+                        ],
+                        "schema_sha256": "1" * 64,
+                    },
+                    "envelope": {
+                        "version": 1,
+                        "status": "PLAN_READY",
+                        "plan": {
+                            "version": 1,
+                            "schema_sha256": "1" * 64,
+                            "intent_summary": "Find region with highest revenue",
+                            "required_columns": [
+                                {"column_id": "col_001", "name": "region", "expected_type": "text"},
+                                {"column_id": "col_002", "name": "revenue", "expected_type": "number"},
+                            ],
+                            "operations": [
+                                {
+                                    "step_number": 1,
+                                    "operation": "SORT",
+                                    "target_columns": ["revenue"],
+                                    "sort_direction": "desc",
+                                    "limit_rows": 1,
+                                    "rationale": "Highest revenue",
+                                }
+                            ],
+                            "expected_result_type": "table",
+                        },
+                    },
+                    "plan_sha256": "1" * 64,
+                    "real_data_result": {
+                        "answer_text": "Region South had highest revenue ($200.00).",
+                        "scalar_value": None,
+                        "result_type": "table",
+                        "columns": ["region", "revenue"],
+                        "column_headers": {"region": "region", "revenue": "revenue"},
+                        "rows": [{"region": "South", "revenue": 200.0}],
+                        "row_count": 1,
+                        "chart_kind": "BAR",
+                        "chart_x_label": "region",
+                        "chart_y_label": "revenue",
+                        "chart_series": [{"x": "South", "y": 200.0}],
+                        "execution_mode": "DETERMINISTIC_DATAFRAME_HOST",
+                        "ai_code_executed": False,
+                    },
+                    "request_id": "req_plan_001",
+                },
+            )
+        return httpx.Response(404)
+
+    client = _mock_client(mock_backend_handler)
+
+    # 1. Health check: uses short standard timeout (5s)
+    client.check_health()
+    assert captured_requests[-1]["path"] == "/api/v1/health"
+    assert captured_requests[-1]["timeout"]["read"] == 5.0
+
+    # 2. Ready check: uses short standard timeout (5s)
+    client.check_ready()
+    assert captured_requests[-1]["path"] == "/api/v1/ready"
+    assert captured_requests[-1]["timeout"]["read"] == 5.0
+
+    # 3. Session creation: uses short standard timeout (5s)
+    client.create_synthetic_session()
+    assert captured_requests[-1]["path"] == "/api/v1/sessions"
+    assert captured_requests[-1]["timeout"]["read"] == 5.0
+
+    # 4. CSV upload: uses short standard timeout (5s)
+    client.upload_csv_for_analytics(
+        filename="test.csv",
+        content=b"region,revenue\nNorth,100.0\nSouth,200.0\n",
+    )
+    assert captured_requests[-1]["path"] == "/api/v1/planning/csv-analytics"
+    assert captured_requests[-1]["timeout"]["read"] == 5.0
+
+    # 5. AI Planning request: uses dedicated bounded planning timeout (40s)
+    preview = client.create_planning_preview("Which region has the highest revenue?")
+    plan_req = captured_requests[-1]
+    assert plan_req["path"] == "/api/v1/planning/preview"
+    assert plan_req["timeout"]["read"] == 40.0
+    assert plan_req["timeout"]["connect"] == 2.0
+
+    # 6. Session authentication & CSRF boundary verified
+    assert plan_req["origin"] == TEST_ORIGIN
+    assert plan_req["csrf"] == "c" * 64
+    assert plan_req["cookie"] == "__Host-sheetsafe_session=" + "S" * 43
+
+    # 7. Provider mode and response attributes accurately reported
+    assert preview.provider_mode == "LIVE_VULTR_AI"
+    assert preview.simulated_response is False
+    assert "Vultr Serverless Inference" in preview.provider_label
+    assert preview.real_data_result is not None
+    assert preview.real_data_result.ai_code_executed is False
+
+
+def test_ai_planning_provider_modes_and_failure_boundaries() -> None:
+    current_mode = "SIMULATED_MOCK"
+    backend_status_code = 200
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/sessions":
+            return httpx.Response(
+                201,
+                headers={"Set-Cookie": "__Host-sheetsafe_session=" + "T" * 43 + "; HttpOnly; SameSite=Strict; Path=/"},
+                json={
+                    "session_id": "1" * 32,
+                    "mode": "synthetic",
+                    "expires_at": 1800000000,
+                    "lifetime_seconds": 3600,
+                    "private_uploads_enabled": False,
+                    "csrf_token": "2" * 64,
+                },
+            )
+        if request.url.path == "/api/v1/planning/preview":
+            if backend_status_code == 504:
+                return httpx.Response(
+                    504,
+                    headers={"X-Request-ID": "e" * 32},
+                    json={
+                        "code": "PROVIDER_TIMEOUT",
+                        "message": "AI inference provider timed out while generating a plan.",
+                        "retryable": True,
+                        "request_id": "e" * 32,
+                    },
+                )
+            if backend_status_code == 503:
+                return httpx.Response(
+                    503,
+                    headers={"X-Request-ID": "e" * 32},
+                    json={
+                        "code": "PROVIDER_UNAVAILABLE",
+                        "message": "AI inference provider is currently unavailable.",
+                        "retryable": True,
+                        "request_id": "e" * 32,
+                    },
+                )
+            sim = (current_mode != "LIVE_VULTR_AI")
+            label = (
+                "SheetSafe Deterministic Intent Parser (Offline Fallback)"
+                if current_mode == "DETERMINISTIC_FALLBACK"
+                else "Simulated Deterministic Planning Mock"
+            )
+            return httpx.Response(
+                200,
+                headers={"X-Request-ID": "p" * 32},
+                json={
+                    "run_id": "3" * 32,
+                    "session_id": "1" * 32,
+                    "dataset_id": "4" * 32,
+                    "dataset_version": 1,
+                    "run_state": "AWAIT_CONFIRMATION",
+                    "provider_mode": current_mode,
+                    "simulated_response": sim,
+                    "provider_label": label,
+                    "is_synthetic_dataset": (current_mode == "SIMULATED_MOCK"),
+                    "execution_enabled": False,
+                    "model": "simulated-v1",
+                    "question": "Show revenue",
+                    "dataset_schema": {
+                        "version": 1,
+                        "row_count": 2,
+                        "column_count": 1,
+                        "columns": [{"column_id": "col_001", "name": "revenue", "inferred_type": "number", "missing_count": 0}],
+                        "schema_sha256": "5" * 64,
+                    },
+                    "envelope": {
+                        "version": 1,
+                        "status": "PLAN_READY",
+                        "plan": {
+                            "version": 1,
+                            "schema_sha256": "5" * 64,
+                            "intent_summary": "Show revenue",
+                            "required_columns": [{"column_id": "col_001", "name": "revenue", "expected_type": "number"}],
+                            "operations": [{"step_number": 1, "operation": "SELECT", "target_columns": ["revenue"], "rationale": "Select"}],
+                            "expected_result_type": "table",
+                        },
+                    },
+                    "plan_sha256": "6" * 64,
+                    "request_id": "p" * 32,
+                },
+            )
+        return httpx.Response(404)
+
+    client = _mock_client(mock_handler)
+    client.create_synthetic_session()
+
+    # Verify SIMULATED_MOCK mode
+    current_mode = "SIMULATED_MOCK"
+    sim_preview = client.create_planning_preview("Show revenue")
+    assert sim_preview.provider_mode == "SIMULATED_MOCK"
+    assert sim_preview.simulated_response is True
+
+    # Verify DETERMINISTIC_FALLBACK mode
+    current_mode = "DETERMINISTIC_FALLBACK"
+    fallback_preview = client.create_planning_preview("Show revenue")
+    assert fallback_preview.provider_mode == "DETERMINISTIC_FALLBACK"
+    assert fallback_preview.simulated_response is True
+    assert "Deterministic Intent Parser" in fallback_preview.provider_label
+
+    # Verify upstream 504 provider timeout failure maps to BACKEND_TIMEOUT with retryable=True
+    backend_status_code = 504
+    with pytest.raises(FrontendClientError) as exc_504:
+        client.create_planning_preview("Show revenue")
+    assert exc_504.value.code is FrontendClientCode.BACKEND_TIMEOUT
+    assert exc_504.value.retryable is True
+    assert exc_504.value.status_code == 504
+
+    # Verify upstream 503 provider unavailable maps to SERVICE_UNAVAILABLE with retryable=True
+    backend_status_code = 503
+    with pytest.raises(FrontendClientError) as exc_503:
+        client.create_planning_preview("Show revenue")
+    assert exc_503.value.code is FrontendClientCode.SERVICE_UNAVAILABLE
+    assert exc_503.value.retryable is True
+    assert exc_503.value.status_code == 503
+
+    # Verify client-side HTTPX timeout exception during planning maps safely to BACKEND_TIMEOUT
+    def timeout_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/sessions":
+            return mock_handler(request)
+        raise httpx.ReadTimeout("Read timed out after 40 seconds", request=request)
+
+    timeout_client = _mock_client(timeout_handler)
+    timeout_client.create_synthetic_session()
+    with pytest.raises(FrontendClientError) as exc_read_timeout:
+        timeout_client.create_planning_preview("Show revenue")
+    assert exc_read_timeout.value.code is FrontendClientCode.BACKEND_TIMEOUT
+    assert exc_read_timeout.value.retryable is True
+    assert "FastAPI backend timed out" in exc_read_timeout.value.safe_message
 
 
 def test_live_fastapi_health_and_readiness_integration(

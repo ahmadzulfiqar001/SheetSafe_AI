@@ -28,6 +28,7 @@ DEFAULT_API_BASE_URL = "http://127.0.0.1:8000"
 DEFAULT_CLIENT_ORIGIN = "http://localhost:8501"
 MAX_API_RESPONSE_BYTES = 32 * 1024
 MAX_CSV_UPLOAD_BYTES = 2 * 1024 * 1024  # 2 MiB
+DEFAULT_PLANNING_READ_TIMEOUT_SECONDS = 40.0
 
 
 class FrontendClientCode(StrEnum):
@@ -560,6 +561,7 @@ class SheetSafeApiClient:
         *,
         connect_timeout_seconds: float = 2.0,
         read_timeout_seconds: float = 5.0,
+        planning_read_timeout_seconds: float = DEFAULT_PLANNING_READ_TIMEOUT_SECONDS,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self._api_base_url = validate_canonical_origin(api_base_url)
@@ -569,9 +571,20 @@ class SheetSafeApiClient:
                 FrontendClientCode.INVALID_CONFIGURATION,
                 "HTTP timeouts must stay within bounded limits.",
             )
+        if not (0.2 <= planning_read_timeout_seconds <= 60.0):
+            raise FrontendClientError(
+                FrontendClientCode.INVALID_CONFIGURATION,
+                "Planning read timeout must stay within bounded limits.",
+            )
         self._timeout = httpx.Timeout(
             connect=connect_timeout_seconds,
             read=read_timeout_seconds,
+            write=connect_timeout_seconds,
+            pool=connect_timeout_seconds,
+        )
+        self._planning_timeout = httpx.Timeout(
+            connect=connect_timeout_seconds,
+            read=planning_read_timeout_seconds,
             write=connect_timeout_seconds,
             pool=connect_timeout_seconds,
         )
@@ -597,6 +610,14 @@ class SheetSafeApiClient:
     def active_session(self) -> ActiveSessionView | None:
         return self._sealed_session.view if self._sealed_session is not None else None
 
+    @property
+    def timeout(self) -> httpx.Timeout:
+        return self._timeout
+
+    @property
+    def planning_timeout(self) -> httpx.Timeout:
+        return self._planning_timeout
+
     def clear_local_session(self) -> None:
         self._sealed_session = None
 
@@ -615,6 +636,7 @@ class SheetSafeApiClient:
         *,
         headers: dict[str, str] | None = None,
         json_body: dict[str, object] | None = None,
+        timeout: httpx.Timeout | None = None,
     ) -> tuple[int, httpx.Headers, bytes]:
         if not path.startswith("/api/v1/"):
             raise FrontendClientError(
@@ -628,10 +650,11 @@ class SheetSafeApiClient:
             content = json.dumps(json_body, separators=(",", ":"), allow_nan=False).encode("utf-8")
             req_headers["Content-Type"] = "application/json"
 
+        effective_timeout = timeout if timeout is not None else self._timeout
         try:
             with httpx.Client(
                 transport=self._transport,
-                timeout=self._timeout,
+                timeout=effective_timeout,
                 follow_redirects=False,
                 trust_env=False,
             ) as client:
@@ -977,6 +1000,7 @@ class SheetSafeApiClient:
                 "Cookie": cookie_header,
             },
             json_body=body,
+            timeout=self._planning_timeout,
         )
         if status_code != 200:
             if status_code == 401:
