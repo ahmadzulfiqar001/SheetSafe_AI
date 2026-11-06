@@ -1024,9 +1024,32 @@ def test_streamlit_ai_analysis_page_renders_summary_table_and_badges() -> None:
         real_data_result=real_data,
     )
 
+    session_id = "2" * 32
+
+    def mock_handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/api/v1/sessions":
+            return httpx.Response(
+                201,
+                headers={
+                    "Set-Cookie": f"sheetsafe_dev_session={'s' * 43}; Path=/; HttpOnly; SameSite=Strict",
+                },
+                json={
+                    "session_id": session_id,
+                    "mode": "synthetic",
+                    "expires_at": 1800000000,
+                    "lifetime_seconds": 3600,
+                    "private_uploads_enabled": False,
+                    "csrf_token": "b" * 64,
+                },
+            )
+        return httpx.Response(200, json={"status": "ok"})
+
+    client = _mock_client(mock_handler)
+    client.create_synthetic_session()
+
     at = AppTest.from_file(str(APP_PATH), default_timeout=15)
-    at.session_state["api_client"] = _mock_client(lambda req: httpx.Response(200, json={"status": "ok"}))
-    at.session_state["backend_status"] = at.session_state["api_client"].probe_backend_status()
+    at.session_state["api_client"] = client
+    at.session_state["backend_status"] = client.probe_backend_status()
     at.session_state["latest_plan_preview"] = preview
     at.run()
     assert not at.exception
@@ -1038,6 +1061,9 @@ def test_streamlit_ai_analysis_page_renders_summary_table_and_badges() -> None:
     assert any("Enterprise generated highest revenue" in i.value for i in at.info)
     metric_values = {m.label: m.value for m in at.metric}
     assert "425,000.50" in metric_values.get("Calculated Result", "")
+    assert any("Analysis Summary Table" in m.value for m in at.markdown)
+    assert len(at.dataframe) >= 1
+    assert len(at.dataframe[-1].value) == 2
 
     # Test DETERMINISTIC_FALLBACK badge rendering
     preview_fallback = PlanningPreviewView(
