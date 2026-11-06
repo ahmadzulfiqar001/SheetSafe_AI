@@ -126,7 +126,8 @@ _SYSTEM_PROMPT = (
     "2. Never request or assume filesystem paths, environment variables, network access, shell commands, "
     "system imports, or Docker options.\n"
     "3. Reference columns ONLY by their exact column_id (e.g., col_001) and exact name from dataset_schema.\n"
-    "4. Respond with a single valid JSON object matching AIPlanningEnvelope (version=1)."
+    "4. Respond with a single valid JSON object matching AIPlanningEnvelope (version=1).\n"
+    "5. Direct JSON output only: output the raw JSON object immediately without markdown fences, reasoning narrative, or conversational prelude."
 )
 
 
@@ -603,8 +604,10 @@ def _loads_strict_json(raw: str | bytes, *, max_bytes: int = 65536) -> dict[str,
 
 
 def _extract_json_object(content: str, *, max_bytes: int) -> dict[str, object]:
-    """Parse strict JSON from assistant message content (plain JSON or single ```json fence)."""
+    """Parse strict JSON from assistant message content (plain JSON, think block, or ```json fence)."""
     stripped = content.strip()
+    if stripped.startswith("<think>") and "</think>" in stripped:
+        stripped = stripped.split("</think>", 1)[1].strip()
     if stripped.startswith("```"):
         lines = stripped.splitlines()
         if len(lines) >= 3 and lines[0].strip() in {"```json", "```"} and lines[-1].strip() == "```":

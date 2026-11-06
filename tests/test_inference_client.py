@@ -809,3 +809,123 @@ def test_incompatible_operation_column_types_are_rejected():
     with pytest.raises(InferenceError) as exc_info:
         validate_planning_envelope(envelope, schema)
     assert exc_info.value.code is InferenceCode.INVALID_PLAN_CONTRACT
+
+
+def test_deepseek_reasoning_tokens_and_think_blocks_supported() -> None:
+    profile = make_profile()
+    schema = build_validated_dataset_schema(profile)
+    envelope_dict = valid_plan_envelope_dict(schema)
+    raw_json_str = json.dumps(envelope_dict)
+
+    # Provider message includes DeepSeek <think> reasoning block followed by valid JSON
+    reasoning_content = (
+        "<think>\n"
+        "The user wants total revenue by department.\n"
+        "We need col_001 (department) and col_002 (quarterly_revenue).\n"
+        "Let's output the schema-compliant AIPlanningEnvelope v1.\n"
+        "</think>\n"
+        + raw_json_str
+    )
+
+    def reasoning_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model": APPROVED_MODEL,
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": reasoning_content,
+                            "reasoning_content": "Internal chain of thought",
+                        },
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 320,
+                    "completion_tokens": 1850,
+                    "total_tokens": 2170,
+                    "completion_tokens_details": {
+                        "reasoning_tokens": 1400,
+                    },
+                },
+            },
+        )
+
+    client = VultrInferenceClient(make_settings(), transport=httpx.MockTransport(reasoning_handler))
+    result = client.plan_analysis(profile=profile, question="What is total revenue by department?")
+    assert result.envelope.status == "PLAN_READY"
+    assert result.envelope.plan is not None
+    assert result.input_tokens == 320
+    assert result.output_tokens == 1850
+
+
+def test_reasoning_output_token_budget_exhaustion_via_reported_usage() -> None:
+    profile = make_profile()
+    schema = build_validated_dataset_schema(profile)
+    envelope_dict = valid_plan_envelope_dict(schema)
+
+    def usage_exhausted_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model": APPROVED_MODEL,
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(envelope_dict),
+                        },
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 300,
+                    "completion_tokens": 4500,  # Exceeds max_output_tokens (4096)
+                    "total_tokens": 4800,
+                    "completion_tokens_details": {
+                        "reasoning_tokens": 3900,
+                    },
+                },
+            },
+        )
+
+    client = VultrInferenceClient(make_settings(), transport=httpx.MockTransport(usage_exhausted_handler))
+    with pytest.raises(InferenceError) as exc_info:
+        client.plan_analysis(profile=profile, question="Summarize revenue.")
+    assert exc_info.value.code is InferenceCode.TOKEN_BUDGET_EXCEEDED
+
+
+def test_reasoning_output_token_budget_exhaustion_via_finish_reason_length() -> None:
+    profile = make_profile()
+
+    def length_exhausted_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model": APPROVED_MODEL,
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "length",
+                        "message": {
+                            "role": "assistant",
+                            "content": "<think>\nExhausted reasoning halfway through...",
+                        },
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 300,
+                    "completion_tokens": 4096,
+                    "total_tokens": 4396,
+                },
+            },
+        )
+
+    client = VultrInferenceClient(make_settings(), transport=httpx.MockTransport(length_exhausted_handler))
+    with pytest.raises(InferenceError) as exc_info:
+        client.plan_analysis(profile=profile, question="Summarize revenue.")
+    assert exc_info.value.code is InferenceCode.TOKEN_BUDGET_EXCEEDED

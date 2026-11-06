@@ -1869,6 +1869,7 @@ class PlanningService:
                     InferenceCode.PROVIDER_TIMEOUT,
                     InferenceCode.RATE_LIMITED,
                     InferenceCode.MODEL_NOT_SUPPORTED,
+                    InferenceCode.TOKEN_BUDGET_EXCEEDED,
                 }:
                     provider_mode = "DETERMINISTIC_FALLBACK"
                     simulated_response = True

@@ -1055,6 +1055,88 @@ def test_planning_service_live_vultr_ai_mode() -> None:
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+def test_planning_service_token_budget_exceeded_falls_back_to_deterministic_intent_parser() -> None:
+    scratch = Path(__file__).resolve().parents[1] / "var" / "test_scratch_token_budget_fallback"
+    if scratch.exists():
+        shutil.rmtree(scratch)
+    scratch.mkdir(parents=True)
+
+    vultr_model = "deepseek-v4.1-flash-1017"
+
+    # Mock provider returning length truncation (TOKEN_BUDGET_EXCEEDED)
+    def length_vultr_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model": vultr_model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "length",
+                        "message": {"role": "assistant", "content": "{\"status\":\"PLAN_READY\""},
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 150,
+                    "completion_tokens": 4096,
+                    "total_tokens": 4246,
+                },
+            },
+        )
+
+    length_transport = httpx.MockTransport(length_vultr_handler)
+
+    try:
+        settings = Settings(
+            _env_file=None,
+            environment="development",
+            database_path=scratch / "planning.sqlite3",
+            private_storage_path=scratch / "store",
+            allowed_origins=(ORIGIN,),
+            synthetic_planning_enabled=True,
+            vultr_inference_api_key="mock_vultr_api_key",
+            vultr_inference_model=vultr_model,
+        )
+        db = Database(settings)
+        db.initialize()
+        storage = PrivateStorage(db, settings)
+        storage.initialize()
+        service = PlanningService(db, storage, settings, transport=length_transport)
+
+        now = db.now()
+        principal = SessionPrincipal(
+            session_id="7" * 32,
+            audit_pseudonym="p" * 16,
+            expires_at=now + 1800,
+            auth_token_hash="7" * 64,
+            csrf_token="7" * 64,
+        )
+        with db.transaction() as conn:
+            conn.execute(
+                """INSERT INTO sessions(session_id, auth_token_hash, audit_pseudonym, mode, created_at, expires_at)
+                   VALUES (?, ?, ?, 'synthetic', ?, ?)""",
+                (principal.session_id, principal.auth_token_hash, principal.audit_pseudonym, now, principal.expires_at),
+            )
+
+        outcome = service.analyze_uploaded_csv(principal, filename="sales.csv", csv_bytes=SAMPLE_CSV_BYTES)
+
+        # Provider TOKEN_BUDGET_EXCEEDED -> graceful fallback to DETERMINISTIC_FALLBACK
+        preview = service.create_plan_preview(
+            principal,
+            question="What is the average revenue_usd?",
+            dataset_id=outcome.dataset_id,
+        )
+        assert preview.provider_mode == "DETERMINISTIC_FALLBACK"
+        assert preview.simulated_response is True
+        assert "Deterministic Intent Parser" in preview.provider_label
+        assert preview.real_data_result is not None
+        assert preview.real_data_result.scalar_value == 11667.0
+        assert preview.real_data_result.ai_code_executed is False
+
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 @pytest.mark.skipif(
     sys.platform == "win32",
     reason="Windows Security blocks temp directory and Starlette TestClient lifespan thread; verified on Vultr Ubuntu",
