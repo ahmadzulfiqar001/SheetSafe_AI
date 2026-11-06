@@ -1063,7 +1063,34 @@ def test_streamlit_ai_analysis_page_renders_summary_table_and_badges() -> None:
     assert "425,000.50" in metric_values.get("Calculated Result", "")
     assert any("Analysis Summary Table" in m.value for m in at.markdown)
     assert len(at.dataframe) >= 1
-    assert len(at.dataframe[-1].value) == 2
+
+    # Locate the Analysis Summary Table by its expected columns and verify exact rows
+    summary_table = None
+    for df_el in at.dataframe:
+        val = df_el.value
+        if hasattr(val, "columns"):
+            cols = set(val.columns)
+            if "Department" in cols and "Total Revenue" in cols:
+                summary_table = val
+                break
+        elif isinstance(val, list) and val and isinstance(val[0], dict):
+            if "Department" in val[0] and "Total Revenue" in val[0]:
+                summary_table = val
+                break
+
+    assert summary_table is not None, "Analysis Summary Table not found in rendered dataframes"
+    assert len(summary_table) == 2
+
+    if hasattr(summary_table, "to_dict"):
+        summary_records = summary_table.to_dict(orient="records")
+    else:
+        summary_records = list(summary_table)
+
+    dept_revenue = {
+        row["Department"]: row["Total Revenue"] for row in summary_records
+    }
+    assert dept_revenue.get("Enterprise") == 425000.50
+    assert dept_revenue.get("MidMarket") == 198500.00
 
     # Test DETERMINISTIC_FALLBACK badge rendering
     preview_fallback = PlanningPreviewView(
