@@ -57,12 +57,64 @@ sudo apparmor_status
 # Expected: docker-default profile loaded and active in enforce mode
 ```
 
-### Step 3: Run SheetSafe AI Preflight Probes
+### Step 3: Idempotent Host Identity & Protected Ledger Setup (Operator Review Only)
+Before running the native operator smoke adapter, provision the four distinct non-login service accounts (`sheetsafe-api`, `sheetsafe-ui`, `sheetsafe-runner`, `sheetsafe-validator`), grant Docker socket access **only** to `sheetsafe-runner`, and create the protected `0700` state directories:
+
 ```bash
-# From repository root with activated virtual environment:
-python3 -m runner.preflight
+# 1. Create four dedicated system accounts with distinct UIDs/GIDs (!= 0 and != 10001)
+for svc in sheetsafe-api sheetsafe-ui sheetsafe-runner sheetsafe-validator; do
+    if ! id -u "${svc}" >/dev/null 2>&1; then
+        sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin "${svc}"
+    fi
+done
+
+# 2. Verify none of the four accounts uses UID/GID 0 or container guest UID/GID 10001
+for svc in sheetsafe-api sheetsafe-ui sheetsafe-runner sheetsafe-validator; do
+    uid="$(id -u "${svc}")"
+    gid="$(id -g "${svc}")"
+    echo "${svc}: uid=${uid} gid=${gid}"
+    test "${uid}" -ne 0 && test "${uid}" -ne 10001
+    test "${gid}" -ne 0 && test "${gid}" -ne 10001
+done
+
+# 3. Grant Docker socket group membership ONLY to sheetsafe-runner
+#    (Ensure sheetsafe-api, sheetsafe-ui, and sheetsafe-validator are NOT in root, docker, sudo, or wheel)
+sudo usermod -aG docker sheetsafe-runner
+for forbidden in sheetsafe-api sheetsafe-ui sheetsafe-validator; do
+    for grp in root docker sudo wheel; do
+        sudo gpasswd -d "${forbidden}" "${grp}" >/dev/null 2>&1 || true
+    done
+done
+
+# 4. Provision protected storage directories with strict ancestor and leaf permissions
+sudo install -d -m 0755 -o root -g root /var/lib/sheetsafe
+sudo install -d -m 0700 -o sheetsafe-api -g sheetsafe-api /var/lib/sheetsafe/api
+sudo install -d -m 0700 -o sheetsafe-runner -g sheetsafe-runner /var/lib/sheetsafe/runner
+
+# 5. Idempotently initialize the protected smoke state ledger (/var/lib/sheetsafe/runner/smoke_state.json)
+sudo -u sheetsafe-runner -- ./scripts/run_operator_smoke.sh --init-ledger
 ```
-*Pass condition:* All preflight probes succeed with exit code `0`. If `LSM_NOT_ADVERTISED` appears, verify AppArmor service is running and restart Docker.
+
+### Step 4: Run SheetSafe AI Preflight & Host Readiness Probes
+```bash
+# Run read-only preflight and host readiness evidence probes as sheetsafe-runner:
+sudo -u sheetsafe-runner -- python3 -m runner.preflight --context default
+sudo -u sheetsafe-runner -- python3 -m runner.host_readiness --context default
+```
+*Pass condition:* `runner.preflight` reports `"metadata_prerequisites_met": true` and `"issues": []`. `runner.host_readiness` reports `DISTINCT_SERVICE_IDENTITIES`, `API_STORAGE_OWNER_MODE`, `RUNNER_STORAGE_OWNER_MODE`, `RUNNER_PROBE_SERVICE_UID`, and `DOCKER_SOCKET_LOCAL_DAC` as `OBSERVED`.
+
+### Step 5: Run Operator Smoke Adapter (Single Fixed Fixture: smoke-v1)
+```bash
+# 1. Safe dry-run admission and deployment boundary verification (read-only):
+sudo -u sheetsafe-runner -- ./scripts/run_operator_smoke.sh --dry-run
+# Pass condition: exits 0, reports DRY_RUN_PASSED, zero containers created.
+
+# 2. Operator-authorized native container smoke test (on verified Linux host ONLY):
+sudo -u sheetsafe-runner -- ./scripts/run_operator_smoke.sh --execute-approved-native-smoke
+# Pass condition: exits 0, reports COMPLETED, exit_code=0, cleanup_confirmed=true,
+#                 execution_enabled=false, production_authorized=false.
+```
+*Important note:* The smoke adapter strictly executes the reviewed `smoke-v1` diagnostic fixture under `/var/lib/sheetsafe/runner/smoke_state.json`. It does NOT enable arbitrary Python execution, user uploads, or production authorization (`execution_enabled=False`, `production_authorized=False`).
 
 ---
 

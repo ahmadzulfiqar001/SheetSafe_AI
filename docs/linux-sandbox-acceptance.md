@@ -127,12 +127,15 @@ provenance; never export a user-specific container. Archive checksum is not the
 image ID. After approved loading, use existing static preflight to compare:
 
 - local reviewed identity:
-  `sha256:551ae45bad03b4a1856ae503c62c01a8078394a19d3c318b53fc9f2e98f66bc9`;
+  `sha256:7bf7f76f3e3e1bb35adeb41176551f0368d77f3dfd467e00dae8b0346e67ee20`
+  (superseding Step 7F's `sha256:551ae45bad03b4a1856ae503c62c01a8078394a19d3c318b53fc9f2e98f66bc9`);
 - separate config digest:
-  `sha256:59f66d35ff913f60851bde600c75680bc0054c04f32ba72ec42ca2ae2ec6d546`;
+  `sha256:b8f4b51b1c59238d91633eb8cd99bc7f3fcc4a56f1e18f446681b5803d635336`
+  (superseding Step 7F's `sha256:59f66d35ff913f60851bde600c75680bc0054c04f32ba72ec42ca2ae2ec6d546`);
 - linux/amd64, user 10001:10001, fixed entrypoint, smoke-v1-only command,
-  minimal reviewed environment, no unexpected volumes/healthcheck/assets;
-- fixed diagnostic tag resolves to the same identity; no pull/fallback.
+  minimal reviewed environment, `/opt/sheetsafe` mode `0755` (`0:0`) and
+  `/opt/sheetsafe/bootstrap.py` mode `0444` (`0:0`), no unexpected volumes/healthcheck/assets;
+- fixed diagnostic tag (`sheetsafe-runner:permissions-review`) resolves to the same identity; no pull/fallback.
 
 Native classic/containerd image stores may expose identity differently. Missing
 descriptor/config annotations or changed local identity is a blocker, not a
@@ -140,15 +143,37 @@ reason to substitute a config digest or invent a RepoDigest. Any representation
 adaptation needs explicit code review/tests. Current final image policy remains
 execution-unapproved even if static identity matches.
 
-## 4. Phase C — separately approved fixed-fixture containment
+## 4. Phase C — operator-only fixed-fixture smoke adapter implementation
 
-No runnable native execution CLI exists yet; do not invent a command or bypass
-require_execution_ready(). After host evidence is reviewed, implement one small
-operator-only fixed smoke adapter under explicit approval. It must persist its
-resource identity, enforce policy, use a watchdog and verify teardown. First
-experiment has no dynamic inputs, generated code, private uploads or artifact
-publication. Its untrusted log line is not containment evidence. This makes
-real progress without requiring the production stdin/collector amendment first.
+An operator-only, single-fixture isolated smoke adapter has been implemented in
+`runner/smoke_adapter.py` with comprehensive fake-transport unit tests in
+`tests/test_smoke_adapter.py`.
+
+**CRITICAL STATUS DISTINCTION**:
+- **Code implementation**: COMPLETED for operator-controlled fixed smoke testing.
+- **Native runtime evidence**: PENDING. No native Linux container execution has been run.
+- **SEC01–SEC10 controls**: All 10 controls remain UNVERIFIED until physical runtime evidence is captured on a verified Linux host with AppArmor enforcing.
+- `execution_enabled=False` and `production_authorized=False` remain strictly enforced.
+- No arbitrary Python, uploads, or API-triggered execution are permitted.
+- `require_execution_ready()` in `runner/policy.py` is preserved and not bypassed.
+
+Key design properties of `runner/smoke_adapter.py`:
+1. **Admissions gate**: Strictly accepts ONLY `smoke-v1`. Rejects any other fixture or arbitrary Python payload fail-closed.
+2. **Default safety**: Defaults to `--dry-run` (read-only); makes zero Docker transport calls and creates zero containers.
+3. **Execution gate**: Native execution requires running on a native Linux host (`sys.platform == 'linux'`) with the explicit operator approval flag `--execute-approved-native-smoke`. Any invocation on Windows or without operator approval fails closed immediately.
+4. **Validated inspect normalization & strict configuration verification**: Created containers pass through `normalize_created_inspect` (enforcing audited `HOST_DEFAULTS`, `MASKED_PATHS`, `READONLY_PATHS`, and ownership nonce) and `verify_configuration` in `runner/docker_backend.py` prior to start. Any policy deviation or unknown field aborts with `POLICY_MISMATCH`.
+5. **Enforced sandbox constraints & bounded attached stream capture**: Preserves UID/GID 10001, `--network none`, `--read-only`, `--cap-drop ALL`, `no-new-privileges=true`, `--log-driver none`, 1 vCPU (`--cpu-period 100000 --cpu-quota 100000`), 1 GiB RAM (0 swap), 32 PIDs, `/work` (256 MiB `nodev,nosuid,noexec` tmpfs) and `/tmp` (64 MiB `nodev,nosuid,noexec` tmpfs). Diagnostic stdout/stderr are captured via attached `docker start --attach` streams capped at 64 KiB per stream without persisting daemon log files.
+6. **Independent watchdog supervision**: Asynchronous monotonic watchdog timer and bounded polling loop enforce the 20s wall deadline and 10s cumulative CPU limit with cancellation support and verified termination within the 2s kill-grace window.
+7. **Scoped absence verification & durable restart blocking**: Teardown verifies absence against both container ID and container name, and persists state to a durable ledger (`var/smoke_adapter/state.json`). Any cleanup ambiguity, remove failure, or mid-run crash sets `admissions_blocked = True` permanently in memory and across process restarts.
+
+Operator CLI commands (for future native Linux host):
+```bash
+# Safe read-only admission check (dry run):
+python3 -m runner.smoke_adapter --dry-run
+
+# Operator-authorized native execution (only on verified Linux host):
+python3 -m runner.smoke_adapter --execute-approved-native-smoke
+```
 
 Broader containment fixtures below are future reviewed fixed code, not arbitrary
 caller Python or a permission to run stress probes now. Use a disposable host,

@@ -35,9 +35,11 @@ Each operation has a generated UUID, a distinct generated resource UUID and a
 256-bit ownership nonce. Its job/run/session, origin epoch, authorized owner
 hash, operation type, scope, image identity and image configuration digest are
 immutable. The approved local image is
-`sha256:551ae45bad03b4a1856ae503c62c01a8078394a19d3c318b53fc9f2e98f66bc9`;
+`sha256:7bf7f76f3e3e1bb35adeb41176551f0368d77f3dfd467e00dae8b0346e67ee20`
+(rotated from Step 7F's `sha256:551ae45bad03b4a1856ae503c62c01a8078394a19d3c318b53fc9f2e98f66bc9`);
 its separate configuration digest is
-`sha256:59f66d35ff913f60851bde600c75680bc0054c04f32ba72ec42ca2ae2ec6d546`.
+`sha256:b8f4b51b1c59238d91633eb8cd99bc7f3fcc4a56f1e18f446681b5803d635336`
+(rotated from Step 7F's `sha256:59f66d35ff913f60851bde600c75680bc0054c04f32ba72ec42ca2ae2ec6d546`).
 These are the existing local review identities, not invented registry digests or
 runtime-policy verification. The displayed name is always
 simulated-sheetsafe-<resource UUID>; name matching alone never proves ownership.

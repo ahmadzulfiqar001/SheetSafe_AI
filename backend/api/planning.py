@@ -18,13 +18,17 @@ from backend.planning import (
     PlanningPreviewOutcome,
     PlanningService,
     SyntheticDatasetSnapshot,
+    UploadedCsvAnalyticsOutcome,
 )
 from backend.security.sessions import SessionPrincipal
+from validator.csv_analytics import MAX_CSV_UPLOAD_BYTES
 
 
 router = APIRouter(prefix="/planning", tags=["planning"])
 
 MAX_PLANNING_BODY_BYTES = 4096
+# Bounded buffer to accommodate raw 2 MiB CSV plus JSON serialization and escaping overhead
+MAX_CSV_ANALYTICS_BODY_BYTES = 4 * 1024 * 1024  # 4 MiB
 
 
 class PlanningPreviewRequest(BaseModel):
@@ -32,6 +36,15 @@ class PlanningPreviewRequest(BaseModel):
 
     question: str = Field(min_length=1, max_length=1000, repr=False)
     dataset_id: str | None = Field(default=None, max_length=64)
+
+
+class CsvAnalyticsUploadRequest(BaseModel):
+    model_config = ConfigDict(strict=True, frozen=True, extra="forbid", hide_input_in_errors=True)
+
+    filename: str = Field(min_length=1, max_length=256)
+    csv_text: str = Field(min_length=0, max_length=MAX_CSV_UPLOAD_BYTES, repr=False)
+    delimiter: str | None = Field(default=None, max_length=8)
+
 
 
 class SyntheticDatasetBootstrapRequest(BaseModel):
@@ -105,6 +118,27 @@ async def planning_preview_request(request: Request) -> PlanningPreviewRequest:
         raise HTTPException(400) from None
 
 
+async def csv_analytics_upload_request(request: Request) -> CsvAnalyticsUploadRequest:
+    try:
+        raw_dict = await _read_bounded_json(request, max_bytes=MAX_CSV_ANALYTICS_BODY_BYTES)
+    except HTTPException as exc:
+        if exc.status_code == 413:
+            raise PlanningError(PlanningCode.CSV_PAYLOAD_TOO_LARGE) from None
+        raise
+    if "filename" in raw_dict and type(raw_dict["filename"]) is str:
+        if not raw_dict["filename"].strip():
+            raise PlanningError(PlanningCode.INVALID_CSV_FILENAME)
+    if "csv_text" in raw_dict and type(raw_dict["csv_text"]) is str:
+        if not raw_dict["csv_text"].strip():
+            raise PlanningError(PlanningCode.EMPTY_CSV_UPLOAD)
+        if len(raw_dict["csv_text"]) > MAX_CSV_UPLOAD_BYTES:
+            raise PlanningError(PlanningCode.CSV_PAYLOAD_TOO_LARGE)
+    try:
+        return CsvAnalyticsUploadRequest.model_validate(raw_dict)
+    except ValidationError:
+        raise HTTPException(400) from None
+
+
 @router.post("/synthetic-dataset", response_model=SyntheticDatasetSnapshot, status_code=200)
 def bootstrap_synthetic_dataset(
     response: Response,
@@ -114,6 +148,29 @@ def bootstrap_synthetic_dataset(
 ) -> SyntheticDatasetSnapshot:
     response.headers["Cache-Control"] = "no-store"
     return service.ensure_synthetic_dataset(principal)
+
+
+@router.post("/csv-analytics", response_model=UploadedCsvAnalyticsOutcome, status_code=200)
+def create_csv_analytics(
+    response: Response,
+    principal: Annotated[SessionPrincipal, Depends(csrf_authenticated_session)],
+    service: Annotated[PlanningService, Depends(planning_service)],
+    payload: Annotated[CsvAnalyticsUploadRequest, Depends(csv_analytics_upload_request)],
+) -> UploadedCsvAnalyticsOutcome:
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        raw_bytes = payload.csv_text.encode("utf-8", errors="strict")
+    except UnicodeEncodeError:
+        raise PlanningError(PlanningCode.INVALID_UTF8_ENCODING) from None
+    if len(raw_bytes) > MAX_CSV_UPLOAD_BYTES:
+        raise PlanningError(PlanningCode.CSV_PAYLOAD_TOO_LARGE)
+    return service.analyze_uploaded_csv(
+        principal,
+        filename=payload.filename,
+        csv_bytes=raw_bytes,
+        delimiter=payload.delimiter,
+    )
+
 
 
 @router.post("/preview", response_model=PlanningPreviewOutcome, status_code=200)

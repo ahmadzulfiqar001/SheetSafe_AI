@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     vultr_inference_max_request_bytes: int = Field(default=32768, ge=1024, le=65536)
     vultr_inference_max_response_bytes: int = Field(default=65536, ge=2048, le=131072)
     vultr_inference_max_input_tokens: int = Field(default=4096, ge=256, le=8192)
-    vultr_inference_max_output_tokens: int = Field(default=1024, ge=128, le=2048)
+    vultr_inference_max_output_tokens: int = Field(default=4096, ge=128, le=4096)
     vultr_inference_max_retries: int = Field(default=1, ge=0, le=2)
     synthetic_planning_enabled: bool = False
     planning_requests_per_session_per_minute: int = Field(default=10, ge=1, le=60)

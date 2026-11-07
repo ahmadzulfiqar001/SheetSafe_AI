@@ -463,6 +463,9 @@ def test_even_internal_capture_rejects_commands_and_overrides(arguments):
 
 OLD_IMAGE_ID = "sha256:4f6d2d12fcecf7c70e7923186c698785cfdf0b370a89c5cee186896207f01756"
 OLD_CONFIG_DIGEST = "sha256:0d78a20a59527cde284674316413b4d1bd5ba66ac95a7639be6b4823fdba1965"
+STEP7F_IMAGE_ID = "sha256:551ae45bad03b4a1856ae503c62c01a8078394a19d3c318b53fc9f2e98f66bc9"
+STEP7F_CONFIG_DIGEST = "sha256:59f66d35ff913f60851bde600c75680bc0054c04f32ba72ec42ca2ae2ec6d546"
+STEP7F_REVIEW_TAG = "sheetsafe-runner:environment-review"
 
 
 @pytest.fixture
@@ -489,8 +492,8 @@ def image_client(monkeypatch):
 
 def test_reviewed_local_pin_pair_is_exact_and_never_execution_permission(image_client):
     client, calls, _ = image_client
-    assert LOCAL_IMAGE_ID == "sha256:551ae45bad03b4a1856ae503c62c01a8078394a19d3c318b53fc9f2e98f66bc9"
-    assert LOCAL_CONFIG_DIGEST == "sha256:59f66d35ff913f60851bde600c75680bc0054c04f32ba72ec42ca2ae2ec6d546"
+    assert LOCAL_IMAGE_ID == "sha256:7bf7f76f3e3e1bb35adeb41176551f0368d77f3dfd467e00dae8b0346e67ee20"
+    assert LOCAL_CONFIG_DIGEST == "sha256:b8f4b51b1c59238d91633eb8cd99bc7f3fcc4a56f1e18f446681b5803d635336"
     report = preflight.run_preflight(client)
     assert report.metadata_prerequisites_met and not report.execution_enabled
     assert report.image.verified_registry_digest is report.image.final_approved_identity is None
@@ -500,7 +503,7 @@ def test_reviewed_local_pin_pair_is_exact_and_never_execution_permission(image_c
     assert ContainerJobSpec().create_body()["Image"] == LOCAL_IMAGE_ID
 
 
-@pytest.mark.parametrize("replacement", [OLD_IMAGE_ID, "sha256:" + "f" * 64, LOCAL_REVIEW_TAG])
+@pytest.mark.parametrize("replacement", [OLD_IMAGE_ID, STEP7F_IMAGE_ID, "sha256:" + "f" * 64, LOCAL_REVIEW_TAG])
 def test_reassigned_review_tag_is_rejected_without_fallback(image_client, replacement):
     client, calls, responses = image_client
     responses[LOCAL_REVIEW_TAG][0]["Id"] = replacement
@@ -553,6 +556,8 @@ def test_each_reviewed_image_configuration_field_is_required(field):
 
 @pytest.mark.parametrize("id_value,config_value", [
     (OLD_IMAGE_ID, OLD_CONFIG_DIGEST), (OLD_IMAGE_ID, LOCAL_CONFIG_DIGEST),
+    (STEP7F_IMAGE_ID, STEP7F_CONFIG_DIGEST), (STEP7F_IMAGE_ID, LOCAL_CONFIG_DIGEST),
+    (LOCAL_IMAGE_ID, STEP7F_CONFIG_DIGEST),
     (LOCAL_IMAGE_ID, OLD_CONFIG_DIGEST), (LOCAL_CONFIG_DIGEST, LOCAL_CONFIG_DIGEST),
 ])
 def test_old_or_crossed_identity_pairs_cannot_be_admitted(id_value, config_value):
@@ -581,7 +586,7 @@ def test_local_static_image_approval_does_not_clear_lsm_or_execution_gate(image_
         map_container(raw, ContainerJobSpec(), report.engine, report.image)
 
 
-@pytest.mark.parametrize("reference", [OLD_IMAGE_ID, "caller:latest", LOCAL_REVIEW_TAG])
+@pytest.mark.parametrize("reference", [OLD_IMAGE_ID, STEP7F_IMAGE_ID, STEP7F_REVIEW_TAG, "caller:latest", LOCAL_REVIEW_TAG])
 def test_caller_image_selection_overrides_are_not_supported(image_client, reference):
     client, calls, _ = image_client
     with pytest.raises(TypeError):

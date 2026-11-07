@@ -280,6 +280,23 @@ def test_missing_transport_fails_closed_when_live_network_disabled():
     assert exc_info.value.code is InferenceCode.NOT_CONFIGURED
 
 
+def test_unmocked_requests_to_inference_hostname_blocked_by_test_guard():
+    """Ensure unmocked requests to api.vultrinference.com are trapped and cannot reach the network."""
+    from _pytest.outcomes import Failed
+
+    client = VultrInferenceClient(make_settings(), transport=None, allow_live_network=True)
+    with pytest.raises(Failed) as exc_info:
+        client.plan_analysis(profile=make_profile(), question="Show average revenue.")
+    assert "Unmocked outbound network call" in str(exc_info.value)
+    assert "api.vultrinference.com" in str(exc_info.value)
+
+    with pytest.raises(Failed) as exc_raw:
+        with httpx.Client() as raw_client:
+            raw_client.post("https://api.vultrinference.com/v1/chat/completions", json={})
+    assert "Unmocked outbound network call" in str(exc_raw.value)
+    assert "api.vultrinference.com" in str(exc_raw.value)
+
+
 @pytest.mark.parametrize(
     ("bad_content", "expected_code"),
     [
@@ -809,3 +826,294 @@ def test_incompatible_operation_column_types_are_rejected():
     with pytest.raises(InferenceError) as exc_info:
         validate_planning_envelope(envelope, schema)
     assert exc_info.value.code is InferenceCode.INVALID_PLAN_CONTRACT
+
+
+def test_deepseek_reasoning_tokens_and_think_blocks_supported() -> None:
+    profile = make_profile()
+    schema = build_validated_dataset_schema(profile)
+    envelope_dict = valid_plan_envelope_dict(schema)
+    raw_json_str = json.dumps(envelope_dict)
+
+    # Provider message includes DeepSeek <think> reasoning block followed by valid JSON
+    reasoning_content = (
+        "<think>\n"
+        "The user wants total revenue by department.\n"
+        "We need col_001 (department) and col_002 (quarterly_revenue).\n"
+        "Let's output the schema-compliant AIPlanningEnvelope v1.\n"
+        "</think>\n"
+        + raw_json_str
+    )
+
+    def reasoning_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model": APPROVED_MODEL,
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": reasoning_content,
+                            "reasoning_content": "Internal chain of thought",
+                        },
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 320,
+                    "completion_tokens": 1850,
+                    "total_tokens": 2170,
+                    "completion_tokens_details": {
+                        "reasoning_tokens": 1400,
+                    },
+                },
+            },
+        )
+
+    client = VultrInferenceClient(make_settings(), transport=httpx.MockTransport(reasoning_handler))
+    result = client.plan_analysis(profile=profile, question="What is total revenue by department?")
+    assert result.envelope.status == "PLAN_READY"
+    assert result.envelope.plan is not None
+    assert result.input_tokens == 320
+    assert result.output_tokens == 1850
+
+
+def test_reasoning_output_token_budget_exhaustion_via_reported_usage() -> None:
+    profile = make_profile()
+    schema = build_validated_dataset_schema(profile)
+    envelope_dict = valid_plan_envelope_dict(schema)
+
+    def usage_exhausted_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model": APPROVED_MODEL,
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(envelope_dict),
+                        },
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 300,
+                    "completion_tokens": 4500,  # Exceeds max_output_tokens (4096)
+                    "total_tokens": 4800,
+                    "completion_tokens_details": {
+                        "reasoning_tokens": 3900,
+                    },
+                },
+            },
+        )
+
+    client = VultrInferenceClient(make_settings(), transport=httpx.MockTransport(usage_exhausted_handler))
+    with pytest.raises(InferenceError) as exc_info:
+        client.plan_analysis(profile=profile, question="Summarize revenue.")
+    assert exc_info.value.code is InferenceCode.TOKEN_BUDGET_EXCEEDED
+
+
+def test_reasoning_output_token_budget_exhaustion_via_finish_reason_length() -> None:
+    profile = make_profile()
+
+    def length_exhausted_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model": APPROVED_MODEL,
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "length",
+                        "message": {
+                            "role": "assistant",
+                            "content": "<think>\nExhausted reasoning halfway through...",
+                        },
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 300,
+                    "completion_tokens": 4096,
+                    "total_tokens": 4396,
+                },
+            },
+        )
+
+    client = VultrInferenceClient(make_settings(), transport=httpx.MockTransport(length_exhausted_handler))
+    with pytest.raises(InferenceError) as exc_info:
+        client.plan_analysis(profile=profile, question="Summarize revenue.")
+    assert exc_info.value.code is InferenceCode.TOKEN_BUDGET_EXCEEDED
+
+
+def test_privacy_safe_diagnostics_on_contract_validation_failures() -> None:
+    """Verify that validation failures produce structured, privacy-safe diagnostics without sensitive leaks."""
+    profile = make_profile()
+    schema = build_validated_dataset_schema(profile)
+
+    # 1. JSON parse failure -> json_extraction stage
+    with pytest.raises(InferenceError) as exc_info:
+        validate_planning_envelope("{malformed_json: true", schema)
+    err = exc_info.value
+    assert err.code is InferenceCode.INVALID_PLAN_CONTRACT
+    assert err.stage == "json_extraction"
+    assert err.category == "invalid_json_structure"
+    assert err.diagnostic == "stage=json_extraction, category=invalid_json_structure"
+    assert "stage=json_extraction" in str(err)
+    assert "{" not in err.diagnostic
+
+    # 2. Pydantic validation failure (missing operations) -> pydantic_validation stage
+    envelope_missing_ops = valid_plan_envelope_dict(schema)
+    del envelope_missing_ops["plan"]["operations"]
+    with pytest.raises(InferenceError) as exc_info:
+        validate_planning_envelope(envelope_missing_ops, schema)
+    err = exc_info.value
+    assert err.code is InferenceCode.INVALID_PLAN_CONTRACT
+    assert err.stage == "pydantic_validation"
+    assert "operations" in (err.location or "")
+    assert err.diagnostic is not None
+    assert "operations" in err.diagnostic
+
+    # 3. Schema digest mismatch -> schema_digest_check stage
+    envelope_bad_hash = valid_plan_envelope_dict(schema)
+    envelope_bad_hash["plan"]["schema_sha256"] = "0" * 64
+    with pytest.raises(InferenceError) as exc_info:
+        validate_planning_envelope(envelope_bad_hash, schema)
+    err = exc_info.value
+    assert err.code is InferenceCode.INVALID_PLAN_CONTRACT
+    assert err.stage == "schema_digest_check"
+    assert err.category == "schema_sha256_mismatch"
+    assert err.location == "plan.schema_sha256"
+
+    # 4. Unknown column in required_columns -> required_columns_check stage
+    envelope_unknown_col = valid_plan_envelope_dict(schema)
+    envelope_unknown_col["plan"]["required_columns"] = [
+        {"column_id": "col_099", "name": "fake_col", "expected_type": "text"},
+    ]
+    envelope_unknown_col["plan"]["operations"] = [
+        {
+            "step_number": 1,
+            "operation": "SELECT_COLUMNS",
+            "target_columns": ["col_099"],
+            "group_by_columns": [],
+            "aggregation": None,
+            "sort_direction": None,
+            "limit_rows": None,
+            "rationale": "Select unknown column.",
+        }
+    ]
+    with pytest.raises(InferenceError) as exc_info:
+        validate_planning_envelope(envelope_unknown_col, schema)
+    err = exc_info.value
+    assert err.code is InferenceCode.UNKNOWN_COLUMN_REFERENCE
+    assert err.stage == "required_columns_check"
+    assert err.category == "unknown_column_id"
+
+    # 5. Non-numeric aggregation target -> operation_type_check stage
+    envelope_non_numeric = valid_plan_envelope_dict(schema)
+    envelope_non_numeric["plan"]["operations"][0]["target_columns"] = ["col_001"]  # department is text
+    envelope_non_numeric["plan"]["operations"][0]["group_by_columns"] = ["col_002"]
+    with pytest.raises(InferenceError) as exc_info:
+        validate_planning_envelope(envelope_non_numeric, schema)
+    err = exc_info.value
+    assert err.code is InferenceCode.INVALID_PLAN_CONTRACT
+    assert err.stage == "operation_type_check"
+    assert err.category == "non_numeric_aggregation_target"
+
+
+def test_valid_plan_envelope_with_prompt_contract_format() -> None:
+    """Verify that a plan matching the prompt contract schema validates successfully."""
+    profile = make_profile()
+    schema = build_validated_dataset_schema(profile)
+    valid_payload = {
+        "version": 1,
+        "status": "PLAN_READY",
+        "plan": {
+            "version": 1,
+            "schema_sha256": schema.schema_sha256,
+            "intent_summary": "Aggregate quarterly revenue by department.",
+            "required_columns": [
+                {"column_id": "col_001", "name": "department", "expected_type": "text"},
+                {"column_id": "col_002", "name": "quarterly_revenue", "expected_type": "number"},
+            ],
+            "operations": [
+                {
+                    "step_number": 1,
+                    "operation": "GROUP_AGGREGATE",
+                    "target_columns": ["col_002"],
+                    "group_by_columns": ["col_001"],
+                    "aggregation": "sum",
+                    "sort_direction": None,
+                    "limit_rows": None,
+                    "rationale": "Sum quarterly revenue for each department.",
+                }
+            ],
+            "expected_result_type": "GROUPED_TABLE",
+        },
+        "clarification": None,
+    }
+    envelope = validate_planning_envelope(valid_payload, schema)
+    assert envelope.status == "PLAN_READY"
+    assert envelope.plan is not None
+    assert envelope.plan.schema_sha256 == schema.schema_sha256
+    assert len(envelope.plan.operations) == 1
+    assert envelope.clarification is None
+
+
+def test_valid_clarification_envelope_with_prompt_contract_format() -> None:
+    """Verify that a clarification matching the prompt contract schema validates successfully."""
+    profile = make_profile()
+    schema = build_validated_dataset_schema(profile)
+    clarification_payload = {
+        "version": 1,
+        "status": "CLARIFICATION_REQUIRED",
+        "plan": None,
+        "clarification": {
+            "version": 1,
+            "reason_code": "AMBIGUOUS_METRIC",
+            "clarification_prompt": "Please specify whether to compute sum or mean for quarterly revenue.",
+            "candidate_columns": ["col_002"],
+        },
+    }
+    envelope = validate_planning_envelope(clarification_payload, schema)
+    assert envelope.status == "CLARIFICATION_REQUIRED"
+    assert envelope.plan is None
+    assert envelope.clarification is not None
+    assert envelope.clarification.reason_code == "AMBIGUOUS_METRIC"
+    assert envelope.clarification.candidate_columns == ("col_002",)
+
+
+def test_extract_json_object_handles_fences_text_and_think_blocks() -> None:
+    """Verify _extract_json_object enforces strict JSON framing and rejects arbitrary surrounding commentary."""
+    from backend.inference import _extract_json_object
+
+    expected = {"version": 1, "status": "PLAN_READY"}
+
+    # 1. Clean JSON
+    assert _extract_json_object('{"version": 1, "status": "PLAN_READY"}', max_bytes=4096) == expected
+
+    # 2. Think block + JSON
+    think_text = '<think>\nLet us analyze this...\n</think>\n{"version": 1, "status": "PLAN_READY"}'
+    assert _extract_json_object(think_text, max_bytes=4096) == expected
+
+    # 3. Clean fenced JSON
+    clean_fenced = '```json\n{"version": 1, "status": "PLAN_READY"}\n```'
+    assert _extract_json_object(clean_fenced, max_bytes=4096) == expected
+
+    # 4. Whitespace before think tag + fence
+    mixed_text = '  <think>Thinking step 1</think>\n```\n{"version": 1, "status": "PLAN_READY"}\n```'
+    assert _extract_json_object(mixed_text, max_bytes=4096) == expected
+
+    # 5. Arbitrary surrounding commentary is strictly rejected (does not silently carve out JSON)
+    arbitrary_surrounding = 'Here is the plan:\n```json\n{"version": 1, "status": "PLAN_READY"}\n```\nDone.'
+    with pytest.raises(ValueError):
+        _extract_json_object(arbitrary_surrounding, max_bytes=4096)
+
+    # 6. Raw provider payload with forbidden capability is rejected upfront as UNSAFE_OPERATION_REJECTED
+    schema = build_validated_dataset_schema(make_profile())
+    injected_payload = 'import os; os.system("sh"); {"version": 1, "status": "PLAN_READY"}'
+    with pytest.raises(InferenceError) as exc_info:
+        validate_planning_envelope(injected_payload, schema)
+    assert exc_info.value.code is InferenceCode.UNSAFE_OPERATION_REJECTED

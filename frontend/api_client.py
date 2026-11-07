@@ -17,7 +17,7 @@ import hashlib
 from http.cookies import SimpleCookie
 import json
 import re
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 import httpx
@@ -27,6 +27,8 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 DEFAULT_API_BASE_URL = "http://127.0.0.1:8000"
 DEFAULT_CLIENT_ORIGIN = "http://localhost:8501"
 MAX_API_RESPONSE_BYTES = 32 * 1024
+MAX_CSV_UPLOAD_BYTES = 2 * 1024 * 1024  # 2 MiB
+DEFAULT_PLANNING_READ_TIMEOUT_SECONDS = 40.0
 
 
 class FrontendClientCode(StrEnum):
@@ -330,14 +332,32 @@ class SyntheticVerificationPreviewView(StrictFrontendModel):
         return self
 
 
+class RealDataAnalysisResultView(StrictFrontendModel):
+    """Client view for deterministic dataframe analysis computed on real uploaded data."""
+
+    answer_text: str = Field(min_length=3, max_length=500)
+    scalar_value: float | int | None = None
+    result_type: str = Field(min_length=1, max_length=64)
+    columns: tuple[str, ...] = ()
+    column_headers: dict[str, str] = Field(default_factory=dict)
+    rows: tuple[dict[str, Any], ...] = ()
+    row_count: int = Field(default=0, ge=0)
+    chart_kind: Literal["BAR", "LINE", "NONE"] = "NONE"
+    chart_x_label: str | None = None
+    chart_y_label: str | None = None
+    chart_series: tuple[ChartPointView, ...] = ()
+    execution_mode: Literal["DETERMINISTIC_DATAFRAME_HOST"] = "DETERMINISTIC_DATAFRAME_HOST"
+    ai_code_executed: Literal[False] = False
+
+
 class PlanningPreviewView(StrictFrontendModel):
     run_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     session_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     dataset_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     dataset_version: int = Field(ge=1)
     run_state: Literal["AWAIT_CONFIRMATION", "NEEDS_CLARIFICATION"]
-    provider_mode: Literal["SIMULATED_MOCK"] = "SIMULATED_MOCK"
-    simulated_response: Literal[True] = True
+    provider_mode: Literal["SIMULATED_MOCK", "LIVE_VULTR_AI", "DETERMINISTIC_FALLBACK"] = "SIMULATED_MOCK"
+    simulated_response: bool = True
     provider_label: str
     is_synthetic_dataset: bool = True
     execution_enabled: Literal[False] = False
@@ -348,6 +368,7 @@ class PlanningPreviewView(StrictFrontendModel):
     plan_sha256: str | None = None
     code_preview: CodeGenerationPreviewView | None = None
     synthetic_verification_preview: SyntheticVerificationPreviewView | None = None
+    real_data_result: RealDataAnalysisResultView | None = None
     request_id: str | None = None
 
     @model_validator(mode="after")
@@ -401,6 +422,71 @@ class PersistedRunSummaryView(StrictFrontendModel):
 class SessionRunsListView(StrictFrontendModel):
     session_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     runs: tuple[PersistedRunSummaryView, ...]
+
+
+class UploadedCsvColumnInfoView(StrictFrontendModel):
+    column_id: str = Field(pattern=r"^col_[0-9]{3}$")
+    name: str = Field(min_length=1, max_length=128)
+    inferred_type: Literal["empty", "text", "integer", "number", "boolean", "date", "mixed"]
+    pandas_dtype: str = Field(min_length=1, max_length=64)
+    missing_count: int = Field(ge=0)
+    present_count: int = Field(ge=0)
+    completeness_pct: float = Field(ge=0.0, le=100.0)
+
+
+class UploadedCsvNumericSummaryView(StrictFrontendModel):
+    column_id: str = Field(pattern=r"^col_[0-9]{3}$")
+    column_name: str = Field(min_length=1, max_length=128)
+    pandas_dtype: str = Field(min_length=1, max_length=64)
+    non_null_count: int = Field(ge=0)
+    null_count: int = Field(ge=0)
+    total_sum: float
+    mean_value: float
+    median_value: float
+    std_value: float = Field(ge=0.0)
+    min_value: float
+    max_value: float
+
+
+class UploadedCsvChartPointView(StrictFrontendModel):
+    x: str | int | float | bool
+    y: float
+
+
+class UploadedCsvChartSpecView(StrictFrontendModel):
+    chart_kind: Literal["BAR", "LINE"]
+    chart_title: str = Field(min_length=1, max_length=160)
+    x_label: str = Field(min_length=1, max_length=128)
+    y_label: str = Field(min_length=1, max_length=128)
+    aggregation: Literal["sum", "value", "count"]
+    series: tuple[UploadedCsvChartPointView, ...]
+
+
+class UploadedCsvAnalyticsView(StrictFrontendModel):
+    version: Literal[1] = 1
+    dataset_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    session_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    filename: str = Field(min_length=5, max_length=128)
+    byte_count: int = Field(ge=1, le=MAX_CSV_UPLOAD_BYTES)
+    source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    schema_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    delimiter: Literal[",", ";", "\t"]
+    row_count: int = Field(ge=1)
+    column_count: int = Field(ge=1, le=100)
+    nonempty_cells: int = Field(ge=1)
+    total_missing_cells: int = Field(ge=0)
+    dataset_completeness_pct: float = Field(ge=0.0, le=100.0)
+    is_synthetic_fixture: Literal[False] = False
+    execution_mode: Literal["DETERMINISTIC_PANDAS_HOST"] = "DETERMINISTIC_PANDAS_HOST"
+    ai_code_executed: Literal[False] = False
+    columns: tuple[UploadedCsvColumnInfoView, ...]
+    preview_headers: tuple[str, ...]
+    preview_rows: tuple[tuple[str, ...], ...]
+    numeric_summaries: tuple[UploadedCsvNumericSummaryView, ...]
+    chart: UploadedCsvChartSpecView
+    warnings: tuple[str, ...] = ()
+    request_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+
 
 
 @dataclass(slots=True)
@@ -475,6 +561,7 @@ class SheetSafeApiClient:
         *,
         connect_timeout_seconds: float = 2.0,
         read_timeout_seconds: float = 5.0,
+        planning_read_timeout_seconds: float = DEFAULT_PLANNING_READ_TIMEOUT_SECONDS,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self._api_base_url = validate_canonical_origin(api_base_url)
@@ -484,9 +571,20 @@ class SheetSafeApiClient:
                 FrontendClientCode.INVALID_CONFIGURATION,
                 "HTTP timeouts must stay within bounded limits.",
             )
+        if not (0.2 <= planning_read_timeout_seconds <= 60.0):
+            raise FrontendClientError(
+                FrontendClientCode.INVALID_CONFIGURATION,
+                "Planning read timeout must stay within bounded limits.",
+            )
         self._timeout = httpx.Timeout(
             connect=connect_timeout_seconds,
             read=read_timeout_seconds,
+            write=connect_timeout_seconds,
+            pool=connect_timeout_seconds,
+        )
+        self._planning_timeout = httpx.Timeout(
+            connect=connect_timeout_seconds,
+            read=planning_read_timeout_seconds,
             write=connect_timeout_seconds,
             pool=connect_timeout_seconds,
         )
@@ -512,6 +610,14 @@ class SheetSafeApiClient:
     def active_session(self) -> ActiveSessionView | None:
         return self._sealed_session.view if self._sealed_session is not None else None
 
+    @property
+    def timeout(self) -> httpx.Timeout:
+        return self._timeout
+
+    @property
+    def planning_timeout(self) -> httpx.Timeout:
+        return self._planning_timeout
+
     def clear_local_session(self) -> None:
         self._sealed_session = None
 
@@ -530,6 +636,7 @@ class SheetSafeApiClient:
         *,
         headers: dict[str, str] | None = None,
         json_body: dict[str, object] | None = None,
+        timeout: httpx.Timeout | None = None,
     ) -> tuple[int, httpx.Headers, bytes]:
         if not path.startswith("/api/v1/"):
             raise FrontendClientError(
@@ -543,10 +650,11 @@ class SheetSafeApiClient:
             content = json.dumps(json_body, separators=(",", ":"), allow_nan=False).encode("utf-8")
             req_headers["Content-Type"] = "application/json"
 
+        effective_timeout = timeout if timeout is not None else self._timeout
         try:
             with httpx.Client(
                 transport=self._transport,
-                timeout=self._timeout,
+                timeout=effective_timeout,
                 follow_redirects=False,
                 trust_env=False,
             ) as client:
@@ -642,6 +750,7 @@ class SheetSafeApiClient:
             403: FrontendClientCode.FORBIDDEN,
             404: FrontendClientCode.NOT_FOUND,
             409: FrontendClientCode.CONFLICT,
+            413: FrontendClientCode.INVALID_REQUEST,
             422: FrontendClientCode.UNPROCESSABLE_REQUEST,
             429: FrontendClientCode.RATE_LIMITED,
             502: FrontendClientCode.UPSTREAM_CONTRACT_ERROR,
@@ -891,6 +1000,7 @@ class SheetSafeApiClient:
                 "Cookie": cookie_header,
             },
             json_body=body,
+            timeout=self._planning_timeout,
         )
         if status_code != 200:
             if status_code == 401:
@@ -936,6 +1046,124 @@ class SheetSafeApiClient:
             raise FrontendClientError(
                 FrontendClientCode.MALFORMED_RESPONSE,
                 "Backend returned an invalid runs list schema.",
+            ) from None
+
+    def upload_csv_for_analytics(
+        self,
+        *,
+        filename: str,
+        content: bytes | str,
+        delimiter: str | None = None,
+    ) -> UploadedCsvAnalyticsView:
+        """Upload a CSV payload to POST /api/v1/planning/csv-analytics for deterministic pandas analytics."""
+        jar = self._require_sealed_session()
+        if type(filename) is not str or not filename.strip():
+            raise FrontendClientError(
+                FrontendClientCode.INVALID_REQUEST,
+                "Filename must be a non-empty .csv file name.",
+            )
+        cleaned_filename = filename.strip()
+        if (
+            len(cleaned_filename) < 5
+            or len(cleaned_filename) > 128
+            or not cleaned_filename.lower().endswith(".csv")
+            or "/" in cleaned_filename
+            or "\\" in cleaned_filename
+            or ".." in cleaned_filename
+            or ":" in cleaned_filename
+        ):
+            raise FrontendClientError(
+                FrontendClientCode.INVALID_REQUEST,
+                "Filename must be a valid .csv file name without path separators.",
+            )
+
+        if type(content) is bytes:
+            raw_bytes = content
+            if len(raw_bytes) == 0 or not raw_bytes.strip():
+                raise FrontendClientError(
+                    FrontendClientCode.INVALID_REQUEST,
+                    "Uploaded CSV file is empty.",
+                )
+            if len(raw_bytes) > MAX_CSV_UPLOAD_BYTES:
+                raise FrontendClientError(
+                    FrontendClientCode.INVALID_REQUEST,
+                    f"Uploaded CSV file exceeds maximum size ({MAX_CSV_UPLOAD_BYTES} bytes).",
+                )
+            if b"\x00" in raw_bytes:
+                raise FrontendClientError(
+                    FrontendClientCode.INVALID_REQUEST,
+                    "Uploaded CSV file must be valid UTF-8 text without binary NUL bytes.",
+                )
+            try:
+                csv_text = raw_bytes.decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                raise FrontendClientError(
+                    FrontendClientCode.INVALID_REQUEST,
+                    "Uploaded CSV file must be valid UTF-8 text.",
+                ) from None
+        elif type(content) is str:
+            if not content.strip():
+                raise FrontendClientError(
+                    FrontendClientCode.INVALID_REQUEST,
+                    "Uploaded CSV file is empty.",
+                )
+            try:
+                raw_bytes = content.encode("utf-8", errors="strict")
+            except UnicodeEncodeError:
+                raise FrontendClientError(
+                    FrontendClientCode.INVALID_REQUEST,
+                    "Uploaded CSV file must be valid UTF-8 text.",
+                ) from None
+            if len(raw_bytes) > MAX_CSV_UPLOAD_BYTES:
+                raise FrontendClientError(
+                    FrontendClientCode.INVALID_REQUEST,
+                    f"Uploaded CSV file exceeds maximum size ({MAX_CSV_UPLOAD_BYTES} bytes).",
+                )
+            csv_text = content
+        else:
+            raise FrontendClientError(
+                FrontendClientCode.INVALID_REQUEST,
+                "CSV content must be UTF-8 bytes or text.",
+            )
+
+        cookie_header = f"{jar.view.cookie_name}={jar._cookie_value.get_secret_value()}"
+        body: dict[str, object] = {
+            "filename": cleaned_filename,
+            "csv_text": csv_text,
+        }
+        if delimiter is not None:
+            body["delimiter"] = delimiter
+
+        status_code, headers, raw = self._request_raw(
+            "POST",
+            "/api/v1/planning/csv-analytics",
+            headers={
+                "Origin": self._client_origin,
+                "X-CSRF-Token": jar._csrf_token.get_secret_value(),
+                "Cookie": cookie_header,
+            },
+            json_body=body,
+        )
+        if status_code != 200:
+            if status_code == 401:
+                self._sealed_session = None
+            self._raise_api_error(status_code, headers, raw)
+
+        payload = _coerce_tuples(self._parse_json(raw))
+        if type(payload) is not dict:
+            raise FrontendClientError(
+                FrontendClientCode.MALFORMED_RESPONSE,
+                "Invalid CSV analytics payload.",
+            )
+        try:
+            return UploadedCsvAnalyticsView.model_validate({
+                **payload,
+                "request_id": headers.get("X-Request-ID"),
+            })
+        except Exception:
+            raise FrontendClientError(
+                FrontendClientCode.MALFORMED_RESPONSE,
+                "Backend returned an invalid CSV analytics schema.",
             ) from None
 
     def submit_dataset_upload(self, *_args: object, **_kwargs: object) -> None:

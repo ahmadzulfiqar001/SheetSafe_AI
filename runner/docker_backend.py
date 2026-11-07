@@ -19,10 +19,11 @@ from uuid import uuid4
 from runner.policy import FixtureRequest, SandboxPolicy, policy_for
 
 
-# Step 7G static selection approval of Step 7F's LOCAL manifest identity.
+# Controlled static selection approval of the permissions-hardened LOCAL manifest identity
+# (supersedes Step 7F's sha256:551ae45bad03b4a1856ae503c62c01a8078394a19d3c318b53fc9f2e98f66bc9).
 # Not a registry-published RepoDigest or permission to create/execute containers.
-LOCAL_IMAGE_ID = "sha256:551ae45bad03b4a1856ae503c62c01a8078394a19d3c318b53fc9f2e98f66bc9"
-LOCAL_REVIEW_TAG = "sheetsafe-runner:environment-review"  # Consistency check only.
+LOCAL_IMAGE_ID = "sha256:7bf7f76f3e3e1bb35adeb41176551f0368d77f3dfd467e00dae8b0346e67ee20"
+LOCAL_REVIEW_TAG = "sheetsafe-runner:permissions-review"  # Consistency check only.
 API_TIMEOUT_SECONDS = 1.0
 _ID = re.compile(r"[0-9a-f]{64}\Z")
 

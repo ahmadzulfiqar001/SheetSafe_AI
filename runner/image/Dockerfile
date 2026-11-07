@@ -16,6 +16,7 @@ ENV LANG=C.UTF-8 \
     HOME=/nonexistent \
     PATH=/usr/local/bin:/usr/bin:/bin
 
+WORKDIR /opt/sheetsafe
 COPY --chown=0:0 --chmod=0444 bootstrap.py /opt/sheetsafe/bootstrap.py
 
 USER 10001:10001

@@ -41,6 +41,7 @@ from backend.inference import (
     CHAT_COMPLETIONS_URL,
     InferenceCode,
     InferenceError,
+    InferencePlanningResult,
     UserAnalysisQuestion,
     ValidatedDatasetSchema,
     VultrInferenceClient,
@@ -52,10 +53,25 @@ from backend.security.sessions import SessionError, SessionPrincipal, require_ac
 from backend.storage.database import Database, DatabaseVersionError
 from backend.storage.files import PrivateStorage
 from ingestion.contracts import ColumnProfile, DatasetProfile
+from validator.csv_analytics import (
+    CsvAnalyticsCode,
+    CsvAnalyticsError,
+    MAX_CSV_UPLOAD_BYTES,
+    UploadedCsvChartPoint,
+    UploadedCsvChartSpec,
+    UploadedCsvColumnInfo,
+    UploadedCsvNumericSummary,
+    compute_validated_csv_analytics,
+)
 from validator.numerical_verifier import (
     SyntheticTableFixture,
     VerificationError,
     compute_expected_analysis_result,
+)
+from validator.natural_language_analysis import (
+    RealDataAnalysisResult,
+    execute_deterministic_dataframe_analysis,
+    parse_natural_language_intent,
 )
 
 
@@ -191,6 +207,13 @@ class PlanningCode(StrEnum):
     PROVIDER_TIMEOUT = "PROVIDER_TIMEOUT"
     RATE_LIMITED = "RATE_LIMITED"
     PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
+    EMPTY_CSV_UPLOAD = "EMPTY_CSV_UPLOAD"
+    CSV_PAYLOAD_TOO_LARGE = "CSV_PAYLOAD_TOO_LARGE"
+    INVALID_CSV_FILENAME = "INVALID_CSV_FILENAME"
+    INVALID_UTF8_ENCODING = "INVALID_UTF8_ENCODING"
+    MALFORMED_CSV_CONTENT = "MALFORMED_CSV_CONTENT"
+    AMBIGUOUS_CSV_DELIMITER = "AMBIGUOUS_CSV_DELIMITER"
+    CSV_SCHEMA_LIMIT_EXCEEDED = "CSV_SCHEMA_LIMIT_EXCEEDED"
 
 
 PLANNING_ERROR_TABLE: dict[PlanningCode, tuple[int, str, bool]] = {
@@ -258,6 +281,41 @@ PLANNING_ERROR_TABLE: dict[PlanningCode, tuple[int, str, bool]] = {
         503,
         "AI inference provider is currently unavailable.",
         True,
+    ),
+    PlanningCode.EMPTY_CSV_UPLOAD: (
+        400,
+        "Uploaded CSV file is empty or contains no data rows.",
+        False,
+    ),
+    PlanningCode.CSV_PAYLOAD_TOO_LARGE: (
+        413,
+        "Uploaded CSV file exceeds the maximum allowed size (2 MiB).",
+        False,
+    ),
+    PlanningCode.INVALID_CSV_FILENAME: (
+        400,
+        "Filename must be a valid .csv file name without path separators.",
+        False,
+    ),
+    PlanningCode.INVALID_UTF8_ENCODING: (
+        400,
+        "Uploaded CSV file must be valid UTF-8 text.",
+        False,
+    ),
+    PlanningCode.MALFORMED_CSV_CONTENT: (
+        422,
+        "Uploaded CSV file is malformed, has inconsistent columns, or invalid headers.",
+        False,
+    ),
+    PlanningCode.AMBIGUOUS_CSV_DELIMITER: (
+        422,
+        "Uploaded CSV delimiter is ambiguous; specify comma, semicolon, or tab.",
+        False,
+    ),
+    PlanningCode.CSV_SCHEMA_LIMIT_EXCEEDED: (
+        422,
+        "Uploaded CSV exceeds column, row, or cell length limits.",
+        False,
     ),
 }
 
@@ -418,8 +476,8 @@ class PlanningPreviewOutcome(StrictPlanningContract):
     dataset_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     dataset_version: int = Field(ge=1)
     run_state: Literal["AWAIT_CONFIRMATION", "NEEDS_CLARIFICATION"]
-    provider_mode: Literal["SIMULATED_MOCK"] = "SIMULATED_MOCK"
-    simulated_response: Literal[True] = True
+    provider_mode: Literal["SIMULATED_MOCK", "LIVE_VULTR_AI", "DETERMINISTIC_FALLBACK"] = "SIMULATED_MOCK"
+    simulated_response: bool = True
     provider_label: str = SIMULATED_PROVIDER_LABEL
     is_synthetic_dataset: bool = True
     execution_enabled: Literal[False] = False
@@ -430,6 +488,7 @@ class PlanningPreviewOutcome(StrictPlanningContract):
     plan_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     code_preview: CodeGenerationPreview | None = None
     synthetic_verification_preview: SyntheticVerificationPreview | None = None
+    real_data_result: RealDataAnalysisResult | None = None
 
 
 class PersistedRunSummary(StrictPlanningContract):
@@ -451,6 +510,34 @@ class PersistedRunSummary(StrictPlanningContract):
     clarification_reason: str | None = None
     created_at: int = Field(gt=0)
     updated_at: int = Field(gt=0)
+
+
+class UploadedCsvAnalyticsOutcome(StrictPlanningContract):
+    """Validated, persisted deterministic pandas CSV analytics response."""
+
+    version: Literal[1] = 1
+    dataset_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    session_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    filename: str = Field(min_length=5, max_length=128)
+    byte_count: int = Field(ge=1, le=MAX_CSV_UPLOAD_BYTES)
+    source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    schema_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    delimiter: Literal[",", ";", "\t"]
+    row_count: int = Field(ge=1)
+    column_count: int = Field(ge=1, le=100)
+    nonempty_cells: int = Field(ge=1)
+    total_missing_cells: int = Field(ge=0)
+    dataset_completeness_pct: float = Field(ge=0.0, le=100.0)
+    is_synthetic_fixture: Literal[False] = False
+    execution_mode: Literal["DETERMINISTIC_PANDAS_HOST"] = "DETERMINISTIC_PANDAS_HOST"
+    ai_code_executed: Literal[False] = False
+    columns: tuple[UploadedCsvColumnInfo, ...]
+    preview_headers: tuple[str, ...]
+    preview_rows: tuple[tuple[str, ...], ...]
+    numeric_summaries: tuple[UploadedCsvNumericSummary, ...]
+    chart: UploadedCsvChartSpec
+    warnings: tuple[str, ...] = ()
+
 
 
 def build_deterministic_mock_transport() -> httpx.MockTransport:
@@ -1436,15 +1523,31 @@ class PlanningService:
             raise PlanningError(PlanningCode.SYNTHETIC_PLANNING_DISABLED)
 
     def _effective_inference_client(
-        self, transport_override: httpx.BaseTransport | None = None,
+        self,
+        transport_override: httpx.BaseTransport | None = None,
+        *,
+        force_mock: bool = False,
     ) -> VultrInferenceClient:
-        chosen_transport = (
-            transport_override
-            if transport_override is not None
-            else self._transport
-            if self._transport is not None
-            else build_deterministic_mock_transport()
+        has_vultr_creds = (
+            self.settings.vultr_inference_api_key is not None
+            and bool(self.settings.vultr_inference_model)
         )
+        if transport_override is not None:
+            chosen_transport = transport_override
+            allow_live = False
+        elif self._transport is not None:
+            chosen_transport = self._transport
+            allow_live = False
+        elif force_mock:
+            chosen_transport = build_deterministic_mock_transport()
+            allow_live = False
+        elif has_vultr_creds:
+            chosen_transport = None
+            allow_live = True
+        else:
+            chosen_transport = build_deterministic_mock_transport()
+            allow_live = False
+
         effective_settings = self.settings.model_copy(
             update={
                 "vultr_inference_base_url": VULTR_INFERENCE_BASE_URL,
@@ -1459,8 +1562,55 @@ class PlanningService:
         return VultrInferenceClient(
             effective_settings,
             transport=chosen_transport,
-            allow_live_network=False,
+            allow_live_network=allow_live,
         )
+
+    def _resolve_provider_context(
+        self,
+        transport_override: httpx.BaseTransport | None = None,
+        *,
+        is_synthetic_dataset: bool = True,
+    ) -> tuple[VultrInferenceClient, Literal["SIMULATED_MOCK", "LIVE_VULTR_AI", "DETERMINISTIC_FALLBACK"], bool, str]:
+        has_vultr_creds = (
+            self.settings.vultr_inference_api_key is not None
+            and bool(self.settings.vultr_inference_model)
+        )
+        model_name = self.settings.vultr_inference_model or SIMULATED_MODEL_ID
+
+        if is_synthetic_dataset:
+            # Synthetic dataset planning is strictly an offline demo/simulated fixture workflow.
+            # It must remain deterministic SIMULATED_MOCK even when host inference credentials are set.
+            inference_client = self._effective_inference_client(
+                transport_override,
+                force_mock=True,
+            )
+            return inference_client, "SIMULATED_MOCK", True, SIMULATED_PROVIDER_LABEL
+
+        # For real uploaded CSV datasets:
+        if transport_override is not None or self._transport is not None:
+            chosen = transport_override if transport_override is not None else self._transport
+            inference_client = self._effective_inference_client(chosen)
+            provider_mode: Literal["SIMULATED_MOCK", "LIVE_VULTR_AI", "DETERMINISTIC_FALLBACK"] = (
+                "LIVE_VULTR_AI" if has_vultr_creds else "DETERMINISTIC_FALLBACK"
+            )
+            simulated = (provider_mode != "LIVE_VULTR_AI")
+            provider_label = (
+                f"Vultr Serverless Inference ({model_name})"
+                if provider_mode == "LIVE_VULTR_AI"
+                else "SheetSafe Deterministic Intent Parser (Offline Fallback)"
+            )
+        elif has_vultr_creds:
+            inference_client = self._effective_inference_client(None)
+            provider_mode = "LIVE_VULTR_AI"
+            simulated = False
+            provider_label = f"Vultr Serverless Inference ({model_name})"
+        else:
+            inference_client = self._effective_inference_client(None, force_mock=True)
+            provider_mode = "DETERMINISTIC_FALLBACK"
+            simulated = True
+            provider_label = "SheetSafe Deterministic Intent Parser (Offline Fallback)"
+
+        return inference_client, provider_mode, simulated, provider_label
 
     def ensure_synthetic_dataset(self, principal: SessionPrincipal) -> SyntheticDatasetSnapshot:
         """Idempotently provision the server-owned synthetic dataset for the active session."""
@@ -1690,18 +1840,60 @@ class PlanningService:
             raise SessionError(503) from None
 
         # Step 2: Provider call outside SQLite writer lock
-        inference_client = self._effective_inference_client(transport)
+        inference_client, initial_provider_mode, initial_simulated, initial_label = (
+            self._resolve_provider_context(transport, is_synthetic_dataset=is_synthetic_dataset)
+        )
         started_mono = time.monotonic()
         planning_result = None
         inference_error: InferenceError | None = None
-        try:
-            planning_result = inference_client.plan_analysis(
-                profile=profile,
-                question=validated_question,
-                verify_model=False,
+        provider_mode = initial_provider_mode
+        simulated_response = initial_simulated
+        provider_label = initial_label
+
+        if not is_synthetic_dataset and initial_provider_mode == "DETERMINISTIC_FALLBACK":
+            envelope = parse_natural_language_intent(validated_question.question, validated_schema)
+            planning_result = InferencePlanningResult(
+                model="deterministic-fallback-v1",
+                schema_sha256=validated_schema.schema_sha256,
+                envelope=envelope,
+                input_tokens=0,
+                output_tokens=0,
+                retry_count=0,
             )
-        except InferenceError as exc:
-            inference_error = exc
+        else:
+            try:
+                planning_result = inference_client.plan_analysis(
+                    profile=profile,
+                    question=validated_question,
+                    verify_model=False,
+                )
+            except InferenceError as exc:
+                if not is_synthetic_dataset and exc.code in {
+                    InferenceCode.NOT_CONFIGURED,
+                    InferenceCode.AUTHENTICATION_FAILED,
+                    InferenceCode.PROVIDER_UNAVAILABLE,
+                    InferenceCode.PROVIDER_TIMEOUT,
+                    InferenceCode.RATE_LIMITED,
+                    InferenceCode.MODEL_NOT_SUPPORTED,
+                    InferenceCode.TOKEN_BUDGET_EXCEEDED,
+                    InferenceCode.RESPONSE_TOO_LARGE,
+                    InferenceCode.MALFORMED_PROVIDER_RESPONSE,
+                    InferenceCode.INVALID_PLAN_CONTRACT,
+                }:
+                    provider_mode = "DETERMINISTIC_FALLBACK"
+                    simulated_response = True
+                    provider_label = "SheetSafe Deterministic Intent Parser (Offline Fallback)"
+                    envelope = parse_natural_language_intent(validated_question.question, validated_schema)
+                    planning_result = InferencePlanningResult(
+                        model="deterministic-fallback-v1",
+                        schema_sha256=validated_schema.schema_sha256,
+                        envelope=envelope,
+                        input_tokens=0,
+                        output_tokens=0,
+                        retry_count=0,
+                    )
+                else:
+                    inference_error = exc
         duration_ms = max(0, int((time.monotonic() - started_mono) * 1000))
 
         # Step 3: Post-inference transaction — check cancellation/expiry race and persist state
@@ -1798,6 +1990,7 @@ class PlanningService:
 
                     code_preview: CodeGenerationPreview | None = None
                     verification_preview: SyntheticVerificationPreview | None = None
+                    real_data_result: RealDataAnalysisResult | None = None
                     if envelope.status == "PLAN_READY":
                         assert envelope.plan is not None
                         plan: AIAnalysisPlan = envelope.plan
@@ -1808,8 +2001,19 @@ class PlanningService:
                                 validated_schema,
                                 is_synthetic_dataset=is_synthetic_dataset,
                             )
-                        except (CodeGenError, VerificationError) as exc:
-                            plan_code, failure_state = _map_codegen_error(exc)
+                            if not is_synthetic_dataset:
+                                csv_bytes = self.storage.read(principal, ds_row["storage_ref"])
+                                real_data_result = execute_deterministic_dataframe_analysis(
+                                    csv_bytes=csv_bytes,
+                                    delimiter=profile.delimiter,
+                                    plan=plan,
+                                    schema=validated_schema,
+                                )
+                        except (CodeGenError, VerificationError, InferenceError) as exc:
+                            if isinstance(exc, InferenceError):
+                                plan_code, failure_state = _map_inference_error(exc)[0], "BLOCKED_POLICY"
+                            else:
+                                plan_code, failure_state = _map_codegen_error(exc)
                             connection.execute(
                                 """UPDATE runs SET state=?, state_version=state_version+1,
                                     interpretation_json='{}', plan_json='{}', updated_at=? WHERE run_id=?""",
@@ -1846,14 +2050,15 @@ class PlanningService:
                             interpretation_payload = {
                                 "version": 1,
                                 "status": "PLAN_READY",
-                                "provider_mode": "SIMULATED_MOCK",
-                                "simulated_response": True,
+                                "provider_mode": provider_mode,
+                                "simulated_response": simulated_response,
                                 "model": planning_result.model,
                                 "schema_sha256": planning_result.schema_sha256,
                                 "plan_sha256": plan_sha,
-                                "code_sha256": code_preview.code_sha256,
+                                "code_sha256": code_preview.code_sha256 if code_preview else None,
                                 "intent_summary": plan.intent_summary,
                                 "expected_result_type": plan.expected_result_type,
+                                "has_real_data_result": real_data_result is not None,
                             }
                             connection.execute(
                                 """UPDATE runs SET state=?, state_version=state_version+1,
@@ -1879,7 +2084,7 @@ class PlanningService:
                                 details={
                                     "schema_sha256": planning_result.schema_sha256,
                                     "plan_sha256": plan_sha,
-                                    "code_sha256": code_preview.code_sha256,
+                                    "code_sha256": code_preview.code_sha256 if code_preview else None,
                                 },
                             )
                     else:
@@ -1890,8 +2095,8 @@ class PlanningService:
                         interpretation_payload = {
                             "version": 1,
                             "status": "CLARIFICATION_REQUIRED",
-                            "provider_mode": "SIMULATED_MOCK",
-                            "simulated_response": True,
+                            "provider_mode": provider_mode,
+                            "simulated_response": simulated_response,
                             "model": planning_result.model,
                             "schema_sha256": planning_result.schema_sha256,
                             "reason_code": clarification.reason_code,
@@ -1926,6 +2131,9 @@ class PlanningService:
                             dataset_id=target_dataset_id,
                             dataset_version=1,
                             run_state=target_state,
+                            provider_mode=provider_mode,
+                            simulated_response=simulated_response,
+                            provider_label=provider_label,
                             is_synthetic_dataset=is_synthetic_dataset,
                             model=planning_result.model,
                             question=validated_question.question,
@@ -1934,6 +2142,7 @@ class PlanningService:
                             plan_sha256=plan_sha,
                             code_preview=code_preview,
                             synthetic_verification_preview=verification_preview,
+                            real_data_result=real_data_result,
                         )
         except (SessionError, PlanningError):
             raise
@@ -1981,3 +2190,183 @@ class PlanningService:
             raise
         except (sqlite3.Error, OSError, DatabaseVersionError):
             raise SessionError(503) from None
+
+    def analyze_uploaded_csv(
+        self,
+        principal: SessionPrincipal,
+        *,
+        filename: str,
+        csv_bytes: bytes,
+        delimiter: str | None = None,
+    ) -> UploadedCsvAnalyticsOutcome:
+        """Validate an uploaded CSV file, compute deterministic pandas analytics, and persist metadata."""
+        try:
+            with self.database.connection() as connection:
+                require_active_session(connection, principal)
+                now = self.database.now()
+                window_start = now - 60
+                recent_datasets = connection.execute(
+                    "SELECT COUNT(*) FROM datasets WHERE session_id=? AND created_at>=?",
+                    (principal.session_id, window_start),
+                ).fetchone()[0]
+                if recent_datasets >= max(5, self.settings.planning_requests_per_session_per_minute * 2):
+                    raise PlanningError(PlanningCode.RATE_LIMITED, retry_after=60)
+                total_datasets = connection.execute(
+                    "SELECT COUNT(*) FROM datasets WHERE session_id=?",
+                    (principal.session_id,),
+                ).fetchone()[0]
+                if total_datasets >= max(10, self.settings.max_runs_per_session * 2):
+                    raise PlanningError(PlanningCode.RATE_LIMITED, retry_after=60)
+        except (SessionError, PlanningError):
+            raise
+        except (sqlite3.Error, OSError, DatabaseVersionError):
+            raise SessionError(503) from None
+
+        started_mono = time.monotonic()
+        if len(csv_bytes) > MAX_CSV_UPLOAD_BYTES:
+            raise PlanningError(PlanningCode.CSV_PAYLOAD_TOO_LARGE)
+        try:
+            bundle = compute_validated_csv_analytics(
+                filename=filename,
+                raw_bytes=csv_bytes,
+                delimiter=delimiter,
+            )
+        except CsvAnalyticsError as exc:
+            raise PlanningError(_map_csv_analytics_error(exc.code)) from None
+
+        try:
+            validated_schema = build_validated_dataset_schema(bundle.profile)
+        except InferenceError as exc:
+            plan_code, _ = _map_inference_error(exc)
+            raise PlanningError(plan_code) from None
+
+        duration_ms = max(0, int((time.monotonic() - started_mono) * 1000))
+
+        # Store in session's PrivateStorage under 'version' input category so it is cleaned up
+        # on session revocation without conflicting with the synthetic 'original' slot.
+        # PrivateStorage requires chunks <= 64 KiB.
+        storage_chunk_size = 64 * 1024
+        storage_chunks = [
+            csv_bytes[i : i + storage_chunk_size]
+            for i in range(0, max(1, len(csv_bytes)), storage_chunk_size)
+        ]
+        stored = self.storage.store(
+            principal,
+            category="version",
+            file_type="csv",
+            chunks=storage_chunks,
+            byte_count=bundle.byte_count,
+            run_id=None,
+            candidate_version=0,
+        )
+
+        dataset_id = uuid4().hex
+        idempotency_key = f"uploaded-csv:{dataset_id}"
+        parsing_settings = json.dumps(
+            {
+                "filename_sha256": hashlib.sha256(
+                    bundle.filename.encode("utf-8")
+                ).hexdigest(),
+                "delimiter": bundle.delimiter,
+                "deterministic_pandas": True,
+            },
+            separators=(",", ":"),
+        )
+        profile_json = bundle.profile.model_dump_json()
+        fingerprint = hashlib.sha256(
+            f"{stored.object_id}:{parsing_settings}".encode("utf-8")
+        ).hexdigest()
+
+        try:
+            with self.database.transaction() as connection:
+                require_active_session(connection, principal)
+                now = self.database.now()
+                connection.execute(
+                    """INSERT INTO datasets(
+                        dataset_id, session_id, source_sha256, storage_ref,
+                        file_type, byte_count, idempotency_key, request_sha256, created_at
+                    ) VALUES (?, ?, ?, ?, 'csv', ?, ?, ?, ?)""",
+                    (
+                        dataset_id,
+                        principal.session_id,
+                        stored.sha256,
+                        stored.object_id,
+                        stored.byte_count,
+                        idempotency_key,
+                        fingerprint,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """INSERT INTO dataset_versions(
+                        dataset_id, version, session_id, parsing_settings_json,
+                        profile_json, state, created_at
+                    ) VALUES (?, 1, ?, ?, ?, 'READY', ?)""",
+                    (
+                        dataset_id,
+                        principal.session_id,
+                        parsing_settings,
+                        profile_json,
+                        now,
+                    ),
+                )
+                self.database.append_audit_event(
+                    connection,
+                    session_pseudonym=principal.audit_pseudonym,
+                    event_type="DATASET_CREATED",
+                    build_version="0.1.0",
+                    timestamp=now,
+                    details={
+                        "byte_count": stored.byte_count,
+                        "source_sha256": stored.sha256,
+                    },
+                )
+                self.database.append_audit_event(
+                    connection,
+                    session_pseudonym=principal.audit_pseudonym,
+                    event_type="DATASET_PROFILED",
+                    build_version="0.1.0",
+                    timestamp=now,
+                    details={
+                        "schema_sha256": validated_schema.schema_sha256,
+                        "duration_ms": duration_ms,
+                    },
+                )
+        except (SessionError, PlanningError):
+            raise
+        except (sqlite3.Error, OSError, DatabaseVersionError):
+            raise SessionError(503) from None
+
+        return UploadedCsvAnalyticsOutcome(
+            dataset_id=dataset_id,
+            session_id=principal.session_id,
+            filename=bundle.filename,
+            byte_count=bundle.byte_count,
+            source_sha256=bundle.source_sha256,
+            schema_sha256=validated_schema.schema_sha256,
+            delimiter=bundle.delimiter,
+            row_count=bundle.row_count,
+            column_count=bundle.column_count,
+            nonempty_cells=bundle.nonempty_cells,
+            total_missing_cells=bundle.total_missing_cells,
+            dataset_completeness_pct=bundle.dataset_completeness_pct,
+            columns=bundle.columns,
+            preview_headers=bundle.preview_headers,
+            preview_rows=bundle.preview_rows,
+            numeric_summaries=bundle.numeric_summaries,
+            chart=bundle.chart,
+            warnings=bundle.warnings,
+        )
+
+
+def _map_csv_analytics_error(code: CsvAnalyticsCode) -> PlanningCode:
+    mapping: dict[CsvAnalyticsCode, PlanningCode] = {
+        CsvAnalyticsCode.EMPTY_CSV_UPLOAD: PlanningCode.EMPTY_CSV_UPLOAD,
+        CsvAnalyticsCode.CSV_PAYLOAD_TOO_LARGE: PlanningCode.CSV_PAYLOAD_TOO_LARGE,
+        CsvAnalyticsCode.INVALID_CSV_FILENAME: PlanningCode.INVALID_CSV_FILENAME,
+        CsvAnalyticsCode.INVALID_UTF8_ENCODING: PlanningCode.INVALID_UTF8_ENCODING,
+        CsvAnalyticsCode.MALFORMED_CSV_CONTENT: PlanningCode.MALFORMED_CSV_CONTENT,
+        CsvAnalyticsCode.AMBIGUOUS_CSV_DELIMITER: PlanningCode.AMBIGUOUS_CSV_DELIMITER,
+        CsvAnalyticsCode.CSV_SCHEMA_LIMIT_EXCEEDED: PlanningCode.CSV_SCHEMA_LIMIT_EXCEEDED,
+    }
+    return mapping.get(code, PlanningCode.MALFORMED_CSV_CONTENT)
